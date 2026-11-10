@@ -320,14 +320,16 @@ fn main() -> Result<()> {
     // otherwise spawn the REST server inside the worker (GUI) or TUI async runtime (#35).
     if let Some(port) = api_port {
         account_manager::set_active_uin(&cli_uin);
-        if args.iter().any(|a| a == "--api-only") {
-            let cli_db = authenticated_db_path(&s)?;
-            let shared = std::sync::Arc::new(tokio::sync::Mutex::new(s));
-            println!("🌐 REST API & MCP HTTP server đang lắng nghe tại http://127.0.0.1:{port}/api/v1/status");
-            return run_async(api_mcp::run_local_http_server(shared, port, cli_db));
-        }
-        if launch_gui {
-            std::env::set_var("CTDOZLITE_API_PORT", port.to_string());
+        let api_only = args.iter().any(|a| a == "--api-only");
+        if let Some(db_path) = api_startup_path(&s, api_only)? {
+            if api_only {
+                let shared = std::sync::Arc::new(tokio::sync::Mutex::new(s));
+                println!("🌐 REST API & MCP HTTP server đang lắng nghe tại http://127.0.0.1:{port}/api/v1/status");
+                return run_async(api_mcp::run_local_http_server(shared, port, db_path));
+            }
+            if launch_gui {
+                std::env::set_var("CTDOZLITE_API_PORT", port.to_string());
+            }
         }
     }
 
@@ -404,12 +406,13 @@ fn main() -> Result<()> {
 
     run_async(async move {
     if let Some(port) = api_port {
+        if let Some(api_db) = api_startup_path(&s, false)? {
         let shared = std::sync::Arc::new(tokio::sync::Mutex::new(s.clone()));
         println!("🌐 REST API & MCP HTTP server đang lắng nghe tại http://127.0.0.1:{port}/api/v1/status");
-        let api_db = cli_db.clone();
         tokio::spawn(async move {
             let _ = api_mcp::run_local_http_server(shared, port, api_db).await;
         });
+        }
     }
     // 1. Initial server info check for TUI mode (skipped offline).
     if !offline_mode {
@@ -585,4 +588,27 @@ fn authenticated_db_path(session: &Session) -> Result<String> {
         .ok_or_else(|| anyhow::anyhow!("Vui lòng đăng nhập trước khi mở API"))?;
     store::MessageStore::open_account(&login.uin)?;
     Ok(store::db_path_for_account(&login.uin))
+}
+
+fn api_startup_path(session: &Session, api_only: bool) -> Result<Option<String>> {
+    match authenticated_db_path(session) {
+        Ok(path) => Ok(Some(path)),
+        Err(error) if !api_only => {
+            eprintln!("Không thể mở API nền: {error}");
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn optional_background_api_does_not_prevent_login_ui_startup() {
+        let session = Session::new(false, false, false).unwrap();
+        assert_eq!(api_startup_path(&session, false).unwrap(), None);
+        assert!(api_startup_path(&session, true).is_err());
+    }
 }
