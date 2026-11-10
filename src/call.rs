@@ -2322,7 +2322,7 @@ impl CallBridge {
                         }
                         (command, Arc::new(Mutex::new(snapshot)), events)
                     }
-                    command => (command, session.clone(), gui_tx.scoped()),
+                    command => (command, session.clone(), gui_tx.scoped().for_call()),
                 };
                 match cmd {
                     CallEngineCmd::AccountCommand(_) => continue,
@@ -4812,7 +4812,7 @@ impl CallBridge {
     pub(crate) fn for_account(&self, session: Session, events: crate::gui::GuiTx) -> Self {
         Self {
             cmd_tx: self.cmd_tx.clone(),
-            account_context: Some(Arc::new((session, events))),
+            account_context: Some(Arc::new((session, events.for_call()))),
         }
     }
 
