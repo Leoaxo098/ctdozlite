@@ -51,7 +51,7 @@ pdf-extract = "0.12.1"
 calamine = "0.38.0"
 cfb = "0.16.0"
 rhai = "1"
-nokhwa = { version = "=0.10.11", default-features = false, features = ["input-native", "decoding"] }
+nokhwa = { version = "=0.10.11", default-features = false, features = ["input-native"] }
 openh264 = { version = "=0.9.9", default-features = false, features = ["source"] }
 
 [lib]
