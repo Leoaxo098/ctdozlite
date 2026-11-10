@@ -234,6 +234,7 @@ impl MessageStore {
         }
         // The current login does not prove who wrote a database left behind by logout.
         // Unowned history stays untouched for explicit import through Settings.
+        // The Sync settings and docs/KHAC_PHUC_SU_CO.md explain this upgrade step.
         let probe =
             Connection::open_with_flags(&legacy_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         let has_metadata: bool = probe.query_row(
@@ -3786,6 +3787,33 @@ mod tests {
         for result in results {
             assert_eq!(result.unwrap(), 2000);
         }
+    }
+
+    #[test]
+    fn current_schema_open_does_not_wait_for_an_active_writer() {
+        let root = std::env::temp_dir().join(format!(
+            "ctdozlite-read-open-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("history.db");
+        let path = path.to_str().unwrap();
+        let writer = MessageStore::open(path).unwrap();
+        writer.conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let reader = MessageStore::open(path);
+        writer.conn.execute_batch("ROLLBACK").unwrap();
+        let opened = reader.is_ok();
+        drop(reader);
+        drop(writer);
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(
+            opened,
+            "opening a current WAL schema must not require the writer lock"
+        );
     }
 
     #[test]
