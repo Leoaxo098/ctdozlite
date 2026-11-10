@@ -812,30 +812,45 @@ impl ReactionInbox {
         messages: &[crate::chat::ChatMessage],
         incoming: &[ReactionEvent],
     ) {
-        let targets: std::collections::HashSet<String> =
+        let mut targets: std::collections::HashSet<String> =
             incoming.iter().filter_map(event_key).collect();
+        targets.extend(self.events.keys().cloned());
         for msg in messages {
             for key in message_keys(msg) {
                 if !targets.contains(&key) || self.bases.contains_key(&key) {
                     continue;
                 }
+                let represented: Vec<_> = msg
+                    .reaction_versions
+                    .values()
+                    .flat_map(|version| version.events.iter().chain(&version.covered_events))
+                    .cloned()
+                    .collect();
                 let (totals, per_sender, _) = self
                     .events
                     .get(&key)
-                    .map(effective_counts)
+                    .map(|events| {
+                        if represented.is_empty() {
+                            // Without persisted identities, keep the legacy stale-snapshot policy.
+                            return effective_counts(events);
+                        }
+                        let covered = events
+                            .iter()
+                            .filter(|(_, event)| {
+                                represented.iter().any(|old| {
+                                    old.sender_id == event.sender_id && same_event(old, event)
+                                })
+                            })
+                            .map(|(id, event)| (id.clone(), event.clone()))
+                            .collect();
+                        effective_counts(&covered)
+                    })
                     .unwrap_or_default();
                 self.bases.insert(
                     key.clone(),
                     init_message_base(&msg.reaction_summaries, &totals, &per_sender),
                 );
-                self.represented.insert(
-                    key,
-                    msg.reaction_versions
-                        .values()
-                        .flat_map(|version| version.events.iter().chain(&version.covered_events))
-                        .cloned()
-                        .collect(),
-                );
+                self.represented.insert(key, represented);
             }
         }
     }
@@ -883,6 +898,7 @@ impl ReactionInbox {
 
     /// Recompute counts for every loaded message that has events. Returns `true` if any changed.
     pub fn apply_to(&mut self, messages: &mut [crate::chat::ChatMessage]) -> bool {
+        self.observe_loaded(messages, &[]);
         let mut changed = false;
         for msg in messages.iter_mut() {
             let keys = message_keys(msg);
@@ -969,6 +985,33 @@ impl ReactionInbox {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn late_snapshot_reconciles_queued_replay_before_adding_a_new_event() {
+        let replay = parse_reaction_events(&wire_frame(&["1", "2", "3", "4", "5"])["data"]);
+        let new = parse_reaction_events(&wire_frame(&["6"])["data"]);
+        let mut inbox = ReactionInbox::default();
+        inbox.ingest(&replay, &mut []);
+        inbox.ingest(&new, &mut []);
+        let mut message = crate::chat::ChatMessage {
+            id: "8460448471161".into(),
+            reaction_summaries: parse_reactions(&json!({"reactions":{"0":{"20":10}}})),
+            ..Default::default()
+        };
+        for event in &replay {
+            message
+                .reaction_versions
+                .entry(event.sender_id.clone())
+                .or_default()
+                .cover(event);
+        }
+        let mut loaded = vec![message];
+        inbox.ingest(&[], &mut loaded);
+        assert_eq!(total_count(&loaded[0].reaction_summaries), 11);
+        inbox.ingest(&replay, &mut loaded);
+        inbox.ingest(&new, &mut loaded);
+        assert_eq!(total_count(&loaded[0].reaction_summaries), 11);
+    }
 
     /// Shape captured from the live socket (`cmd=610`): sender is `uidFrom:"0"` (the account itself),
     /// every event has its own `msgId`. Replaying the same frame must never add to the count.
