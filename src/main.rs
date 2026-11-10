@@ -20,7 +20,19 @@ pub const POLL_SECS: u64 = 4;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let arguments: Vec<String> = std::env::args().collect();
+    if zalo_rust::video::camera::run_helper_if_requested(&arguments)? {
+        return Ok(());
+    }
+    let args: Vec<String> = arguments.into_iter().skip(1).collect();
+    if args.iter().any(|argument| argument == "--video-self-test") {
+        println!("{}", zalo_rust::video::self_test()?);
+        return Ok(());
+    }
+    if args.iter().any(|argument| argument == "--video-licenses") {
+        println!("{}", zalo_rust::video::license_notices());
+        return Ok(());
+    }
     if args.iter().any(|a| a == "--version" || a == "-V") {
         println!("ctdozlite v{}", env!("CARGO_PKG_VERSION"));
         return Ok(());
@@ -188,9 +200,13 @@ async fn main() -> Result<()> {
         });
 
     if force_logout {
-        let _ = std::fs::remove_file("session.json");
-        let _ = std::fs::remove_file("threads_cache.json");
-        println!("✓ Đã đăng xuất và xóa phiên lưu trữ cũ (session.json, threads_cache.json).");
+        let uin = std::fs::read("session.json")
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<session::SavedSession>(&bytes).ok())
+            .and_then(|saved| saved.login.map(|login| login.uin))
+            .unwrap_or_default();
+        account_manager::logout_account(&uin)?;
+        println!("✓ Đã đăng xuất và xoá các phiên đăng nhập đã lưu của tài khoản.");
         if !force_gui && !force_tui && !force_qr {
             return Ok(());
         }
@@ -283,20 +299,22 @@ async fn main() -> Result<()> {
     // If `--mcp` is requested, run the Model Context Protocol JSON-RPC 2.0 server over stdio (#35).
     // `--thread <id>` locks thread-scoped tools to one thread (per-thread agent session).
     if force_mcp {
+        let db_path = authenticated_db_path(&s)?;
         let shared = std::sync::Arc::new(tokio::sync::Mutex::new(s));
-        return api_mcp::run_mcp_stdio_server_bound(shared, "zalo_history.db", thread_arg).await;
+        return api_mcp::run_mcp_stdio_server_bound(shared, &db_path, thread_arg).await;
     }
 
     // If `--api-port <PORT>` is set without `--gui`/`--tui`, run headless REST + MCP server if `--api-only` is passed;
     // otherwise spawn the REST server in the background alongside GUI/TUI (#35).
     if let Some(port) = api_port {
+        let db_path = authenticated_db_path(&s)?;
         let shared = std::sync::Arc::new(tokio::sync::Mutex::new(s.clone()));
         println!("🌐 REST API & MCP HTTP server đang lắng nghe tại http://127.0.0.1:{port}/api/v1/status");
         if args.iter().any(|a| a == "--api-only") {
-            return api_mcp::run_local_http_server(shared, port, "zalo_history.db".into()).await;
+            return api_mcp::run_local_http_server(shared, port, db_path).await;
         }
         tokio::spawn(async move {
-            let _ = api_mcp::run_local_http_server(shared, port, "zalo_history.db".into()).await;
+            let _ = api_mcp::run_local_http_server(shared, port, db_path).await;
         });
     }
 
@@ -330,15 +348,7 @@ async fn main() -> Result<()> {
             ..Default::default()
         };
 
-        let mut initial_threads = chat::load_threads_cache();
-        // Hydrate từ đúng account DB (read-point/vanish/note lưu theo acc, #119).
-        let startup_uin = s.login.as_ref().map(|l| l.uin.as_str()).unwrap_or("");
-        let startup_db = store::db_path_for_account(startup_uin);
-        store::load_history_into_threads(
-            &startup_db,
-            &mut initial_threads,
-            store::MessageStore::PRELOAD_MSGS,
-        );
+        let initial_threads = startup_account_threads(&s, store::MessageStore::PRELOAD_MSGS);
 
         let app_session = s;
         let res = eframe::run_native(
@@ -467,10 +477,7 @@ async fn main() -> Result<()> {
     }
 
     // Fetch initial threads and hydrate with local SQLite history
-    let mut initial_threads = chat::load_threads_cache();
-    let tui_uin = s.login.as_ref().map(|l| l.uin.as_str()).unwrap_or("");
-    let tui_db = store::db_path_for_account(tui_uin);
-    store::load_history_into_threads(&tui_db, &mut initial_threads, 200);
+    let mut initial_threads = startup_account_threads(&s, 200);
     if s.login.is_some() && server_ok && !offline_mode {
         match chat::get_friends(&s).await {
             Ok(list) => {
@@ -510,4 +517,30 @@ async fn main() -> Result<()> {
     tui::run_tui(tui_app).await?;
 
     Ok(())
+}
+
+/// Hydrate only the captured authenticated account before either UI first paints.
+fn startup_account_threads(session: &Session, limit: usize) -> Vec<chat::Thread> {
+    let Some(login) = session.login.as_ref() else {
+        return Vec::new();
+    };
+    let mut threads = chat::load_threads_cache_for_account(&login.uin);
+    match store::MessageStore::open_account(&login.uin) {
+        Ok(store) => {
+            if let Err(error) = store.hydrate_threads(&mut threads, limit) {
+                logger::log_error("main::hydrate_account_history", &error.to_string());
+            }
+        }
+        Err(error) => logger::log_error("main::open_account_history", &error.to_string()),
+    }
+    threads
+}
+
+fn authenticated_db_path(session: &Session) -> Result<String> {
+    let login = session
+        .login
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("Vui lòng đăng nhập trước khi mở API"))?;
+    store::MessageStore::open_account(&login.uin)?;
+    Ok(store::db_path_for_account(&login.uin))
 }
