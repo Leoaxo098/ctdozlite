@@ -46,7 +46,7 @@ pub(super) async fn handle_mobile_sync_controls(
                 crate::history_sync::set_latest_mobile_temp_key(&temp_key);
                 if trigger_sync_on_login {
                     let known = crate::chat::load_threads_cache_for_account(uin);
-                    queue_automatic_phone_sync(&gui_tx, known);
+                    queue_automatic_phone_sync(&gui_tx, uin, known);
                 }
             }
             crate::chat::MobileSyncControlEvent::WaitingConfirmOnPhone { sync_id } => {
@@ -357,13 +357,14 @@ impl Drop for VoiceRecording {
     }
 }
 
-fn queue_automatic_phone_sync(scope: &GuiTx, threads: Vec<Thread>) {
+fn queue_automatic_phone_sync(scope: &GuiTx, uin: &str, threads: Vec<Thread>) {
     if let Some(tx) = WORKER_TX.get() {
         // The original scope travels with the snapshot in case a switch is queued ahead of it.
-        let _ = tx.send(WorkerCmd::AutoSyncPhoneMessages {
-            scope: scope.clone(),
-            threads,
-        });
+        let _ = tx.send_for_account(
+            WorkerCmd::SyncPhoneMessages { threads, send_phone_prompt: false },
+            uin,
+            scope,
+        );
     }
 }
 
@@ -376,14 +377,20 @@ fn queue_mobile_sync_controls(
     if events.is_empty() {
         return;
     }
+    let Some(login) = session.login.as_ref() else {
+        return;
+    };
     if let Some(tx) = WORKER_TX.get() {
         // Dispatch through the account task set so transitions can cancel downloads and imports.
-        let _ = tx.send(WorkerCmd::HandleMobileSyncControls {
-            scope: scope.clone(),
-            events,
-            session: Box::new(session.clone()),
-            trigger_sync_on_login,
-        });
+        let _ = tx.send_for_account(
+            WorkerCmd::HandleMobileSyncControls {
+                events,
+                session: Box::new(session.clone()),
+                trigger_sync_on_login,
+            },
+            &login.uin,
+            scope,
+        );
     }
 }
 
@@ -591,6 +598,16 @@ pub enum WorkerCmd {
         uin: String,
         id: i64,
     },
+    /// Make an unclaimed schedule due through the scheduler's single delivery path.
+    SendScheduledMessageNow {
+        uin: String,
+        id: i64,
+    },
+    /// Load the originating account's schedule on a blocking worker.
+    LoadScheduledMessages {
+        uin: String,
+        notify_sent: bool,
+    },
     CheckForUpdates {
         silent: bool,
     },
@@ -674,14 +691,8 @@ pub enum WorkerCmd {
         threads: Vec<Thread>,
         send_phone_prompt: bool,
     },
-    /// Automatically sync cached conversations for the account that supplied them.
-    AutoSyncPhoneMessages {
-        scope: GuiTx,
-        threads: Vec<Thread>,
-    },
     /// Process phone sync controls under the originating account's lifetime.
     HandleMobileSyncControls {
-        scope: GuiTx,
         events: Vec<crate::chat::MobileSyncControlEvent>,
         session: Box<Session>,
         trigger_sync_on_login: bool,
@@ -714,8 +725,225 @@ pub enum WorkerCmd {
     },
 }
 
-pub(super) static WORKER_TX: std::sync::OnceLock<tokio::sync::mpsc::UnboundedSender<WorkerCmd>> =
-    std::sync::OnceLock::new();
+struct QueuedWorkerCommand {
+    command: WorkerCmd,
+    origin_uin: Option<String>,
+    origin_events: Option<GuiTx>,
+}
+
+impl QueuedWorkerCommand {
+    fn origin_is_current(&self) -> bool {
+        self.origin_events.as_ref().is_none_or(GuiTx::is_current)
+    }
+    fn origin_matches(&self, uin: &str) -> bool {
+        self.origin_uin
+            .as_deref()
+            .is_none_or(|origin| origin == uin)
+    }
+
+    fn accepts_account(&self, current_uin: &str) -> bool {
+        // Authentication replaces an identity; its enqueue-time epoch is checked first.
+        if matches!(
+            self.command,
+            WorkerCmd::RequestQr | WorkerCmd::LoginPassword { .. }
+        ) {
+            return true;
+        }
+        self.origin_matches(current_uin)
+            || (current_uin.is_empty()
+                && matches!(self.command, WorkerCmd::Logout | WorkerCmd::BeginAddAccount))
+    }
+}
+
+pub(super) struct WorkerTx {
+    sender: tokio::sync::mpsc::UnboundedSender<QueuedWorkerCommand>,
+    // Updated only when the UI displays a new identity, independently of worker transitions.
+    visible_account: std::sync::Mutex<(String, GuiTx)>,
+    root_events: GuiTx,
+}
+
+impl WorkerTx {
+    fn new(
+        sender: tokio::sync::mpsc::UnboundedSender<QueuedWorkerCommand>,
+        uin: String,
+        events: &GuiTx,
+    ) -> Self {
+        Self {
+            sender,
+            visible_account: std::sync::Mutex::new((uin, events.scoped())),
+            root_events: events.clone(),
+        }
+    }
+
+    pub(super) fn set_visible_account(&self, uin: &str) {
+        if let Ok(mut visible) = self.visible_account.lock() {
+            *visible = (uin.to_string(), self.root_events.scoped());
+        }
+    }
+
+    pub(super) fn send(
+        &self,
+        command: WorkerCmd,
+    ) -> Result<(), tokio::sync::mpsc::error::SendError<()>> {
+        let (origin_uin, origin_events) = if command.is_app_wide() {
+            (None, None)
+        } else {
+            let visible = self
+                .visible_account
+                .lock()
+                .map_err(|_| tokio::sync::mpsc::error::SendError(()))?;
+            (Some(visible.0.clone()), Some(visible.1.clone()))
+        };
+        self.sender
+            .send(QueuedWorkerCommand {
+                command,
+                origin_uin,
+                origin_events,
+            })
+            .map_err(|_| tokio::sync::mpsc::error::SendError(()))
+    }
+
+    fn send_for_account(
+        &self,
+        command: WorkerCmd,
+        uin: &str,
+        events: &GuiTx,
+    ) -> Result<(), tokio::sync::mpsc::error::SendError<()>> {
+        self.sender
+            .send(QueuedWorkerCommand {
+                command,
+                origin_uin: Some(uin.to_string()),
+                origin_events: Some(events.clone()),
+            })
+            .map_err(|_| tokio::sync::mpsc::error::SendError(()))
+    }
+
+    fn send_if_current(
+        &self,
+        command: WorkerCmd,
+        events: &GuiTx,
+    ) -> Result<(), tokio::sync::mpsc::error::SendError<()>> {
+        let origin = self
+            .visible_account
+            .lock()
+            .map(|visible| visible.0.clone())
+            .map_err(|_| tokio::sync::mpsc::error::SendError(()))?;
+        if !events.is_current() {
+            return Ok(());
+        }
+        self.send_for_account(command, &origin, events)
+    }
+}
+
+impl WorkerCmd {
+    fn is_transition(&self) -> bool {
+        matches!(
+            self,
+            Self::Logout
+                | Self::BeginAddAccount
+                | Self::SwitchAccount { .. }
+                | Self::RequestQr
+                | Self::LoginPassword { .. }
+        )
+    }
+    fn is_app_wide(&self) -> bool {
+        matches!(
+            self,
+            Self::ReadNotificationAuthorization { .. }
+                | Self::RequestNotificationAuthorization { .. }
+                | Self::CheckForUpdates { .. }
+                | Self::DownloadAndApplyUpdate { .. }
+                | Self::RefreshMediaDevices
+        )
+    }
+
+    fn needs_session_snapshot(&self) -> bool {
+        // Only authentication and guarded session-maintenance flows update the live session.
+        !matches!(
+            self,
+            Self::RequestQr
+                | Self::LoginPassword { .. }
+                | Self::SetProxy { .. }
+                | Self::RefreshThreads
+                | Self::RefreshThreadsManual
+                | Self::PollMessages { .. }
+        )
+    }
+}
+
+pub(super) static WORKER_TX: std::sync::OnceLock<WorkerTx> = std::sync::OnceLock::new();
+
+async fn next_worker_command(
+    receiver: &mut tokio::sync::mpsc::UnboundedReceiver<QueuedWorkerCommand>,
+    deferred: &mut std::collections::VecDeque<QueuedWorkerCommand>,
+) -> Option<QueuedWorkerCommand> {
+    loop {
+        tokio::select! {
+            biased;
+            next = receiver.recv() => {
+                let next = next?;
+                if !deferred.is_empty() && !next.command.is_app_wide() && !next.command.is_transition() {
+                    deferred.push_back(next);
+                } else {
+                    return Some(next);
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_millis(10)), if !deferred.is_empty() => {
+                return deferred.pop_front();
+            }
+        }
+    }
+}
+
+fn try_command_snapshot(
+    command: &WorkerCmd,
+    live: &std::sync::Arc<tokio::sync::Mutex<Session>>,
+) -> Option<Option<Session>> {
+    if command.is_app_wide() {
+        Some(None)
+    } else {
+        live.try_lock().ok().map(|session| Some(session.clone()))
+    }
+}
+
+fn session_for_command(
+    command: &WorkerCmd,
+    snapshot: Option<&Session>,
+    live: &std::sync::Arc<tokio::sync::Mutex<Session>>,
+) -> std::sync::Arc<tokio::sync::Mutex<Session>> {
+    if command.needs_session_snapshot() {
+        if let Some(snapshot) = snapshot {
+            return std::sync::Arc::new(tokio::sync::Mutex::new(snapshot.clone()));
+        }
+    }
+    live.clone()
+}
+
+fn authentication_events(
+    command: &WorkerCmd,
+    events: GuiTx,
+    call_bridge: &crate::call::CallBridge,
+) -> GuiTx {
+    if matches!(
+        command,
+        WorkerCmd::RequestQr | WorkerCmd::LoginPassword { .. }
+    ) {
+        let next = events.advance_account();
+        call_bridge.end_call();
+        let _ = next.send(GuiEvent::LoggedOut);
+        next
+    } else {
+        events
+    }
+}
+
+fn departing_account_uin(session: &Session, origin_uin: &str) -> String {
+    session
+        .login
+        .as_ref()
+        .map(|login| login.uin.clone())
+        .unwrap_or_else(|| origin_uin.to_string())
+}
 
 pub(super) fn extract_msg_id(resp: &serde_json::Value) -> String {
     resp.get("data")
@@ -821,8 +1049,13 @@ async fn prefetch_missing_sticker_thumbnails(
 }
 
 pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: egui::Context) {
-    let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<WorkerCmd>();
-    let _ = WORKER_TX.set(cmd_tx);
+    let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<QueuedWorkerCommand>();
+    let visible_uin = session
+        .login
+        .as_ref()
+        .map(|login| login.uin.clone())
+        .unwrap_or_default();
+    let _ = WORKER_TX.set(WorkerTx::new(cmd_tx, visible_uin, &gui_tx));
     if let Some(tx) = WORKER_TX.get() {
         // Cache-only UI reads can start immediately while driver discovery runs here.
         let _ = tx.send(WorkerCmd::RefreshMediaDevices);
@@ -1239,7 +1472,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                         let s = s_kw.lock().await.clone();
                         if s.login.is_some() {
                             if let Some(tx) = WORKER_TX.get() {
-                                let _ = tx.send(WorkerCmd::RefreshThreads);
+                                let _ = tx.send_for_account(WorkerCmd::RefreshThreads, s.login.as_ref().map(|login| login.uin.as_str()).unwrap_or_default(), &gui_tx_kw.scoped());
                             }
                             if let Ok(kws) = crate::chat::fetch_sticker_suggest_keywords(&s).await {
                                 if !kws.is_empty() {
@@ -1307,7 +1540,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                             for voip_ev in
                                                 crate::call::extract_voip_controls(data_node)
                                             {
-                                                cb.handle_control_event(voip_ev);
+                                                cb.for_account(s_snap.clone(), gui_tx_ws.clone()).handle_control_event(voip_ev);
                                             }
                                             crate::chat::dispatch_file_done_controls(data_node);
                                             let mute_evs = crate::chat::extract_mute_controls(
@@ -1455,7 +1688,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                 if let Ok((events, mute_evs, typing_evs, seen_evs)) = ctrl_res {
                                     if !scope.is_current() { continue; }
                                     for ev in events {
-                                        cb.handle_control_event(ev);
+                                        cb.for_account(s_snap.clone(), scope.clone()).handle_control_event(ev);
                                     }
                                     if !mute_evs.is_empty() {
                                         let _ = scope
@@ -1520,10 +1753,38 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                 let mut current_password_task: Option<tokio::task::AbortHandle> = None;
                 let mut account_tasks = tokio::task::JoinSet::new();
                 let mut global_tasks = tokio::task::JoinSet::new();
+                let mut deferred = std::collections::VecDeque::new();
 
-                while let Some(cmd) = cmd_rx.recv().await {
+                while let Some(queued) = next_worker_command(&mut cmd_rx, &mut deferred).await {
                     while account_tasks.try_join_next().is_some() {}
                     while global_tasks.try_join_next().is_some() {}
+                    if !queued.origin_is_current() {
+                        let _ = gui_tx.send(GuiEvent::StatusUpdate("Tài khoản đã thay đổi; vui lòng thực hiện lại thao tác.".into()));
+                        continue;
+                    }
+                    // Login tasks can hold the session across network awaits. Cancel them
+                    // before attempting to inspect that session for a transition command.
+                    if queued.command.is_transition()
+                    {
+                        if let Some(task) = current_qr_task.take() { task.abort(); }
+                        account_tasks.abort_all();
+                    }
+                    // App-wide authorization, updates and discovery do not wait for login.
+                    let Some(snapshot) = try_command_snapshot(&queued.command, &session) else {
+                        // Keep FIFO for ordinary actions while allowing app-wide commands and
+                        // account transitions to bypass login's long critical section.
+                        deferred.push_front(queued);
+                        continue;
+                    };
+                    let current_uin = snapshot.as_ref().and_then(|snapshot| snapshot.login.as_ref())
+                        .map(|login| login.uin.clone()).unwrap_or_default();
+                    if !queued.accepts_account(&current_uin) {
+                        let _ = gui_tx.send(GuiEvent::StatusUpdate("Tài khoản đã thay đổi; vui lòng thực hiện lại thao tác.".into()));
+                        continue;
+                    }
+                    let command_origin = queued.origin_uin.clone().unwrap_or_default();
+                    let cmd = queued.command;
+                    let command_session = session_for_command(&cmd, snapshot.as_ref(), &session);
                     let global = matches!(&cmd,
                         WorkerCmd::ReadNotificationAuthorization { .. }
                         | WorkerCmd::RequestNotificationAuthorization { .. }
@@ -1533,10 +1794,12 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                     );
                     let tasks = if global { &mut global_tasks } else { &mut account_tasks };
                     let gui_tx = if global { gui_tx.clone() } else { gui_tx.scoped() };
+                    let call_bridge = snapshot.map(|snapshot| call_bridge.for_account(snapshot, gui_tx.clone()))
+                        .unwrap_or_else(|| call_bridge.as_ref().clone());
+                    let gui_tx = authentication_events(&cmd, gui_tx, &call_bridge);
                     match cmd {
                         WorkerCmd::RefreshSavedAccounts { request_id } => {
-                            let uin = session.lock().await.login.as_ref()
-                                .map(|login| login.uin.clone()).unwrap_or_default();
+                            let uin = current_uin.clone();
                             let tx = gui_tx.clone();
                             tasks.spawn(async move {
                                 let result = tokio::task::spawn_blocking(move ||
@@ -1547,8 +1810,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             });
                         }
                         WorkerCmd::DeleteSavedAccount { request_id, target_uin } => {
-                            let uin = session.lock().await.login.as_ref()
-                                .map(|login| login.uin.clone()).unwrap_or_default();
+                            let uin = current_uin.clone();
                             // Serialize deletion with account switches so the target cannot become
                             // active between validation and removal. The UI remains asynchronous.
                             let result = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
@@ -1609,8 +1871,8 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             });
                         }
                         WorkerCmd::ImportHistory { uin, path } => {
-                            tokio::task::spawn_blocking(move || {
-                                let result = (|| -> anyhow::Result<_> {
+                            tasks.spawn(async move {
+                                let result = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
                                     crate::store::MessageStore::open_account(&uin)?;
                                     let summary = crate::store::import_history_from_path(
                                         &path, &crate::store::db_path_for_account(&uin),
@@ -1621,19 +1883,48 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                     )?;
                                     crate::chat::save_threads_cache_for_account(&uin, &threads);
                                     Ok((summary, threads))
-                                })();
+                                }).await.unwrap_or_else(|error| Err(error.into()));
                                 match result {
                                     Ok((summary, threads)) => {
                                         let _ = gui_tx.send(GuiEvent::ThreadsUpdated(threads));
-                                        let _ = gui_tx.send(GuiEvent::StatusUpdate(format!(
+                                        let _ = gui_tx.send(GuiEvent::HistoryImportFinished(Ok(format!(
                                             "Đã nhập {} tin nhắn từ {} hội thoại.",
                                             summary.messages_imported, summary.threads_imported,
-                                        )));
+                                        ))));
                                     }
                                     Err(error) => {
-                                        let _ = gui_tx.send(GuiEvent::StatusUpdate(format!("Lỗi nhập lịch sử: {error}")));
+                                        let _ = gui_tx.send(GuiEvent::HistoryImportFinished(Err(error.to_string())));
                                     }
                                 }
+                            });
+                        }
+                        WorkerCmd::LoadScheduledMessages { uin, notify_sent } => {
+                            tasks.spawn(async move {
+                                let result = tokio::task::spawn_blocking(move || {
+                                    crate::store::MessageStore::open_account(&uin)?;
+                                    crate::scheduler::list_pending_scheduled(
+                                        &crate::store::db_path_for_account(&uin), None,
+                                    )
+                                }).await.unwrap_or_else(|error| Err(error.into()));
+                                let _ = gui_tx.send(GuiEvent::ScheduledItemsLoaded {
+                                    result: result.map_err(|error| error.to_string()),
+                                    notify_sent,
+                                });
+                            });
+                        }
+                        WorkerCmd::SendScheduledMessageNow { uin, id } => {
+                            tasks.spawn(async move {
+                                let result = tokio::task::spawn_blocking(move || {
+                                    crate::account_manager::validate_uin(&uin)?;
+                                    crate::scheduler::send_scheduled_now(
+                                        &crate::store::db_path_for_account(&uin), id,
+                                        crate::login::unix_now() as i64,
+                                    )
+                                }).await.unwrap_or_else(|error| Err(error.into()));
+                                let _ = gui_tx.send(GuiEvent::ScheduledListUpdated);
+                                let _ = gui_tx.send(GuiEvent::ScheduleSendNowFinished(
+                                    result.map_err(|error| error.to_string()),
+                                ));
                             });
                         }
                         WorkerCmd::CancelScheduledMessage { uin, id } => {
@@ -1644,24 +1935,21 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                         &crate::store::db_path_for_account(&uin), id,
                                     )
                                 }).await.unwrap_or_else(|error| Err(error.into()));
-                                let event = match result {
-                                    Ok(true) => GuiEvent::ScheduledListUpdated,
-                                    Ok(false) => GuiEvent::StatusUpdate("Lịch hẹn không còn chờ gửi.".into()),
-                                    Err(error) => GuiEvent::StatusUpdate(format!("Không thể huỷ lịch hẹn: {error}")),
-                                };
-                                let _ = gui_tx.send(event);
+                                let _ = gui_tx.send(GuiEvent::ScheduleCancelFinished(
+                                    result.map_err(|error| error.to_string()),
+                                ));
                             });
                         }
                         WorkerCmd::Logout | WorkerCmd::BeginAddAccount => {
                             let adding_account = matches!(cmd, WorkerCmd::BeginAddAccount);
-                            call_bridge.end_call();
                             account_tasks.abort_all();
                             if let Some(task) = current_qr_task.take() {
                                 task.abort();
                             }
                             let (cur_uin, gui_tx) = {
                                 let mut s = session.lock().await;
-                                let uin = s.login.as_ref().map(|l| l.uin.clone()).unwrap_or_default();
+                                call_bridge.end_call_for_account(s.clone(), gui_tx.scoped());
+                                let uin = departing_account_uin(&s, &command_origin);
                                 let tx = gui_tx.advance_account();
                                 s.logout();
                                 (uin, tx)
@@ -1689,13 +1977,13 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             egui_ctx.request_repaint();
                         }
                         WorkerCmd::SwitchAccount { target_uin } => {
-                            call_bridge.end_call();
                             account_tasks.abort_all();
                             if let Some(task) = current_qr_task.take() {
                                 task.abort();
                             }
                             let (previous, gui_tx) = {
                                 let mut s = session.lock().await;
+                                call_bridge.end_call_for_account(s.clone(), gui_tx.scoped());
                                 let previous = s.clone();
                                 let tx = gui_tx.advance_account();
                                 // Background loops see no active account during the disk transition.
@@ -1740,7 +2028,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             egui_ctx.request_repaint();
                         }
                         WorkerCmd::WipeLocalData => {
-                            let uin = session.lock().await.login.as_ref().map(|l| l.uin.clone()).unwrap_or_default();
+                            let uin = current_uin.clone();
                             let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
                                 let store = crate::store::MessageStore::open_account(&uin)?;
                                 store.conn.execute_batch("BEGIN IMMEDIATE; DELETE FROM messages; DELETE FROM threads; COMMIT;")?;
@@ -1758,7 +2046,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             thread_id,
                             is_group,
                         } => {
-                            let session_clone = session.clone();
+                            let session_clone = command_session.clone();
                             let gui_tx_clone = gui_tx.clone();
                             tasks.spawn(async move {
                                 let s = session_clone.lock().await.clone();
@@ -1782,7 +2070,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             pin,
                             topic_id,
                         } => {
-                            let session_clone = session.clone();
+                            let session_clone = command_session.clone();
                             let gui_tx_clone = gui_tx.clone();
                             tasks.spawn(async move {
                                 let s = session_clone.lock().await.clone();
@@ -1841,7 +2129,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             pin,
                         } => {
 
-                            let session_clone = session.clone();
+                            let session_clone = command_session.clone();
                             tasks.spawn(async move {
 
                                 let s = session_clone.lock().await.clone();
@@ -1857,7 +2145,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             unread,
                         } => {
 
-                            let session_clone = session.clone();
+                            let session_clone = command_session.clone();
                             tasks.spawn(async move {
 
                                 let s = session_clone.lock().await.clone();
@@ -1873,7 +2161,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             mute,
                         } => {
 
-                            let session_clone = session.clone();
+                            let session_clone = command_session.clone();
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
                             tasks.spawn(async move {
@@ -1906,7 +2194,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             hide,
                         } => {
 
-                            let session_clone = session.clone();
+                            let session_clone = command_session.clone();
                             tasks.spawn(async move {
 
                                 let s = session_clone.lock().await.clone();
@@ -1927,12 +2215,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             // chỉ ghi history DB thì sweep skip vì active DB không có
                             // setting → tin đủ hạn vẫn hiển thị, #1156). Lỗi persist
                             // chỉ log, GUI vẫn giữ trạng thái RAM.
-                            let db_path = {
-                                let s = session.lock().await;
-                                let uin =
-                                    s.login.as_ref().map(|l| l.uin.clone()).unwrap_or_default();
-                                crate::store::db_path_for_account(&uin)
-                            };
+                            let db_path = crate::store::db_path_for_account(&current_uin);
                             let now_sec = crate::login::unix_now();
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
@@ -1988,7 +2271,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             last_cli_msg_id,
                         } => {
 
-                            let session_clone = session.clone();
+                            let session_clone = command_session.clone();
                             tasks.spawn(async move {
 
                                 let s = session_clone.lock().await.clone();
@@ -2014,7 +2297,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             });
                         }
                         WorkerCmd::LeaveGroup { group_id, silent } => {
-                            let session_clone = session.clone();
+                            let session_clone = command_session.clone();
                             let gui_tx_clone = gui_tx.clone();
                             let egui_ctx_clone = egui_ctx.clone();
                             let gid = group_id.clone();
@@ -2045,7 +2328,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                 task.abort();
                             }
 
-                            let session_clone = session.clone();
+                            let session_clone = command_session.clone();
                             let poll_clone = poll_state.clone();
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
@@ -2297,7 +2580,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                                             .send(GuiEvent::ThreadsUpdated(list));
                                                         ctx_clone.request_repaint();
 
-                                                        queue_automatic_phone_sync(&gui_tx_clone, sync_snapshot);
+                                                        queue_automatic_phone_sync(&gui_tx_clone, &uin, sync_snapshot);
 
                                                         let s_kw = s.clone();
                                                         let tx_kw = gui_tx_clone.clone();
@@ -2327,7 +2610,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                         ref cmd @ (WorkerCmd::RefreshThreads | WorkerCmd::RefreshThreadsManual) => {
                             let manual = matches!(cmd, WorkerCmd::RefreshThreadsManual);
 
-                            let session_clone = session.clone();
+                            let session_clone = command_session.clone();
                             let poll_clone = poll_state.clone();
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
@@ -2352,7 +2635,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                             ));
                                             ctx_clone.request_repaint();
                                             if let Some(tx) = WORKER_TX.get() {
-                                                let _ = tx.send(WorkerCmd::RequestQr);
+                                                let _ = tx.send_if_current(WorkerCmd::RequestQr, &gui_tx_clone);
                                             }
                                             return;
                                         }
@@ -2532,7 +2815,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             let poll_permit = RunningPermit(&IS_POLLING);
 
 
-                            let session_clone = session.clone();
+                            let session_clone = command_session.clone();
                             let poll_clone = poll_state.clone();
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
@@ -2613,7 +2896,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                                 ));
                                                 ctx_clone.request_repaint();
                                                 if let Some(tx) = WORKER_TX.get() {
-                                                    let _ = tx.send(WorkerCmd::RequestQr);
+                                                    let _ = tx.send_if_current(WorkerCmd::RequestQr, &gui_tx_clone);
                                                 }
                                             } else {
                                                 // The session is untouched: report and retry on
@@ -2731,7 +3014,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             crate::history_sync::CANCEL.store(false, Ordering::Relaxed);
                             let running_permit = RunningPermit(&crate::history_sync::RUNNING);
 
-                            let session_clone = session.clone();
+                            let session_clone = command_session.clone();
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
                             tasks.spawn(async move {
@@ -2817,7 +3100,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             have,
                         } => {
 
-                            let session_clone = session.clone();
+                            let session_clone = command_session.clone();
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
                             tasks.spawn(async move {
@@ -3002,7 +3285,8 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             is_group,
                         } => {
 
-                            let session_clone = session.clone();
+                            let session_clone = command_session.clone();
+                            let session_state = session.clone();
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
                             tasks.spawn(async move {
@@ -3114,7 +3398,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                             == crate::session::SessionStatus::Expired
                                         {
                                             {
-                                                let mut sl = session_clone.lock().await; if !gui_tx_clone.is_current() { return; }
+                                                let mut sl = session_state.lock().await; if !gui_tx_clone.is_current() { return; }
                                                 sl.mark_expired();
                                                 let _ = sl.save_to_file("session.json");
                                                 sl.logout();
@@ -3123,7 +3407,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                                 "Không thể gửi vì phiên zpw_sek đã hết hạn".into(),
                                             ));
                                             if let Some(tx) = WORKER_TX.get() {
-                                                let _ = tx.send(WorkerCmd::RequestQr);
+                                                let _ = tx.send_if_current(WorkerCmd::RequestQr, &gui_tx_clone);
                                             }
                                         }
                                         ctx_clone.request_repaint();
@@ -3138,7 +3422,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             is_group,
                         } => {
 
-                            let session_clone = session.clone();
+                            let session_clone = command_session.clone();
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
                             tasks.spawn(async move {
@@ -3178,7 +3462,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             target_name,
                         } => {
 
-                            let session_clone = session.clone();
+                            let session_clone = command_session.clone();
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
                             tasks.spawn(async move {
@@ -3275,7 +3559,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             reaction,
                         } => {
 
-                            let session_clone = session.clone();
+                            let session_clone = command_session.clone();
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
                             tasks.spawn(async move {
@@ -3320,7 +3604,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             msg,
                         } => {
 
-                            let session_clone = session.clone();
+                            let session_clone = command_session.clone();
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
                             tasks.spawn(async move {
@@ -3380,7 +3664,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             msg,
                         } => {
 
-                            let session_clone = session.clone();
+                            let session_clone = command_session.clone();
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
                             tasks.spawn(async move {
@@ -3428,7 +3712,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             old_msg,
                             new_text,
                         } => {
-                            let session_clone = session.clone();
+                            let session_clone = command_session.clone();
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
                             tasks.spawn(async move {
@@ -3502,7 +3786,8 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             is_group,
                         } => {
 
-                            let session_clone = session.clone();
+                            let session_clone = command_session.clone();
+                            let session_state = session.clone();
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
                             if cate_id == AMI_FAT_CAT_CATE_ID {
@@ -3618,7 +3903,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                             == crate::session::SessionStatus::Expired
                                         {
                                             {
-                                                let mut sl = session_clone.lock().await; if !gui_tx_clone.is_current() { return; }
+                                                let mut sl = session_state.lock().await; if !gui_tx_clone.is_current() { return; }
                                                 sl.mark_expired();
                                                 let _ = sl.save_to_file("session.json");
                                                 sl.logout();
@@ -3628,7 +3913,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                                     .into(),
                                             ));
                                             if let Some(tx) = WORKER_TX.get() {
-                                                let _ = tx.send(WorkerCmd::RequestQr);
+                                                let _ = tx.send_if_current(WorkerCmd::RequestQr, &gui_tx_clone);
                                             }
                                         }
                                         ctx_clone.request_repaint();
@@ -3638,7 +3923,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                         }
                         WorkerCmd::FetchStickerImage { key, url } => {
 
-                            let session_clone = session.clone();
+                            let session_clone = command_session.clone();
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
                             if key.starts_with("stk_99901_") {
@@ -3801,7 +4086,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                         }
                         WorkerCmd::FetchStickerStore => {
 
-                            let session_clone = session.clone();
+                            let session_clone = command_session.clone();
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
                             tasks.spawn(async move {
@@ -3829,7 +4114,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                         }
                         WorkerCmd::FetchStickerPack { cate_id, name } => {
 
-                            let session_clone = session.clone();
+                            let session_clone = command_session.clone();
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
                             tasks.spawn(async move {
@@ -3862,7 +4147,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                         }
                         WorkerCmd::SearchStickers { keyword } => {
 
-                            let session_clone = session.clone();
+                            let session_clone = command_session.clone();
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
                             tasks.spawn(async move {
@@ -3904,7 +4189,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                         }
                         WorkerCmd::SuggestComposerStickers { keyword } => {
 
-                            let session_clone = session.clone();
+                            let session_clone = command_session.clone();
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
                             tasks.spawn(async move {
@@ -3932,7 +4217,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                         }
                         WorkerCmd::ParseLinkPreview { url } => {
 
-                            let session_clone = session.clone();
+                            let session_clone = command_session.clone();
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
                             tasks.spawn(async move {
@@ -3952,7 +4237,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             source_lang,
                             generation,
                         } => {
-                            let session_clone = session.clone();
+                            let session_clone = command_session.clone();
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
                             tasks.spawn(async move {
@@ -4043,7 +4328,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             original_hd,
                         } => {
 
-                            let session_clone = session.clone();
+                            let session_clone = command_session.clone();
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
                             tasks.spawn(async move {
@@ -4167,7 +4452,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             mime,
                             duration_secs,
                         } => {
-                            let session_clone = session.clone();
+                            let session_clone = command_session.clone();
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
                             let recording = VoiceRecording { path: voice_path, dir: voice_dir };
@@ -4255,7 +4540,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                         }
                         WorkerCmd::CheckFriendStatus { user_id } => {
 
-                            let session_clone = session.clone();
+                            let session_clone = command_session.clone();
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
                             tasks.spawn(async move {
@@ -4277,7 +4562,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                         }
                         WorkerCmd::AcceptFriend { user_id, user_name } => {
 
-                            let session_clone = session.clone();
+                            let session_clone = command_session.clone();
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
                             tasks.spawn(async move {
@@ -4305,7 +4590,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                         }
                         WorkerCmd::RejectFriend { user_id, user_name } => {
 
-                            let session_clone = session.clone();
+                            let session_clone = command_session.clone();
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
                             tasks.spawn(async move {
@@ -4329,7 +4614,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                         }
                         WorkerCmd::UndoFriend { user_id, user_name } => {
 
-                            let session_clone = session.clone();
+                            let session_clone = command_session.clone();
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
                             tasks.spawn(async move {
@@ -4350,7 +4635,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                         }
                         WorkerCmd::AddFriend { user_id, user_name } => {
 
-                            let session_clone = session.clone();
+                            let session_clone = command_session.clone();
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
                             tasks.spawn(async move {
@@ -4397,7 +4682,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                         }
                         WorkerCmd::LookupPhone { phone } => {
 
-                            let session_clone = session.clone();
+                            let session_clone = command_session.clone();
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
                             tasks.spawn(async move {
@@ -4422,7 +4707,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                         }
                         WorkerCmd::LoginPassword { phone, pass } => {
 
-                            let session_clone = session.clone();
+                            let session_clone = command_session.clone();
                             let poll_clone = poll_state.clone();
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
@@ -4435,6 +4720,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                 ));
                                 ctx_clone.request_repaint();
                                 let mut s = session_clone.lock().await; if !gui_tx_clone.is_current() { return; }
+                                s.logout();
                                 match crate::login::login_by_password(&mut s, &phone, &pass, "VN")
                                     .await
                                 {
@@ -4557,7 +4843,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                                     .send(GuiEvent::ThreadsUpdated(list));
                                                 ctx_clone.request_repaint();
 
-                                                queue_automatic_phone_sync(&gui_tx_clone, sync_snapshot);
+                                                queue_automatic_phone_sync(&gui_tx_clone, &uin, sync_snapshot);
                                             }
                                         }
                                     }
@@ -4637,7 +4923,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                         }
                         WorkerCmd::FetchSocialProfile { target_uid } => {
 
-                            let session_clone = session.clone();
+                            let session_clone = command_session.clone();
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
                             tasks.spawn(async move {
@@ -4653,7 +4939,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                         }
                         WorkerCmd::FetchGroupMembers { group_id } => {
 
-                            let session_clone = session.clone();
+                            let session_clone = command_session.clone();
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
                             tasks.spawn(async move {
@@ -4745,7 +5031,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                         }
                         WorkerCmd::FetchMySocialAvatars { page, count } => {
 
-                            let session_clone = session.clone();
+                            let session_clone = command_session.clone();
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
                             tasks.spawn(async move {
@@ -4764,7 +5050,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             shared_media_by_uid,
                         } => {
 
-                            let session_clone = session.clone();
+                            let session_clone = command_session.clone();
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
                             tasks.spawn(async move {
@@ -4779,29 +5065,19 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             });
                         }
                         WorkerCmd::HandleMobileSyncControls {
-                            scope,
                             events,
                             session,
                             trigger_sync_on_login,
                         } => {
-                            if scope.is_current() {
-                                tasks.spawn(handle_mobile_sync_controls(
-                                    events,
-                                    *session,
-                                    scope,
-                                    egui_ctx.clone(),
-                                    trigger_sync_on_login,
-                                ));
-                            }
+                            tasks.spawn(handle_mobile_sync_controls(
+                                events,
+                                *session,
+                                gui_tx.clone(),
+                                egui_ctx.clone(),
+                                trigger_sync_on_login,
+                            ));
                         }
-                        WorkerCmd::AutoSyncPhoneMessages { ref scope, .. } if !scope.is_current() => {
-                            continue;
-                        }
-                        WorkerCmd::AutoSyncPhoneMessages { mut threads, .. }
-                        | WorkerCmd::SyncPhoneMessages { mut threads, .. } => {
-                            let send_phone_prompt = matches!(cmd, WorkerCmd::SyncPhoneMessages {
-                                send_phone_prompt: true, ..
-                            });
+                        WorkerCmd::SyncPhoneMessages { mut threads, send_phone_prompt } => {
                             use std::sync::atomic::Ordering;
                             if crate::history_sync::PHONE_SYNC_RUNNING.swap(true, Ordering::SeqCst)
                             {
@@ -4814,7 +5090,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             crate::history_sync::PHONE_SYNC_CANCEL.store(false, Ordering::Relaxed);
 
                             let running_permit = RunningPermit(&crate::history_sync::PHONE_SYNC_RUNNING);
-                            let session_clone = session.clone();
+                            let session_clone = command_session.clone();
                             let poll_clone = poll_state.clone();
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
@@ -4870,7 +5146,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             });
                         }
                         WorkerCmd::SetProxy { proxy_url } => {
-                            let session_clone = session.clone();
+                            let session_clone = command_session.clone();
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
                             tasks.spawn(async move {
@@ -4893,7 +5169,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             file_name,
                             download_dir,
                         } => {
-                            let session_clone = session.clone();
+                            let session_clone = command_session.clone();
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
                             tasks.spawn(async move {
@@ -4921,7 +5197,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             url,
                             file_name,
                         } => {
-                            let session_clone = session.clone();
+                            let session_clone = command_session.clone();
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
                             tasks.spawn(async move {
@@ -4963,7 +5239,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             });
                         }
                         WorkerCmd::FetchVideoThumbnail { key, url } => {
-                            let session_clone = session.clone();
+                            let session_clone = command_session.clone();
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
                             tasks.spawn(async move {
@@ -5019,7 +5295,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             thread_id,
                             is_group,
                         } => {
-                            let session_clone = session.clone();
+                            let session_clone = command_session.clone();
                             tasks.spawn(async move {
                                 let s = session_clone.lock().await.clone();
                                 let _ = crate::chat::send_typing_indicator(&s, &thread_id, is_group).await;
@@ -5030,7 +5306,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             is_group,
                             last_msg_id,
                         } => {
-                            let session_clone = session.clone();
+                            let session_clone = command_session.clone();
                             tasks.spawn(async move {
                                 let s = session_clone.lock().await.clone();
                                 let _ = crate::chat::send_seen_v2(&s, &thread_id, is_group, &last_msg_id).await;
@@ -5539,8 +5815,218 @@ pub(crate) fn capture_screen_interactive(gui_tx: crate::gui::GuiTx, ctx: egui::C
 
 #[cfg(test)]
 mod account_task_tests {
-    use super::RunningPermit;
+    use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[tokio::test]
+    async fn replacement_login_invalidates_expired_account_completions() {
+        let session = Session::new(false, false, false).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let root = GuiTx::new(tx, egui::Context::default());
+        let departing = root.scoped();
+        let bridge = crate::call::CallBridge::spawn(
+            std::sync::Arc::new(tokio::sync::Mutex::new(session.clone())),
+            root.clone(),
+            egui::Context::default(),
+        )
+        .for_account(session, departing.clone());
+        let current = authentication_events(&WorkerCmd::RequestQr, departing.clone(), &bridge);
+        assert!(!departing.is_current());
+        assert!(current.is_current());
+        assert!(matches!(
+            rx.try_recv().unwrap().for_current_account(),
+            Some(GuiEvent::LoggedOut)
+        ));
+    }
+
+    #[test]
+    fn explicit_logout_keeps_the_owner_after_runtime_session_expiration() {
+        let session = Session::new(false, false, false).unwrap();
+        let logout = QueuedWorkerCommand {
+            command: WorkerCmd::Logout,
+            origin_uin: Some("account-a".into()),
+            origin_events: None,
+        };
+        assert!(logout.accepts_account(""));
+        assert!(!logout.accepts_account("account-b"));
+        assert_eq!(departing_account_uin(&session, "account-a"), "account-a");
+    }
+
+    #[tokio::test]
+    async fn locked_login_session_does_not_block_app_wide_commands() {
+        let live = std::sync::Arc::new(tokio::sync::Mutex::new(
+            Session::new(false, false, false).unwrap(),
+        ));
+        let held = live.lock().await;
+        assert!(try_command_snapshot(&WorkerCmd::RefreshThreads, &live).is_none());
+        assert!(matches!(
+            try_command_snapshot(&WorkerCmd::CheckForUpdates { silent: true }, &live),
+            Some(None)
+        ));
+        drop(held);
+        assert!(matches!(
+            try_command_snapshot(&WorkerCmd::RefreshThreads, &live),
+            Some(Some(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn priority_commands_bypass_deferred_actions_without_reordering_them() {
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let mut deferred = std::collections::VecDeque::from([QueuedWorkerCommand {
+            command: WorkerCmd::RefreshThreads,
+            origin_uin: None,
+            origin_events: None,
+        }]);
+        sender
+            .send(QueuedWorkerCommand {
+                command: WorkerCmd::RefreshThreadsManual,
+                origin_uin: None,
+                origin_events: None,
+            })
+            .unwrap();
+        sender
+            .send(QueuedWorkerCommand {
+                command: WorkerCmd::CheckForUpdates { silent: true },
+                origin_uin: None,
+                origin_events: None,
+            })
+            .unwrap();
+        let priority = tokio::time::timeout(
+            Duration::from_millis(500),
+            next_worker_command(&mut receiver, &mut deferred),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(matches!(
+            priority.command,
+            WorkerCmd::CheckForUpdates { .. }
+        ));
+        sender
+            .send(QueuedWorkerCommand {
+                command: WorkerCmd::Logout,
+                origin_uin: None,
+                origin_events: None,
+            })
+            .unwrap();
+        assert!(matches!(
+            next_worker_command(&mut receiver, &mut deferred)
+                .await
+                .unwrap()
+                .command,
+            WorkerCmd::Logout
+        ));
+        assert!(matches!(
+            next_worker_command(&mut receiver, &mut deferred)
+                .await
+                .unwrap()
+                .command,
+            WorkerCmd::RefreshThreads
+        ));
+        assert!(matches!(
+            next_worker_command(&mut receiver, &mut deferred)
+                .await
+                .unwrap()
+                .command,
+            WorkerCmd::RefreshThreadsManual
+        ));
+    }
+
+    #[test]
+    fn queued_actions_keep_the_visible_account_until_dispatch() {
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (events, _events_rx) = std::sync::mpsc::channel();
+        let root = GuiTx::new(events, egui::Context::default());
+        let tx = WorkerTx::new(sender, "account-a".into(), &root);
+        tx.send(WorkerCmd::SendMessage {
+            to_id: "thread-a".into(),
+            text: "Test".into(),
+            is_group: false,
+        })
+        .unwrap();
+        tx.set_visible_account("account-b");
+        let old = receiver.try_recv().unwrap();
+        assert_eq!(old.origin_uin.as_deref(), Some("account-a"));
+        assert!(!old.accepts_account("account-b"));
+        tx.send(WorkerCmd::SendMessage {
+            to_id: "thread-b".into(),
+            text: "Test".into(),
+            is_group: false,
+        })
+        .unwrap();
+        assert!(receiver.try_recv().unwrap().accepts_account("account-b"));
+        tx.send(WorkerCmd::CheckForUpdates { silent: true })
+            .unwrap();
+        assert!(receiver.try_recv().unwrap().accepts_account("account-c"));
+        tx.send_for_account(WorkerCmd::RefreshThreads, "account-a", &root.scoped())
+            .unwrap();
+        assert!(!receiver.try_recv().unwrap().accepts_account("account-b"));
+        root.advance_account();
+        // Until AccountSwitched is rendered, even a matching UIN retains the old UI epoch.
+        tx.send(WorkerCmd::RefreshThreads).unwrap();
+        let old_view = receiver.try_recv().unwrap();
+        assert!(old_view.accepts_account("account-b"));
+        assert!(!old_view.origin_is_current());
+        tx.set_visible_account("account-b");
+        tx.send(WorkerCmd::RefreshThreads).unwrap();
+        assert!(receiver.try_recv().unwrap().origin_is_current());
+    }
+
+    #[tokio::test]
+    async fn dispatched_actions_keep_their_session_after_an_account_switch() {
+        let mut snapshot = Session::new(false, false, false).unwrap();
+        snapshot.zpw_sek = Some("fake-account-a".into());
+        let live = std::sync::Arc::new(tokio::sync::Mutex::new(snapshot.clone()));
+        let commands = [
+            WorkerCmd::SendMessage {
+                to_id: "thread-a".into(),
+                text: "Test".into(),
+                is_group: false,
+            },
+            WorkerCmd::SendSticker {
+                to_id: "thread-a".into(),
+                sticker_id: 1,
+                cate_id: 1,
+                sticker_type: 1,
+                is_group: false,
+            },
+            WorkerCmd::PinMessage {
+                thread_id: "thread-a".into(),
+                is_group: false,
+                msg: Default::default(),
+                pin: true,
+                topic_id: String::new(),
+            },
+        ];
+        let captured: Vec<_> = commands
+            .iter()
+            .map(|command| session_for_command(command, Some(&snapshot), &live))
+            .collect();
+        live.lock().await.zpw_sek = Some("fake-account-b".into());
+        for session in captured {
+            let credentials = tokio::spawn(async move { session.lock().await.zpw_sek.clone() })
+                .await
+                .unwrap();
+            assert_eq!(credentials.as_deref(), Some("fake-account-a"));
+        }
+        assert!(std::sync::Arc::ptr_eq(
+            &live,
+            &session_for_command(&WorkerCmd::RequestQr, Some(&snapshot), &live)
+        ));
+    }
+
+    #[test]
+    fn departing_tasks_cannot_queue_a_new_login_after_switching_accounts() {
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (events, _rx) = std::sync::mpsc::channel();
+        let root = GuiTx::new(events, egui::Context::default());
+        let tx = WorkerTx::new(sender, "account-b".into(), &root);
+        let old = root.scoped();
+        root.advance_account();
+        tx.send_if_current(WorkerCmd::RequestQr, &old).unwrap();
+        assert!(receiver.try_recv().is_err());
+    }
 
     #[tokio::test]
     async fn running_permit_resets_after_task_cancellation() {
