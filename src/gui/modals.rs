@@ -189,6 +189,28 @@ pub(crate) fn compute_call_per_page(stage_w: f32) -> usize {
 }
 
 impl ZaloGuiApp {
+    fn request_saved_accounts(&mut self, delete: Option<String>) {
+        if delete.is_some() {
+            self.saved_accounts.invalidate();
+        }
+        let Some(request_id) = self.saved_accounts.request() else {
+            return;
+        };
+        let command = match delete {
+            Some(target_uin) => WorkerCmd::DeleteSavedAccount {
+                request_id,
+                target_uin,
+            },
+            None => WorkerCmd::RefreshSavedAccounts { request_id },
+        };
+        if !WORKER_TX.get().is_some_and(|tx| tx.send(command).is_ok()) {
+            self.saved_accounts.finish(
+                request_id,
+                Err("Không thể kết nối tác vụ tài khoản. Hãy thử lại.".into()),
+            );
+        }
+    }
+
     pub(super) fn render_profile_popover(&mut self, ctx: &egui::Context, pal: &ThemePalette) {
         if !self.profile_menu_open {
             return;
@@ -531,7 +553,7 @@ impl ZaloGuiApp {
                                 .rounding(Rounding::same(7.0)),
                             )
                             .on_hover_text(
-                                "Xoá zalo_history.db và threads_cache.json. Phiên đăng nhập giữ nguyên.",
+                                "Xoá lịch sử và bộ nhớ đệm của tài khoản hiện tại. Phiên đăng nhập giữ nguyên.",
                             )
                             .on_hover_cursor(CursorIcon::PointingHand)
                             .clicked()
@@ -2006,6 +2028,7 @@ impl ZaloGuiApp {
                                                                 format!("{} Quét lại thiết bị", lucide::REFRESH)
                                                             };
                                                             if ui.small_button(scan_label).clicked() {
+                                                                self.media_devices_ready = false;
                                                                 let _ = crate::media::list_media_devices_nonblocking(true);
                                                                 ctx.request_repaint_after(Duration::from_millis(120));
                                                             }
@@ -2149,7 +2172,16 @@ impl ZaloGuiApp {
                                             );
                                             ui.add_space(10.0);
 
-                                            let saved = crate::account_manager::list_saved_accounts(&self.user_uin);
+                                            self.request_saved_accounts(None);
+                                            if ui.button("Làm mới danh sách tài khoản").clicked() {
+                                                self.saved_accounts.invalidate();
+                                                self.request_saved_accounts(None);
+                                            }
+                                            if self.saved_accounts.loading() { ui.label("Đang tải tài khoản…"); }
+                                            if let Some(error) = &self.saved_accounts.error {
+                                                ui.colored_label(pal.danger, error);
+                                            }
+                                            let saved = self.saved_accounts.profiles.clone();
                                             let mut delete_target: Option<String> = None;
 
                                             for acc in &saved {
@@ -2207,7 +2239,7 @@ impl ZaloGuiApp {
                                             }
 
                                             if let Some(target) = delete_target {
-                                                let _ = crate::account_manager::delete_saved_account(&target);
+                                                self.request_saved_accounts(Some(target));
                                             }
 
                                             ui.add_space(14.0);
@@ -2479,8 +2511,28 @@ impl ZaloGuiApp {
                                                 .inner_margin(Margin::symmetric(14.0, 12.0))
                                                 .show(ui, |ui| {
                                                     ui.vertical(|ui| {
-                                                        ui.label(RichText::new("Tải lịch sử tin nhắn nhóm và Cloud của tôi từ máy chủ Zalo (tối đa 1.000 tin nhắn mỗi cuộc trò chuyện).").color(pal.text_primary).size(13.0));
-                                                        ui.add_space(6.0);
+                                                        ui.label(RichText::new("Tải lịch sử cũ của các nhóm và Cloud của tôi từ máy chủ Zalo về lịch sử của tài khoản hiện tại, mỗi lần tối đa 1.000 tin/hội thoại; bấm lần nữa để lùi xa hơn.").color(pal.text_primary).size(13.0));
+                                                        ui.add_space(4.0);
+                                                        if ui
+                                                            .add(
+                                                                egui::Label::new(
+                                                                    RichText::new(format!(
+                                                                        "Tìm hiểu chi tiết cơ chế đồng bộ trong docs/TINH_NANG.md {}",
+                                                                        lucide::EXTERNAL_LINK
+                                                                    ))
+                                                                    .size(11.8)
+                                                                    .color(pal.primary_hover),
+                                                                )
+                                                                .sense(Sense::click()),
+                                                            )
+                                                            .on_hover_cursor(CursorIcon::PointingHand)
+                                                            .clicked()
+                                                        {
+                                                            if let Err(error) = open_external_url("https://github.com/ctdoteam1110/ctdozlite/blob/main/docs/TINH_NANG.md") {
+                                                                self.show_toast(error);
+                                                            }
+                                                        }
+                                                        ui.add_space(4.0);
                                                         let total_msgs: usize = self.threads.iter().map(|t| t.messages.len()).sum();
                                                         ui.label(RichText::new(format!("Đã lưu {} cuộc trò chuyện ({} tin nhắn) trên máy.", self.threads.len(), total_msgs)).color(pal.text_secondary).size(12.2));
                                                         ui.add_space(10.0);
@@ -2504,7 +2556,7 @@ impl ZaloGuiApp {
                                                 .inner_margin(Margin::symmetric(14.0, 12.0))
                                                 .show(ui, |ui| {
                                                     ui.vertical(|ui| {
-                                                        ui.label(RichText::new("Nhập dữ liệu tin nhắn từ file sao lưu (.db, .sqlite, .json) hoặc thư mục dữ liệu Zalo mà không làm mất tin nhắn hiện có.").color(pal.text_secondary).size(12.2));
+                                                        ui.label(RichText::new("Nhập lịch sử tin nhắn từ tệp sao lưu SQLite (.db, .sqlite), JSON hoặc thư mục dữ liệu Zalo vào tài khoản hiện tại mà không làm mất tin nhắn đang có.").color(pal.text_secondary).size(12.2));
                                                         ui.add_space(8.0);
                                                         if ui.button(RichText::new("Chọn file sao lưu để nhập…").size(12.8).strong()).clicked() {
                                                             pick_migrate_file = true;
@@ -4158,6 +4210,23 @@ impl ZaloGuiApp {
                                                         });
                                                     }
                                                 });
+                                            ui.add_space(10.0);
+                                            egui::CollapsingHeader::new("Giấy phép thư viện video")
+                                                .id_salt("native_video_license_notices")
+                                                .default_open(false)
+                                                .show(ui, |ui| {
+                                                    egui::ScrollArea::vertical()
+                                                        .id_salt("native_video_license_scroll")
+                                                        .max_height(200.0)
+                                                        .show(ui, |ui| {
+                                                            ui.add(egui::Label::new(
+                                                                RichText::new(crate::video::license_notices())
+                                                                    .monospace()
+                                                                    .size(11.0)
+                                                                    .color(pal.text_secondary),
+                                                            ).wrap().selectable(true));
+                                                        });
+                                                });
                                         }
                                             }
                                         });
@@ -4286,55 +4355,31 @@ impl ZaloGuiApp {
             }
         }
 
-        if pick_migrate_file {
-            if let Some(src_path) = super::attachments::pick_single_file() {
-                let db_path = crate::store::db_path_for_account(&self.user_uin);
-                match crate::store::import_history_from_path(&src_path, &db_path) {
-                    Ok(summary) => {
-                        let t_cnt = summary.threads_imported;
-                        let m_cnt = summary.messages_imported;
-                        crate::store::load_history_into_threads(
-                            &db_path,
-                            &mut self.threads,
-                            crate::store::MessageStore::PRELOAD_MSGS,
-                        );
-                        self.persist_threads_async();
-                        self.show_toast(format!(
-                            "✅ Đã nhập {m_cnt} tin nhắn từ {t_cnt} hội thoại vào {db_path}"
-                        ));
-                    }
-                    Err(e) => {
-                        self.show_toast(format!("⚠️ Lỗi nhập lịch sử: {e}"));
-                    }
-                }
-            }
-        }
-
-        if pick_migrate_dir {
+        let import_path = if pick_migrate_file {
+            super::attachments::pick_single_file()
+        } else if pick_migrate_dir {
             match pick_native_folder_dialog_result("Chọn thư mục dữ liệu Zalo để nhập") {
-                FolderPick::Picked(src_dir) => {
-                    let db_path = crate::store::db_path_for_account(&self.user_uin);
-                    match crate::store::import_history_from_path(&src_dir, &db_path) {
-                        Ok(summary) => {
-                            let t_cnt = summary.threads_imported;
-                            let m_cnt = summary.messages_imported;
-                            crate::store::load_history_into_threads(
-                                &db_path,
-                                &mut self.threads,
-                                crate::store::MessageStore::PRELOAD_MSGS,
-                            );
-                            self.persist_threads_async();
-                            self.show_toast(format!(
-                                "✅ Đã nhập {m_cnt} tin nhắn từ {t_cnt} hội thoại vào {db_path}"
-                            ));
-                        }
-                        Err(e) => {
-                            self.show_toast(format!("⚠️ Lỗi nhập lịch sử: {e}"));
-                        }
-                    }
+                FolderPick::Picked(src_dir) => Some(src_dir),
+                FolderPick::LaunchFailed(e) => {
+                    self.show_toast(format!("⚠️ {e}"));
+                    None
                 }
-                FolderPick::LaunchFailed(e) => self.show_toast(format!("⚠️ {e}")),
-                FolderPick::Cancelled => {}
+                FolderPick::Cancelled => None,
+            }
+        } else {
+            None
+        };
+        if let Some(path) = import_path {
+            if WORKER_TX.get().is_some_and(|tx| {
+                tx.send(WorkerCmd::ImportHistory {
+                    uin: self.user_uin.clone(),
+                    path,
+                })
+                .is_ok()
+            }) {
+                self.show_toast("Đang nhập lịch sử vào tài khoản hiện tại…");
+            } else {
+                self.show_toast("Không thể bắt đầu nhập lịch sử.");
             }
         }
         if export_theme_tpl {
@@ -6002,6 +6047,7 @@ impl ZaloGuiApp {
                             .on_hover_text("Quét lại danh sách Mic & Camera")
                             .clicked()
                         {
+                            self.media_devices_ready = false;
                             let _ = crate::media::list_media_devices_nonblocking(true);
                             ctx.request_repaint_after(Duration::from_millis(120));
                         }
@@ -6584,11 +6630,7 @@ impl ZaloGuiApp {
                                         .clicked()
                                     {
                                         if !call.cam_enabled {
-                                            if !crate::media::is_ffmpeg_available() {
-                                                self.show_toast(
-                                                    "⚠️ Cần cài đặt ffmpeg trong PATH để bật Camera (winget install Gyan.FFmpeg)",
-                                                );
-                                            } else if crate::media::list_media_devices(false).1.is_empty() {
+                                            if self.media_devices_ready && crate::media::list_media_devices(false).1.is_empty() {
                                                 self.show_toast(
                                                     "⚠️ Không tìm thấy thiết bị Camera nào trên máy",
                                                 );
@@ -7790,7 +7832,7 @@ impl ZaloGuiApp {
                         ui.add(
                             egui::Label::new(
                                 RichText::new(
-                                    "Xoá zalo_history.db và threads_cache.json trên máy này. \
+                                    "Xoá lịch sử và bộ nhớ đệm của tài khoản hiện tại trên máy này. \
                                      Không thể hoàn tác, và tin nhắn cũ chỉ tải lại được từ đám mây Zalo.",
                                 )
                                 .size(12.5)

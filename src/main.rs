@@ -27,7 +27,11 @@ fn run_async<F: std::future::Future<Output = Result<()>>>(fut: F) -> Result<()> 
 }
 
 fn main() -> Result<()> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let arguments: Vec<String> = std::env::args().collect();
+    if zalo_rust::video::camera::run_helper_if_requested(&arguments)? { return Ok(()); }
+    let args: Vec<String> = arguments.into_iter().skip(1).collect();
+    if args.iter().any(|argument| argument == "--video-self-test") { println!("{}", zalo_rust::video::self_test()?); return Ok(()); }
+    if args.iter().any(|argument| argument == "--video-licenses") { println!("{}", zalo_rust::video::license_notices()); return Ok(()); }
     if args.iter().any(|a| a == "--version" || a == "-V") {
         println!("ctdozlite v{}", env!("CARGO_PKG_VERSION"));
         return Ok(());
@@ -198,9 +202,13 @@ fn main() -> Result<()> {
         });
 
     if force_logout {
-        let _ = std::fs::remove_file("session.json");
-        let _ = std::fs::remove_file("threads_cache.json");
-        println!("✓ Đã đăng xuất và xóa phiên lưu trữ cũ (session.json, threads_cache.json).");
+        let uin = std::fs::read("session.json")
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<session::SavedSession>(&bytes).ok())
+            .and_then(|saved| saved.login.map(|login| login.uin))
+            .unwrap_or_default();
+        account_manager::logout_account(&uin)?;
+        println!("✓ Đã đăng xuất và xoá các phiên đăng nhập đã lưu của tài khoản.");
         if !force_gui && !force_tui && !force_qr {
             return Ok(());
         }
@@ -299,6 +307,7 @@ fn main() -> Result<()> {
         .to_string();
     let cli_db = store::db_path_for_account(&cli_uin);
     if force_mcp {
+        let cli_db = authenticated_db_path(&s)?;
         account_manager::set_active_uin(&cli_uin);
         let shared = std::sync::Arc::new(tokio::sync::Mutex::new(s));
         return run_async(api_mcp::run_mcp_stdio_server_bound(shared, &cli_db, thread_arg));
@@ -312,6 +321,7 @@ fn main() -> Result<()> {
     if let Some(port) = api_port {
         account_manager::set_active_uin(&cli_uin);
         if args.iter().any(|a| a == "--api-only") {
+            let cli_db = authenticated_db_path(&s)?;
             let shared = std::sync::Arc::new(tokio::sync::Mutex::new(s));
             println!("🌐 REST API & MCP HTTP server đang lắng nghe tại http://127.0.0.1:{port}/api/v1/status");
             return run_async(api_mcp::run_local_http_server(shared, port, cli_db));
@@ -356,14 +366,7 @@ fn main() -> Result<()> {
         if !startup_uin.is_empty() {
             let _ = account_manager::save_current_account_snapshot(startup_uin);
         }
-        let mut initial_threads = chat::load_threads_cache_for(startup_uin);
-        // Hydrate từ đúng account DB (read-point/vanish/note lưu theo acc, #119).
-        let startup_db = store::db_path_for_account(startup_uin);
-        store::load_history_into_threads(
-            &startup_db,
-            &mut initial_threads,
-            store::MessageStore::PRELOAD_MSGS,
-        );
+        let initial_threads = startup_account_threads(&s, store::MessageStore::PRELOAD_MSGS);
 
         let app_session = s;
         let res = eframe::run_native(
@@ -515,10 +518,7 @@ fn main() -> Result<()> {
     }
 
     // Fetch initial threads and hydrate with local SQLite history
-    let mut initial_threads = chat::load_threads_cache();
-    let tui_uin = s.login.as_ref().map(|l| l.uin.as_str()).unwrap_or("");
-    let tui_db = store::db_path_for_account(tui_uin);
-    store::load_history_into_threads(&tui_db, &mut initial_threads, 200);
+    let mut initial_threads = startup_account_threads(&s, 200);
     if s.login.is_some() && server_ok && !offline_mode {
         match chat::get_friends(&s).await {
             Ok(list) => {
@@ -559,4 +559,30 @@ fn main() -> Result<()> {
 
     Ok(())
     })
+}
+
+/// Hydrate only the captured authenticated account before either UI first paints.
+fn startup_account_threads(session: &Session, limit: usize) -> Vec<chat::Thread> {
+    let Some(login) = session.login.as_ref() else {
+        return Vec::new();
+    };
+    let mut threads = chat::load_threads_cache_for_account(&login.uin);
+    match store::MessageStore::open_account(&login.uin) {
+        Ok(store) => {
+            if let Err(error) = store.hydrate_threads(&mut threads, limit) {
+                logger::log_error("main::hydrate_account_history", &error.to_string());
+            }
+        }
+        Err(error) => logger::log_error("main::open_account_history", &error.to_string()),
+    }
+    threads
+}
+
+fn authenticated_db_path(session: &Session) -> Result<String> {
+    let login = session
+        .login
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("Vui lòng đăng nhập trước khi mở API"))?;
+    store::MessageStore::open_account(&login.uin)?;
+    Ok(store::db_path_for_account(&login.uin))
 }

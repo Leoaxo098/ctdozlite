@@ -288,6 +288,20 @@ impl From<&ReactionEvent> for ReactionVersion {
     }
 }
 impl ReactionVersion {
+    /// Remember an event already included in the displayed snapshot without applying it again.
+    pub(crate) fn cover(&mut self, event: &ReactionEvent) -> bool {
+        if self
+            .events
+            .iter()
+            .chain(&self.covered_events)
+            .any(|old| same_event(old, event))
+        {
+            return false;
+        }
+        self.covered_events.push(event.clone());
+        true
+    }
+
     pub fn precedes(&self, event: &ReactionEvent) -> bool {
         event_order(
             &ReactionEvent {
@@ -737,6 +751,16 @@ pub fn apply_reaction_event(summaries: &mut Vec<ReactionSummary>, event: &Reacti
 /// * events seen before their message exists are kept and applied once it loads;
 /// * count per type = `base` + distinct live events, where `base` is whatever part of the first
 ///   snapshot the known events cannot explain (`snapshot - events`, never negative).
+/// * loaded snapshots are baselined before new live events are recorded;
+/// * persisted event identities prevent replay from incrementing a loaded snapshot again.
+#[derive(Debug, Default)]
+pub struct ReactionInbox {
+    events: std::collections::HashMap<String, BTreeMap<String, ReactionEvent>>,
+    bases: std::collections::HashMap<String, MessageReactionBase>,
+    matched: std::collections::HashSet<String>,
+    represented: std::collections::HashMap<String, Vec<ReactionEvent>>,
+}
+
 #[derive(Debug, Default, Clone)]
 struct MessageReactionBase {
     /// Total snapshot counts per `r_type` after subtracting live events known when the snapshot landed.
@@ -745,13 +769,6 @@ struct MessageReactionBase {
     by_sender: BTreeMap<String, BTreeMap<i32, u64>>,
     /// Senders already cleared against this snapshot so subsequent replays stay idempotent.
     cleared_from_snapshot: std::collections::BTreeSet<String>,
-}
-
-#[derive(Debug, Default)]
-pub struct ReactionInbox {
-    events: std::collections::HashMap<String, BTreeMap<String, ReactionEvent>>,
-    bases: std::collections::HashMap<String, MessageReactionBase>,
-    matched: std::collections::HashSet<String>,
 }
 
 fn message_keys(msg: &crate::chat::ChatMessage) -> Vec<String> {
@@ -902,13 +919,52 @@ fn apply_cleared_senders_to_base(
     }
 }
 impl ReactionInbox {
-    /// Store events by message and event id. Returns the subset actually
-    /// inserted (replays and duplicates excluded) so callers can count each
-    /// accepted event exactly once (#473, gui.rs:1773).
+    /// Observe loaded snapshots before recording a newly received live batch.
+    pub fn observe_loaded(
+        &mut self,
+        messages: &[crate::chat::ChatMessage],
+        incoming: &[ReactionEvent],
+    ) {
+        let targets: std::collections::HashSet<String> =
+            incoming.iter().filter_map(event_key).collect();
+        for msg in messages {
+            for key in message_keys(msg) {
+                if !targets.contains(&key) || self.bases.contains_key(&key) {
+                    continue;
+                }
+                let (totals, per_sender, _) = self
+                    .events
+                    .get(&key)
+                    .map(effective_counts)
+                    .unwrap_or_default();
+                self.bases.insert(
+                    key.clone(),
+                    init_message_base(&msg.reaction_summaries, &totals, &per_sender),
+                );
+                self.represented.insert(
+                    key,
+                    msg.reaction_versions
+                        .values()
+                        .flat_map(|version| version.events.iter().chain(&version.covered_events))
+                        .cloned()
+                        .collect(),
+                );
+            }
+        }
+    }
+
+    /// Store events by message and event id and return the newly inserted events.
     pub fn record_new(&mut self, events: &[ReactionEvent]) -> Vec<ReactionEvent> {
         let mut accepted = Vec::new();
         for ev in events {
             let Some(key) = event_key(ev) else { continue };
+            if self.represented.get(&key).is_some_and(|events| {
+                events
+                    .iter()
+                    .any(|old| old.sender_id == ev.sender_id && same_event(old, ev))
+            }) {
+                continue;
+            }
             let id = event_identity(ev);
             let slot = self.events.entry(key).or_default();
             if slot.contains_key(&id) {
@@ -988,7 +1044,7 @@ impl ReactionInbox {
                 summaries.push(summary);
             }
             summaries.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.r_type.cmp(&b.r_type)));
-            self.matched.insert(key);
+            self.matched.insert(key.clone());
             let after = total_count(&summaries);
             if summaries != msg.reaction_summaries {
                 msg.reaction_summaries = summaries;
@@ -996,6 +1052,15 @@ impl ReactionInbox {
                 msg.reaction_snapshot = true;
                 trace_count_change("ReactionInbox::apply_to", &msg.id, before, after);
                 changed = true;
+            }
+            // Persist identities alongside the displayed snapshot, so a restarted inbox can
+            // distinguish replay from a genuinely new event without guessing from totals.
+            for event in self.events[&key].values() {
+                let version = msg
+                    .reaction_versions
+                    .entry(event.sender_id.clone())
+                    .or_default();
+                changed |= version.cover(event);
             }
         }
         changed
@@ -1007,6 +1072,7 @@ impl ReactionInbox {
         events: &[ReactionEvent],
         messages: &mut [crate::chat::ChatMessage],
     ) -> bool {
+        self.observe_loaded(messages, events);
         self.record(events);
         self.apply_to(messages)
     }
@@ -1225,6 +1291,84 @@ mod tests {
             "u1:123:5",
             "fallback identity must be stable"
         );
+    }
+
+    #[test]
+    fn first_live_event_adds_to_an_already_loaded_snapshot() {
+        let events = parse_reaction_events(&wire_frame(&["8460599999999"])["data"]);
+        let mut messages = vec![crate::chat::ChatMessage {
+            id: "8460448471161".into(),
+            reaction_summaries: parse_reactions(&json!({"reactions":{"0":{"20":5}}})),
+            ..Default::default()
+        }];
+        let mut inbox = ReactionInbox::default();
+        inbox.ingest(&events, &mut messages);
+        assert_eq!(total_count(&messages[0].reaction_summaries), 6);
+        inbox.ingest(&events, &mut messages);
+        assert_eq!(total_count(&messages[0].reaction_summaries), 6);
+    }
+
+    #[test]
+    fn persisted_live_event_is_not_added_again_after_restart() {
+        let events = parse_reaction_events(&wire_frame(&["8460599999999"])["data"]);
+        let mut messages = vec![crate::chat::ChatMessage {
+            id: "8460448471161".into(),
+            ..Default::default()
+        }];
+        ReactionInbox::default().ingest(&events, &mut messages);
+        let persisted = serde_json::to_string(&messages).unwrap();
+        let mut restored: Vec<crate::chat::ChatMessage> = serde_json::from_str(&persisted).unwrap();
+        let newer = parse_reaction_events(&wire_frame(&["8460599999998"])["data"]);
+        let mut inbox = ReactionInbox::default();
+        inbox.ingest(&events, &mut restored);
+        inbox.ingest(&newer, &mut restored);
+        assert_eq!(total_count(&restored[0].reaction_summaries), 2);
+        assert!(!restored[0].reaction_versions.is_empty());
+    }
+
+    #[test]
+    fn sqlite_loaded_snapshot_deduplicates_replay_before_accepting_new_events() {
+        let events = parse_reaction_events(&wire_frame(&["8460599999999"])["data"]);
+        let mut messages = vec![crate::chat::ChatMessage {
+            id: "8460448471161".into(),
+            ts: 1000,
+            text: "Test".into(),
+            ..Default::default()
+        }];
+        ReactionInbox::default().ingest(&events, &mut messages);
+        let thread = crate::chat::Thread {
+            id: "thread-1".into(),
+            name: "Test".into(),
+            avatar: None,
+            preview: String::new(),
+            time: String::new(),
+            is_group: false,
+            presentation: Default::default(),
+            unread: Default::default(),
+            messages,
+        };
+        let mut store = crate::store::MessageStore::open(":memory:").unwrap();
+        crate::store::persist_threads(&mut store, std::slice::from_ref(&thread)).unwrap();
+        // A later history refresh carries counts but no live-event ledger.
+        let mut refreshed = thread.clone();
+        refreshed.messages[0].reaction_versions.clear();
+        crate::store::persist_threads(&mut store, &[refreshed]).unwrap();
+        for existing in [false, true] {
+            let mut restored = if existing {
+                let mut partial = thread.clone();
+                partial.messages[0].reaction_versions.clear();
+                vec![partial]
+            } else {
+                Vec::new()
+            };
+            store.hydrate_threads(&mut restored, 50).unwrap();
+            let mut inbox = ReactionInbox::default();
+            inbox.ingest(&events, &mut restored[0].messages);
+            assert_eq!(total_count(&restored[0].messages[0].reaction_summaries), 1);
+            let new = parse_reaction_events(&wire_frame(&["8460599999998"])["data"]);
+            inbox.ingest(&new, &mut restored[0].messages);
+            assert_eq!(total_count(&restored[0].messages[0].reaction_summaries), 2);
+        }
     }
     #[test]
     fn heart_count_is_not_unique_user_count() {

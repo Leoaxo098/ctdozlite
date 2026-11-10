@@ -2110,7 +2110,7 @@ pub fn build_pure_rust_invite_fields_with_probe(
         "srtcp": 0,
         "srtpMode": 0,
         "supportCallBusy": 1,
-        "supportHevcDecode": if crate::media::is_ffmpeg_available() { 1 } else { 0 },
+        "supportHevcDecode": 0, // The bundled codec decodes H.264 only.
         "tpType": 0,
         "video": {
             "codec": [
@@ -2184,7 +2184,7 @@ pub fn build_callee_extend_data(
         "srtcp": 0,
         "srtpMode": 0,
         "supportCallBusy": 1,
-        "supportHevcDecode": if crate::media::is_ffmpeg_available() { 1 } else { 0 },
+        "supportHevcDecode": 0, // The bundled codec decodes H.264 only.
         "tpType": 0,
         "video": {
             "codec": [
@@ -2242,6 +2242,7 @@ impl CallBridge {
 
         tokio::spawn(async move {
             while let Some(cmd) = cmd_rx.recv().await {
+                let gui_tx = gui_tx.scoped();
                 match cmd {
                     CallEngineCmd::MakeCall {
                         partner_id,
@@ -3205,7 +3206,7 @@ impl CallBridge {
                                     } else {
                                         crate::media::set_group_srtp_key(None, false);
                                     }
-                                    match crate::media::MediaHandle::start_with_sockets(
+                                    match crate::media::MediaHandle::start_with_sockets_and_camera_state(
                                         st.rtp_ip.clone(),
                                         st.rtcp_ip.clone(),
                                         st.from_uid_u32,
@@ -3216,13 +3217,11 @@ impl CallBridge {
                                         st.udp_rtcp_sock.clone(),
                                         0,
                                         st.is_video,
+                                        st.is_video && !cam_start_off,
                                         Some(gui_tx_clone.clone()),
                                         Some(ctx_clone.clone()),
                                     ) {
                                         Ok(m) => {
-                                            if cam_start_off {
-                                                m.set_cam_enabled(false);
-                                            }
                                             st.media = Some(m);
                                         }
                                         Err(e) => {
@@ -5159,6 +5158,7 @@ mod tests {
         );
         let ext: Value = serde_json::from_str(ext_raw.trim()).expect("callee extendData JSON");
         assert_eq!(ext["select2side"], 1);
+        assert_eq!(ext["supportHevcDecode"], 0);
         assert_eq!(ext["numServers"], 0);
         let p2p = ext["p2p"].as_array().expect("p2p array");
         assert!(p2p.iter().any(|e| e["type"] == 0 && e["port"] == 61234));
@@ -5336,6 +5336,9 @@ mod tests {
         // Drain events to confirm IncomingCall
         let mut got_incoming = false;
         while let Ok(ev) = rx.try_recv() {
+            let Some(ev) = ev.for_current_account() else {
+                continue;
+            };
             if let GuiEvent::IncomingCall { call_id, .. } = ev {
                 if call_id == 998877 {
                     got_incoming = true;
@@ -5360,6 +5363,9 @@ mod tests {
         let mut got_connected = false;
         let mut status_msg = String::new();
         while let Ok(ev) = rx.try_recv() {
+            let Some(ev) = ev.for_current_account() else {
+                continue;
+            };
             match ev {
                 GuiEvent::CallStateChanged(state) => {
                     if state == "free" {
@@ -5416,6 +5422,9 @@ mod tests {
         // Drain IncomingCall event
         let mut got_incoming = false;
         while let Ok(ev) = rx.try_recv() {
+            let Some(ev) = ev.for_current_account() else {
+                continue;
+            };
             if let GuiEvent::IncomingCall { call_id, .. } = ev {
                 if call_id == 887766 {
                     got_incoming = true;
@@ -5439,6 +5448,9 @@ mod tests {
         let mut got_free = false;
         let mut got_connected = false;
         while let Ok(ev) = rx.try_recv() {
+            let Some(ev) = ev.for_current_account() else {
+                continue;
+            };
             if let GuiEvent::CallStateChanged(state) = ev {
                 if state == "free" {
                     got_free = true;
