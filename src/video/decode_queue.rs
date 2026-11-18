@@ -87,6 +87,8 @@ impl DecodeQueue {
         (reset, state.units.pop_front())
     }
 
+    /// Recover a poisoned queue by discarding pending units and requesting a
+    /// decoder reset before references can be reused.
     fn lock(&self) -> MutexGuard<'_, QueueState> {
         match self.state.lock() {
             Ok(state) => state,
@@ -106,6 +108,8 @@ impl DecodeQueue {
 mod tests {
     use super::*;
 
+    /// Check that overflow makes the decoder consume a reset with the newest
+    /// access unit and leaves no older references queued.
     #[test]
     fn overflow_discards_reference_backlog_and_retains_fresh_unit() {
         let queue = DecodeQueue::default();

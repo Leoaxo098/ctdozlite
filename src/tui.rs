@@ -190,14 +190,20 @@ enum BgEvent {
     ConsoleLine {
         thread_id: String,
         text: String,
+        generation: u64,
     },
     UpdateAvailable(crate::gui::UpdateCheckResult),
     SendFailed(String),
     ActionFailed(String),
     LocalResetDone {
         logout: bool,
-        result: std::result::Result<String, String>,
+        result: std::result::Result<LocalResetOutcome, String>,
     },
+}
+
+enum LocalResetOutcome {
+    Complete,
+    WipedWithCacheError(String),
 }
 
 /// Braille spinner frames (omp-style busy indicator).
@@ -301,9 +307,11 @@ pub struct TuiApp<'a> {
     bg_tx: Sender<BgEvent>,
     background_tasks: RefCell<Vec<tokio::task::JoinHandle<()>>>,
     local_reset_pending: bool,
+    reset_generation: u64,
 }
 
 impl<'a> TuiApp<'a> {
+    /// Initialize the terminal state from cached threads and hydrate recent history when available.
     pub fn new(session: &'a mut Session, mut threads: Vec<Thread>) -> Self {
         let store = session
             .login
@@ -362,6 +370,7 @@ impl<'a> TuiApp<'a> {
             bg_tx: tx,
             background_tasks: RefCell::new(Vec::new()),
             local_reset_pending: false,
+            reset_generation: 0,
         };
         app.rebuild_filter();
         app.ensure_msg_selection();
@@ -372,6 +381,7 @@ impl<'a> TuiApp<'a> {
         self.session.login.as_ref().map(|login| login.uin.clone())
     }
 
+    /// Cache the signed-in account's thread previews only outside local reset.
     fn save_account_cache(&self) {
         if !self.local_reset_pending {
             if let Some(uin) = self.account_uin() {
@@ -380,13 +390,36 @@ impl<'a> TuiApp<'a> {
         }
     }
 
+    /// Track active tasks so local reset can cancel them and wait for their completion.
     fn spawn_background(&self, future: impl std::future::Future<Output = ()> + Send + 'static) {
-        if self.local_reset_pending {
-            return;
+        if !self.local_reset_pending {
+            self.track_background(tokio::spawn(future));
         }
+    }
+
+    fn spawn_blocking_background(&self, work: impl FnOnce() + Send + 'static) {
+        if !self.local_reset_pending {
+            // Reset must wait for writes that began before cancellation.
+            self.track_background(tokio::task::spawn_blocking(work));
+        }
+    }
+
+    fn track_background(&self, task: tokio::task::JoinHandle<()>) {
         let mut tasks = self.background_tasks.borrow_mut();
         tasks.retain(|task| !task.is_finished());
-        tasks.push(tokio::spawn(future));
+        tasks.push(task);
+    }
+
+    fn console_completion(&self, thread_id: String) -> impl FnOnce(String) + Send + 'static {
+        let tx = self.bg_tx.clone();
+        let generation = self.reset_generation;
+        move |text| {
+            let _ = tx.send(BgEvent::ConsoleLine {
+                thread_id,
+                text,
+                generation,
+            });
+        }
     }
 
     fn session_clone(&self) -> Session {
@@ -740,6 +773,7 @@ impl<'a> TuiApp<'a> {
         self.rebuild_filter_prefer(selected_id);
     }
 
+    /// Persist threads for the current account, reopening its store if needed.
     fn persist_snapshot(&mut self, threads: &[Thread]) {
         if self.local_reset_pending {
             return;
@@ -771,6 +805,7 @@ impl<'a> TuiApp<'a> {
         self.persist_snapshot(&snapshot);
     }
 
+    /// Write a captured account snapshot on the blocking pool and retain the handle for reset.
     fn persist_async(&self) {
         if self.local_reset_pending {
             return;
@@ -779,15 +814,14 @@ impl<'a> TuiApp<'a> {
             return;
         };
         let snapshot = self.threads.clone();
-        // Keep the blocking task's handle so a wipe can wait for an already-running write.
-        let task = tokio::task::spawn_blocking(move || {
+        self.spawn_blocking_background(move || {
             if let Ok(mut st) = crate::store::MessageStore::open_account(&uin) {
                 let _ = crate::store::persist_threads(&mut st, &snapshot);
             }
         });
-        self.background_tasks.borrow_mut().push(task);
     }
 
+    /// Poll from the current cursor with at most one outstanding request for the signed-in account.
     fn spawn_poll(&mut self) {
         if self.local_reset_pending || self.poll_inflight || self.session.login.is_none() {
             return;
@@ -810,6 +844,7 @@ impl<'a> TuiApp<'a> {
         });
     }
 
+    /// Fetch the contact list with available previews and mute settings in the background.
     fn spawn_refresh(&mut self) {
         self.status = "Đang làm mới...".into();
         let session = self.session_clone();
@@ -850,6 +885,7 @@ impl<'a> TuiApp<'a> {
         });
     }
 
+    /// Fetch up to 50 recent messages for the selected group and return them to the UI.
     fn spawn_history(&mut self) {
         let Some(t) = self.threads.get(self.selected_thread) else {
             return;
@@ -879,6 +915,7 @@ impl<'a> TuiApp<'a> {
         });
     }
 
+    /// Open the pack list and load it once when local pack data is unavailable.
     fn open_sticker_store(&mut self) {
         self.overlay = Overlay::Sticker;
         self.sticker.stage = 0;
@@ -914,6 +951,7 @@ impl<'a> TuiApp<'a> {
         *idx = ((cur + delta).clamp(0, (len - 1) as isize)) as usize;
     }
 
+    /// Open the chosen pack or send the selected sticker, according to the active picker stage.
     fn sticker_enter(&mut self) {
         if self.sticker.stage == 0 {
             let Some(pack) = self.sticker.packs.get(self.sticker.pack_idx) else {
@@ -967,6 +1005,7 @@ impl<'a> TuiApp<'a> {
         }
     }
 
+    /// Insert a local sticker preview and dispatch the send for the selected conversation.
     fn send_sticker(&mut self, item: StickerItem) {
         let Some(t) = self.threads.get(self.selected_thread) else {
             return;
@@ -1023,6 +1062,7 @@ impl<'a> TuiApp<'a> {
         self.status = "Đã gửi nhãn dán".into();
     }
 
+    /// Use the current draft as a caption when uploading a valid file to the selected conversation.
     fn send_attachment(&mut self, path: PathBuf) {
         if !path.is_file() {
             self.status = format!("Không tìm thấy tệp: {}", path.display());
@@ -1340,14 +1380,14 @@ impl<'a> TuiApp<'a> {
                     self.push_console_local(&tid, &format!("Ghi chú [{tname}]:\n{shown}"));
                 } else {
                     // edit (async save like GUI debounce, but immediate here)
-                    let tx = self.bg_tx.clone();
+                    let complete = self.console_completion(tid.clone());
                     let uin = self
                         .session
                         .login
                         .as_ref()
                         .map(|l| l.uin.clone())
                         .unwrap_or_default();
-                    tokio::spawn(async move {
+                    self.spawn_blocking_background(move || {
                         let db = crate::store::db_path_for_account(&uin);
                         let res = (|| -> anyhow::Result<()> {
                             let mut st = crate::store::MessageStore::open(&db)?;
@@ -1358,7 +1398,7 @@ impl<'a> TuiApp<'a> {
                             Ok(()) => format!("Đã lưu ghi chú [{tname}]"),
                             Err(e) => format!("Lỗi lưu ghi chú: {e}"),
                         };
-                        let _ = tx.send(BgEvent::ConsoleLine { thread_id: tid, text: line });
+                        complete(line);
                     });
                     self.busy = true;
                     self.status = "Đang lưu ghi chú...".into();
@@ -1366,14 +1406,14 @@ impl<'a> TuiApp<'a> {
             }
             "watch" => {
                 let arg_w = arg.clone();
-                let tx = self.bg_tx.clone();
+                let complete = self.console_completion(tid.clone());
                 let uin = self
                     .session
                     .login
                     .as_ref()
                     .map(|l| l.uin.clone())
                     .unwrap_or_default();
-                tokio::spawn(async move {
+                self.spawn_blocking_background(move || {
                     let db = crate::store::db_path_for_account(&uin);
                     let line = (|| -> anyhow::Result<String> {
                         let mut st = crate::store::MessageStore::open(&db)?;
@@ -1406,10 +1446,10 @@ impl<'a> TuiApp<'a> {
                         Ok(s) => s,
                         Err(e) => format!("Lỗi watch: {e}"),
                     };
-                    let _ = tx.send(BgEvent::ConsoleLine { thread_id: tid, text });
+                    complete(text);
                 });
                 self.busy = true;
-                    self.status = "Đang xử lý watch...".into();
+                self.status = "Đang xử lý watch...".into();
             }
             "stats" => {
                 let db = crate::store::db_path_for_account(
@@ -1468,7 +1508,7 @@ impl<'a> TuiApp<'a> {
                 } else {
                     // run script by name (async sandbox, outbox drained as console lines)
                     let arg_run = arg_s.clone();
-                    let tx = self.bg_tx.clone();
+                    let complete = self.console_completion(tid.clone());
                     let threads = self.threads.clone();
                     let uin = self
                         .session
@@ -1476,7 +1516,7 @@ impl<'a> TuiApp<'a> {
                         .as_ref()
                         .map(|l| l.uin.clone())
                         .unwrap_or_default();
-                    tokio::spawn(async move {
+                    self.spawn_blocking_background(move || {
                         let db = crate::store::db_path_for_account(&uin);
                         let line = (|| -> anyhow::Result<String> {
                             let st = crate::store::MessageStore::open(&db)?;
@@ -1504,7 +1544,7 @@ impl<'a> TuiApp<'a> {
                             Ok(s) => s,
                             Err(e) => format!("Lỗi script: {e}"),
                         };
-                        let _ = tx.send(BgEvent::ConsoleLine { thread_id: tid, text });
+                        complete(text);
                     });
                     self.busy = true;
                     self.status = format!("Đang chạy script '{arg_s}'...");
@@ -1513,7 +1553,7 @@ impl<'a> TuiApp<'a> {
             "sum" => {
                 let arg_q = arg.clone();
                 let ov = self.llm_override.clone();
-                let tx = self.bg_tx.clone();
+                let complete = self.console_completion(tid.clone());
                 let threads = self.threads.clone();
                 let uin = self
                     .session
@@ -1521,33 +1561,56 @@ impl<'a> TuiApp<'a> {
                     .as_ref()
                     .map(|l| l.uin.clone())
                     .unwrap_or_default();
-                tokio::spawn(async move {
+                self.spawn_background(async move {
                     let db = crate::store::db_path_for_account(&uin);
                     let text = async {
                         let st = crate::store::MessageStore::open(&db)?;
-                        let gctx =
-                            crate::group_llm::build_group_context(&st, &threads, &tid);
+                        let gctx = crate::group_llm::build_group_context(&st, &threads, &tid);
                         if crate::thread_script::privacy_allowed(&st, &tid) {
                             if let Ok(mut st2) = crate::store::MessageStore::open(&db) {
-                                let _ = st2.push_script_log(&tid, "privacy", "info", "TUI /sum WITH attachments (consent on)");
+                                let _ = st2.push_script_log(
+                                    &tid,
+                                    "privacy",
+                                    "info",
+                                    "TUI /sum WITH attachments (consent on)",
+                                );
                             }
                         }
                         // Unified provider: env/CTDOZ_* > opencode.json > ollama local.
                         let p = if let Some((url, id)) = ov.clone() {
-                            let (key, _) = crate::auth::resolve_key(&std::fs::read_to_string("app_settings.json").ok().and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()).and_then(|v| v.get("llm_api_key").and_then(|k| k.as_str()).map(str::to_string)).unwrap_or_default());
+                            let (key, _) = crate::auth::resolve_key(
+                                &std::fs::read_to_string("app_settings.json")
+                                    .ok()
+                                    .and_then(|s| {
+                                        serde_json::from_str::<serde_json::Value>(&s).ok()
+                                    })
+                                    .and_then(|v| {
+                                        v.get("llm_api_key")
+                                            .and_then(|k| k.as_str())
+                                            .map(str::to_string)
+                                    })
+                                    .unwrap_or_default(),
+                            );
                             crate::llm::UnifiedProvider::from_parts(&url, &key, &id, "manual")
                         } else {
                             crate::llm::UnifiedProvider::from_settings("", "", "")
                         };
-                        let (sys, user) = p.sys_and_user(&gctx, if arg_q.is_empty() { None } else { Some(arg_q.as_str()) });
+                        let (sys, user) = p.sys_and_user(
+                            &gctx,
+                            if arg_q.is_empty() {
+                                None
+                            } else {
+                                Some(arg_q.as_str())
+                            },
+                        );
                         crate::llm::chat_completions(&p.ep, &sys, &user).await
                     }
                     .await
                     .unwrap_or_else(|e| format!("{e}"));
-                    let _ = tx.send(BgEvent::ConsoleLine { thread_id: tid, text });
+                    complete(text);
                 });
                 self.busy = true;
-                    self.status = "Đang tóm tắt...".into();
+                self.status = "Đang tóm tắt...".into();
             }
             _ => {
                 self.push_console_local(
@@ -1626,6 +1689,7 @@ impl<'a> TuiApp<'a> {
         false
     }
 
+    /// Submit a nonempty draft to the selected conversation or dispatch its slash command.
     fn send_current(&mut self) {
         let text = self.input_text.trim().to_string();
         if text.is_empty() {
@@ -1702,6 +1766,7 @@ impl<'a> TuiApp<'a> {
         self.status = "Đang gửi tin nhắn...".into();
     }
 
+    /// Dispatch the numbered reaction preset against the selected message.
     fn react_quick(&mut self, key: char) {
         let Some(idx) = key
             .to_digit(10)
@@ -1817,6 +1882,7 @@ impl<'a> TuiApp<'a> {
         self.run_confirm_in(action, std::path::Path::new("."));
     }
 
+    /// Dispatch a confirmed action, draining existing background work before local cleanup.
     fn run_confirm_in(&mut self, action: ConfirmAction, root: &std::path::Path) {
         match action.kind {
             ConfirmKind::Logout | ConfirmKind::WipeLocalData => {
@@ -1829,6 +1895,7 @@ impl<'a> TuiApp<'a> {
                 };
                 let logout = action.kind == ConfirmKind::Logout;
                 self.local_reset_pending = true;
+                self.reset_generation = self.reset_generation.wrapping_add(1);
                 let store = self.store.take();
                 let tasks = self
                     .background_tasks
@@ -1846,21 +1913,21 @@ impl<'a> TuiApp<'a> {
                     for task in tasks {
                         let _ = task.await;
                     }
-                    let result = tokio::task::spawn_blocking(move || -> Result<String> {
-                        // SQLite close/checkpoint belongs on the blocking worker too.
-                        drop(store);
-                        if logout {
-                            crate::account_manager::logout_account_in(&root, &uin)?;
-                            remove_owned_thread_caches(&root, &uin)?;
-                            Ok("Đã đăng xuất. Bấm 'q' để thoát.".into())
-                        } else {
-                            wipe_account_history_in(&root, &uin)?;
-                            Ok("Đã xoá dữ liệu tin nhắn cục bộ (session giữ nguyên).".into())
-                        }
-                    })
-                    .await
-                    .map_err(|error| error.to_string())
-                    .and_then(|result| result.map_err(|error| error.to_string()));
+                    let result =
+                        tokio::task::spawn_blocking(move || -> Result<LocalResetOutcome> {
+                            // SQLite close/checkpoint belongs on the blocking worker too.
+                            drop(store);
+                            if logout {
+                                remove_owned_thread_caches(&root, &uin)?;
+                                crate::account_manager::logout_account_in(&root, &uin)?;
+                                Ok(LocalResetOutcome::Complete)
+                            } else {
+                                wipe_account_history_in(&root, &uin)
+                            }
+                        })
+                        .await
+                        .map_err(|error| error.to_string())
+                        .and_then(|result| result.map_err(|error| error.to_string()));
                     let _ = tx.send(BgEvent::LocalResetDone { logout, result });
                 });
             }
@@ -1893,6 +1960,7 @@ impl<'a> TuiApp<'a> {
         }
     }
 
+    /// Route keys through the active terminal mode, allowing only quit requests during reset.
     fn handle_key(&mut self, code: KeyCode, mods: KeyModifiers) {
         if self.local_reset_pending {
             if (mods.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('c'))
@@ -2377,6 +2445,7 @@ impl<'a> TuiApp<'a> {
         changed
     }
 
+    /// Merge refreshed conversations into the local list and persist the sorted result.
     fn apply_refresh(&mut self, list: Vec<Thread>) {
         self.refresh_pins();
         if list.is_empty() {
@@ -2395,6 +2464,7 @@ impl<'a> TuiApp<'a> {
         self.persist_async();
     }
 
+    /// Apply queued results while filtering account updates during reset and after logout.
     fn check_background_events(&mut self) {
         while let Ok(event) = self.bg_rx.try_recv() {
             if self.local_reset_pending && !matches!(&event, BgEvent::LocalResetDone { .. }) {
@@ -2412,24 +2482,50 @@ impl<'a> TuiApp<'a> {
                 BgEvent::LocalResetDone { logout, result } => {
                     self.local_reset_pending = false;
                     self.poll_inflight = false;
+                    self.busy = false;
                     // Aborted sticker requests cannot send their completion events.
                     self.sticker.loading = false;
                     match result {
-                        Ok(status) => {
+                        Ok(outcome) => {
+                            self.reply_target = None;
+                            self.input_text.clear();
+                            self.slash_sel = 0;
+                            self.selected_msg = None;
+                            self.msg_scroll = 0;
+                            self.msg_ranges.clear();
+                            self.follow_tail = true;
+                            self.exit_find_mode();
+                            self.search.clear();
+                            self.search_mode = false;
+                            self.unread.clear();
                             if logout {
                                 self.session.logout();
                                 self.threads.clear();
-                                self.filtered.clear();
-                                self.list_state.select(None);
-                                self.unread.clear();
-                                self.selected_thread = 0;
-                                self.selected_msg = None;
+                                self.focus = Focus::Threads;
                             }
                             for thread in &mut self.threads {
                                 thread.messages.clear();
                                 thread.preview.clear();
+                                thread.time.clear();
+                                thread.unread = Default::default();
+                                thread.presentation.last_message_ts = 0;
+                                thread.presentation.last_message_id.clear();
+                                thread.presentation.last_sender.clear();
+                                thread.presentation.last_sender_id.clear();
+                                thread.presentation.last_outgoing = false;
                             }
-                            self.status = status;
+                            self.rebuild_filter();
+                            self.status = match outcome {
+                                LocalResetOutcome::Complete if logout => {
+                                    "Đã đăng xuất. Bấm 'q' để thoát.".into()
+                                }
+                                LocalResetOutcome::Complete => {
+                                    "Đã xoá dữ liệu tin nhắn cục bộ (session giữ nguyên).".into()
+                                }
+                                LocalResetOutcome::WipedWithCacheError(error) => format!(
+                                    "Đã xoá lịch sử cục bộ. Không thể xoá bộ nhớ đệm: {error}. Bấm 'w' để thử lại."
+                                ),
+                            };
                         }
                         Err(error) => {
                             self.status = format!("Không thể xoá dữ liệu cục bộ: {error}")
@@ -2539,7 +2635,14 @@ impl<'a> TuiApp<'a> {
                     self.sticker.stage = 0;
                     self.status = format!("Kho nhãn dán: {} bộ", self.sticker.packs.len());
                 }
-                BgEvent::ConsoleLine { thread_id, text } => {
+                BgEvent::ConsoleLine {
+                    thread_id,
+                    text,
+                    generation,
+                } => {
+                    if generation != self.reset_generation {
+                        continue;
+                    }
                     self.busy = false;
                     let now = crate::ui::clock();
                     let ts = unix_now_ms();
@@ -2615,6 +2718,10 @@ pub async fn run_tui(mut app: TuiApp<'_>) -> Result<()> {
     result
 }
 
+/// Draw the terminal and process input and polling until quit and any confirmed reset finish.
+///
+/// # Errors
+/// Returns an error if drawing or reading terminal input fails.
 async fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut TuiApp<'_>,
@@ -4176,8 +4283,13 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
         .split(popup_layout[1])[1]
 }
 
+/// Clear the account's thread preview cache and the legacy fallback cache during reset.
+///
+/// # Errors
+/// Returns an error if the account ID is invalid or a cache cannot be removed. Missing files are accepted.
 fn remove_owned_thread_caches(root: &std::path::Path, uin: &str) -> Result<()> {
     crate::account_manager::validate_uin(uin)?;
+    let mut first_error = None;
     for path in [
         root.join("accounts").join(format!("{uin}_threads.json")),
         root.join("threads_cache.json"),
@@ -4185,18 +4297,25 @@ fn remove_owned_thread_caches(root: &std::path::Path, uin: &str) -> Result<()> {
         match std::fs::remove_file(path) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
+            Err(error) => {
+                first_error.get_or_insert(error);
+            }
         }
     }
-    Ok(())
+    first_error.map_or(Ok(()), |error| Err(error.into()))
 }
 
-fn wipe_account_history_in(root: &std::path::Path, uin: &str) -> Result<()> {
-    let store = crate::store::MessageStore::open_account_in(root, uin)?;
-    store
-        .conn
-        .execute_batch("BEGIN IMMEDIATE; DELETE FROM messages; DELETE FROM threads; COMMIT;")?;
-    remove_owned_thread_caches(root, uin)
+/// Wipe account history before attempting to remove preview caches.
+///
+/// # Errors
+/// Returns an error if the account store cannot be opened or the history transaction fails.
+fn wipe_account_history_in(root: &std::path::Path, uin: &str) -> Result<LocalResetOutcome> {
+    let mut store = crate::store::MessageStore::open_account_in(root, uin)?;
+    store.wipe_history()?;
+    Ok(match remove_owned_thread_caches(root, uin) {
+        Ok(()) => LocalResetOutcome::Complete,
+        Err(error) => LocalResetOutcome::WipedWithCacheError(error.to_string()),
+    })
 }
 
 #[cfg(test)]
@@ -4217,6 +4336,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Force a filesystem cleanup failure and verify the same account can retry logout.
     async fn failed_logout_keeps_its_identity_until_cleanup_can_be_retried() {
         let root = std::env::temp_dir().join(format!(
             "ctdozlite-logout-retry-{}-{}",
@@ -4234,6 +4354,12 @@ mod tests {
             uin: "account-a".into(),
             ..Default::default()
         });
+        app.reply_target = Some(ChatMessage {
+            text: "Private quoted text".into(),
+            ..Default::default()
+        });
+        app.input_text = "Private draft".into();
+        app.selected_msg = Some(0);
         let action = || ConfirmAction {
             question: String::new(),
             detail: String::new(),
@@ -4252,6 +4378,8 @@ mod tests {
         let retry_started = app.local_reset_pending;
         wait_for_test_reset(&mut app).await;
         let cleanup_finished = app.session.login.is_none() && !root.join("session.json").exists();
+        let composer_cleared =
+            app.reply_target.is_none() && app.input_text.is_empty() && app.selected_msg.is_none();
         drop(app);
         std::fs::remove_dir_all(root).unwrap();
         assert!(
@@ -4260,8 +4388,122 @@ mod tests {
         );
         assert!(can_retry && error_shown && credentials_remain);
         assert!(retry_started && cleanup_finished);
+        assert!(composer_cleared);
     }
 
+    #[tokio::test]
+    async fn committed_wipe_discards_old_messages_even_if_cache_cleanup_fails() {
+        let root = std::env::temp_dir().join(format!(
+            "ctdozlite-tui-wipe-cache-failure-{}-{}",
+            std::process::id(),
+            unix_now_ms()
+        ));
+        let cache = root.join("accounts/user-a_threads.json");
+        std::fs::create_dir_all(&cache).unwrap();
+        let mut store = crate::store::MessageStore::open_account_in(&root, "user-a").unwrap();
+        let threads = vec![Thread {
+            id: "thread-a".into(),
+            preview: "Pre-wipe history".into(),
+            messages: vec![ChatMessage {
+                id: "msg-a".into(),
+                text: "Pre-wipe history".into(),
+                ts: 1,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }];
+        crate::store::persist_threads(&mut store, &threads).unwrap();
+        let mut session = Session::new(false, false, false).unwrap();
+        let mut app = TuiApp::new(&mut session, threads);
+        app.session.login = Some(crate::session::LoginInfo {
+            uin: "user-a".into(),
+            ..Default::default()
+        });
+        app.store = Some(store);
+        let action = || ConfirmAction {
+            question: String::new(),
+            detail: String::new(),
+            kind: ConfirmKind::WipeLocalData,
+            thread_id: String::new(),
+            msg_id: String::new(),
+        };
+        app.run_confirm_in(action(), &root);
+        wait_for_test_reset(&mut app).await;
+        let cleanup_failed = app.status.contains("bộ nhớ đệm");
+        let preview_cleared = app.threads[0].preview.is_empty();
+        let store = crate::store::MessageStore::open_account_in(&root, "user-a").unwrap();
+        assert!(store.messages_for("thread-a", 10).unwrap().is_empty());
+        app.store = Some(store);
+        app.persist_thread_by_id("thread-a");
+        let history_stayed_empty = app
+            .store
+            .as_ref()
+            .unwrap()
+            .messages_for("thread-a", 10)
+            .unwrap()
+            .is_empty();
+
+        std::fs::remove_dir(&cache).unwrap();
+        std::fs::write(&cache, b"[]").unwrap();
+        app.run_confirm_in(action(), &root);
+        wait_for_test_reset(&mut app).await;
+        let cache_removed = !cache.exists();
+        drop(app);
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(
+            history_stayed_empty,
+            "a new snapshot restored wiped history"
+        );
+        assert!(preview_cleared && cleanup_failed && cache_removed);
+    }
+
+    #[tokio::test]
+    async fn summary_task_is_tracked_before_it_can_run() {
+        let mut session = Session::new(false, false, false).unwrap();
+        let mut app = TuiApp::new(
+            &mut session,
+            vec![Thread {
+                id: "thread-a".into(),
+                ..Default::default()
+            }],
+        );
+        assert!(app.handle_slash("/sum"));
+        let tasks = app.background_tasks.get_mut();
+        assert_eq!(tasks.len(), 1);
+        // The current-thread runtime has not polled the command yet.
+        tasks[0].abort();
+    }
+
+    #[test]
+    fn completion_from_before_reset_cannot_restore_console_output() {
+        let mut session = Session::new(false, false, false).unwrap();
+        let mut app = TuiApp::new(
+            &mut session,
+            vec![Thread {
+                id: "thread-a".into(),
+                ..Default::default()
+            }],
+        );
+        app.session.login = Some(crate::session::LoginInfo {
+            uin: "user-a".into(),
+            ..Default::default()
+        });
+        app.store = Some(crate::store::MessageStore::open(":memory:").unwrap());
+        let finish_old_command = app.console_completion("thread-a".into());
+        app.reset_generation += 1;
+        finish_old_command("Pre-wipe summary".into());
+        app.check_background_events();
+        assert!(app.threads[0].messages.is_empty());
+
+        app.console_completion("thread-a".into())("New summary".into());
+        app.check_background_events();
+        assert_eq!(app.threads[0].messages[0].text, "New summary");
+    }
+
+    /// Drive the event queue until the asynchronous reset is reported to the terminal state.
+    ///
+    /// # Panics
+    /// Panics if reset has not finished within three seconds.
     async fn wait_for_test_reset(app: &mut TuiApp<'_>) {
         tokio::time::timeout(Duration::from_secs(3), async {
             while app.local_reset_pending {
@@ -4274,6 +4516,7 @@ mod tests {
     }
 
     #[test]
+    /// Verify that reopening after a wipe leaves imported history empty and another account's cache intact.
     fn wipe_preserves_migration_marker_and_removes_only_owned_caches() {
         let root = std::env::temp_dir().join(format!(
             "ctdozlite-tui-wipe-{}-{}",
@@ -4307,7 +4550,10 @@ mod tests {
         ] {
             std::fs::write(root.join(cache), b"[]").unwrap();
         }
-        super::wipe_account_history_in(&root, "user-a").unwrap();
+        assert!(matches!(
+            super::wipe_account_history_in(&root, "user-a").unwrap(),
+            LocalResetOutcome::Complete
+        ));
         let store = crate::store::MessageStore::open_account_in(&root, "user-a").unwrap();
         assert!(store.messages_for("thread-a", 10).unwrap().is_empty());
         assert_eq!(
@@ -4436,6 +4682,7 @@ mod tests {
             bg_tx: tx,
             background_tasks: RefCell::new(Vec::new()),
             local_reset_pending: false,
+            reset_generation: 0,
         };
         let backend = ratatui::backend::TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -4518,6 +4765,9 @@ mod tests {
             sidebar: SidebarMode::default(),
             bg_rx: rx,
             bg_tx: tx,
+            background_tasks: RefCell::new(Vec::new()),
+            local_reset_pending: false,
+            reset_generation: 0,
         };
         app.recompute_find_hits();
         assert_eq!(app.find_hits, vec![0, 1]);
@@ -4610,6 +4860,9 @@ mod tests {
             pinned_ids: vec!["pinned-old".into()],
             bg_rx: rx,
             bg_tx: tx,
+            background_tasks: RefCell::new(Vec::new()),
+            local_reset_pending: false,
+            reset_generation: 0,
         };
         app.sort_threads();
         let ids: Vec<&str> = app.threads.iter().map(|t| t.id.as_str()).collect();
@@ -4690,6 +4943,9 @@ mod tests {
             sidebar: SidebarMode::default(),
             bg_rx: rx,
             bg_tx: tx,
+            background_tasks: RefCell::new(Vec::new()),
+            local_reset_pending: false,
+            reset_generation: 0,
         };
         app.sort_threads();
         let ids: Vec<&str> = app.threads.iter().map(|t| t.id.as_str()).collect();
@@ -4760,6 +5016,9 @@ mod tests {
             pinned_ids: Vec::new(),
             bg_rx: rx,
             bg_tx: tx,
+            background_tasks: RefCell::new(Vec::new()),
+            local_reset_pending: false,
+            reset_generation: 0,
         };
         let cands = app.slash_candidates();
         let names: Vec<&str> = cands.iter().map(|(c, _)| c.as_str()).collect();
@@ -4848,6 +5107,9 @@ mod tests {
             sidebar: SidebarMode::default(),
             bg_rx: rx,
             bg_tx: tx,
+            background_tasks: RefCell::new(Vec::new()),
+            local_reset_pending: false,
+            reset_generation: 0,
         };
         assert!(app.select_thread_by_id("t2"));
         assert_eq!(app.selected_thread, 1);
@@ -4922,6 +5184,9 @@ mod tests {
             sidebar: SidebarMode::default(),
             bg_rx: rx,
             bg_tx: tx,
+            background_tasks: RefCell::new(Vec::new()),
+            local_reset_pending: false,
+            reset_generation: 0,
         };
         // plain text: not a command
         assert!(!app.handle_slash("hello world"));
@@ -4947,7 +5212,7 @@ mod tests {
         app.bg_tx
             .send(BgEvent::LocalResetDone {
                 logout: false,
-                result: Ok("Test".into()),
+                result: Ok(LocalResetOutcome::Complete),
             })
             .unwrap();
         app.check_background_events();
@@ -5008,6 +5273,7 @@ mod tests {
             bg_tx: tx,
             background_tasks: RefCell::new(Vec::new()),
             local_reset_pending: false,
+            reset_generation: 0,
         };
         app.handle_key(KeyCode::Char('w'), KeyModifiers::NONE);
         let backend = ratatui::backend::TestBackend::new(100, 30);
@@ -5103,6 +5369,9 @@ mod tests {
             sidebar: SidebarMode::Normal,
             bg_rx: rx,
             bg_tx: tx,
+            background_tasks: RefCell::new(Vec::new()),
+            local_reset_pending: false,
+            reset_generation: 0,
         };
         app.handle_key(KeyCode::Char('j'), KeyModifiers::NONE);
         app.handle_key(KeyCode::Char('k'), KeyModifiers::NONE);

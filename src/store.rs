@@ -287,7 +287,12 @@ impl MessageStore {
             tx.execute_batch("INSERT OR IGNORE INTO messages(msg_id, thread_id, sender_id, sender_name, text, msg_type, ts, is_outgoing, raw_json)
                 SELECT msg_id, thread_id, sender_id, sender_name, text, msg_type, ts, is_outgoing, raw_json FROM legacy_history.messages;
                 INSERT OR IGNORE INTO threads(thread_id, name, is_group, last_ts, last_read_msg_id, vanish_duration_sec, vanish_started_at_sec, contact_name)
-                SELECT thread_id, name, is_group, last_ts, last_read_msg_id, vanish_duration_sec, vanish_started_at_sec, contact_name FROM legacy_history.threads;
+                SELECT t.thread_id, t.name, t.is_group, t.last_ts, t.last_read_msg_id,
+                       CASE WHEN t.vanish_duration_sec > 0 THEN t.vanish_duration_sec ELSE COALESCE(v.duration_sec, 0) END,
+                       CASE WHEN t.vanish_duration_sec > 0 THEN t.vanish_started_at_sec ELSE COALESCE(v.started_at_sec, 0) END,
+                       t.contact_name
+                FROM legacy_history.threads AS t
+                LEFT JOIN legacy_history.thread_vanish AS v ON v.thread_id = t.thread_id AND v.duration_sec > 0;
                 INSERT INTO account_store_metadata(key, value) VALUES ('legacy_imported', '1');")?;
             if has_scheduled_messages {
                 // Scheduler IDs are local autoincrement values, so both databases can
@@ -308,6 +313,27 @@ impl MessageStore {
     /// Messages per thread loaded at startup / on refresh. The list only needs the newest one
     /// for ordering and preview; opening a thread reads deeper (`LoadGroupHistory`).
     pub const PRELOAD_MSGS: usize = 20;
+
+    /// Remove local history and its message-derived records in one transaction.
+    ///
+    /// Account metadata, scheduled deliveries, and workspace configuration are retained.
+    ///
+    /// # Errors
+    /// Returns a database error if the wipe cannot be completed.
+    pub fn wipe_history(&mut self) -> Result<()> {
+        let tx = self.conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        tx.execute_batch(
+            "DELETE FROM message_edits;
+             DELETE FROM message_reminders;
+             DELETE FROM saved_items;
+             DELETE FROM drafts;
+             DELETE FROM thread_vanish;
+             DELETE FROM messages;
+             DELETE FROM threads;",
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
 
     /// Mở SQLite mà KHÔNG chạy migration/khởi tạo schema (đọc đường nhanh).
     /// Dùng cho lookup nền (vd. watch keyword khi match tin mới): DB cũ thiếu
@@ -2503,6 +2529,7 @@ impl MessageStore {
 
 // Counts may be refreshed from history without event IDs. Retain replay identities across
 // metadata upserts; an older or incomplete writer cannot erase the local deduplication ledger.
+/// Merge persisted reaction versions into replacement metadata so replay stays idempotent.
 fn preserve_reaction_replay_metadata(previous: &str, incoming: &str) -> String {
     type Versions = std::collections::BTreeMap<String, crate::reactions::ReactionVersion>;
     let old: Versions = serde_json::from_str::<serde_json::Value>(previous)
@@ -2534,6 +2561,7 @@ fn preserve_reaction_replay_metadata(previous: &str, incoming: &str) -> String {
 }
 
 impl From<&ChatMessage> for StoredMessage {
+    /// Store chat fields and encode optional message details and reaction versions as row metadata.
     fn from(m: &ChatMessage) -> Self {
         let mut meta = serde_json::Map::new();
         let msg_type = if let Some(sid) = m.sticker_id {
@@ -3739,6 +3767,7 @@ mod tests {
     }
 
     #[test]
+    /// Exercise competing initial store opens against the same owned legacy data.
     fn concurrent_first_account_opens_import_legacy_history_once() {
         let root = std::env::temp_dir().join(format!(
             "ctdozlite-concurrent-import-{}-{}",
@@ -3862,6 +3891,13 @@ mod tests {
                 ..Default::default()
             })
             .unwrap();
+        legacy.upsert_thread(&StoredThread {
+            thread_id: "collision".into(),
+            ..Default::default()
+        }).unwrap();
+        legacy.conn.execute_batch(
+            "INSERT INTO thread_vanish VALUES ('thread-1', 3600, 100), ('collision', 7200, 200);"
+        ).unwrap();
         crate::scheduler::init_scheduler_schema(&legacy.conn).unwrap();
         legacy.conn.execute("INSERT INTO scheduled_messages(thread_id, text, deliver_at, created_at) VALUES ('thread-1', 'legacy schedule', 2, 1)", []).unwrap();
         {
@@ -3869,16 +3905,23 @@ mod tests {
                 MessageStore::open(root.join("accounts/user-a_history.db").to_str().unwrap())
                     .unwrap();
             existing.upsert_message(&message("msg-canonical")).unwrap();
+            existing.upsert_thread(&StoredThread {
+                thread_id: "collision".into(),
+                ..Default::default()
+            }).unwrap();
             crate::scheduler::init_scheduler_schema(&existing.conn).unwrap();
             existing.conn.execute("INSERT INTO scheduled_messages(thread_id, text, deliver_at, created_at) VALUES ('thread-1', 'canonical schedule', 2, 1)", []).unwrap();
         }
         {
             let account = MessageStore::open_account_in(&root, "user-a").unwrap();
             assert_eq!(account.messages_for("thread-1", 20).unwrap().len(), 2);
-            assert_eq!(
-                account.all_threads().unwrap()[0].last_read_msg_id,
-                "msg-legacy"
-            );
+            let threads = account.all_threads().unwrap();
+            let migrated = threads.iter().find(|thread| thread.thread_id == "thread-1").unwrap();
+            let collision = threads.iter().find(|thread| thread.thread_id == "collision").unwrap();
+            assert_eq!(migrated.last_read_msg_id, "msg-legacy");
+            assert_eq!((migrated.vanish_duration_sec, migrated.vanish_started_at_sec), (3600, 100));
+            assert_eq!(collision.vanish_duration_sec, 0);
+            assert!(account.load_thread_vanish("collision").is_none());
             let count: i64 = account
                 .conn
                 .query_row("SELECT COUNT(*) FROM scheduled_messages", [], |row| {
@@ -3911,6 +3954,36 @@ mod tests {
         assert_eq!(migrated.messages_for("thread-1", 20).unwrap().len(), 2);
         drop(migrated);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Ensure the wipe removes derived message content and preserves the import marker.
+    #[test]
+    fn history_wipe_removes_related_content_but_keeps_migration_metadata() {
+        let mut store = MessageStore::open(":memory:").unwrap();
+        store.conn.execute_batch(
+            "INSERT INTO threads(thread_id) VALUES ('thread-1');
+             INSERT INTO messages(msg_id, thread_id, text) VALUES ('msg-1', 'thread-1', 'current');
+             INSERT INTO message_edits(msg_id, old_text) VALUES ('msg-1', 'old text');
+             INSERT INTO message_reminders(text_preview) VALUES ('reminder text');
+             INSERT INTO saved_items(msg_id, note) VALUES ('msg-1', 'saved text');
+             INSERT INTO drafts(thread_id, text) VALUES ('thread-1', 'draft');
+             INSERT INTO thread_vanish VALUES ('thread-1', 3600, 100);
+             INSERT INTO account_store_metadata VALUES ('legacy_imported', '1');"
+        ).unwrap();
+        store.wipe_history().unwrap();
+        let remaining: i64 = store.conn.query_row(
+            "SELECT (SELECT count(*) FROM threads) + (SELECT count(*) FROM messages)
+                  + (SELECT count(*) FROM message_edits) + (SELECT count(*) FROM message_reminders)
+                  + (SELECT count(*) FROM saved_items) + (SELECT count(*) FROM drafts)
+                  + (SELECT count(*) FROM thread_vanish)",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(remaining, 0);
+        let marker: String = store.conn.query_row(
+            "SELECT value FROM account_store_metadata WHERE key = 'legacy_imported'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(marker, "1");
     }
 
     #[test]

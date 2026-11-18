@@ -1591,6 +1591,7 @@ pub fn load_threads_cache_for_account(uin: &str) -> Vec<Thread> {
     load_threads_cache_for_account_in(std::path::Path::new("."), uin)
 }
 
+/// Read and deduplicate one account's first-paint cache, with an empty fallback for invalid data.
 fn load_threads_cache_for_account_in(root: &std::path::Path, uin: &str) -> Vec<Thread> {
     if crate::account_manager::validate_uin(uin).is_err() {
         return Vec::new();
@@ -1622,6 +1623,10 @@ pub fn save_threads_cache_for_account(uin: &str, threads: &[Thread]) {
     }
 }
 
+/// Atomically replace the account's private thread cache with a bounded preview per conversation.
+///
+/// # Errors
+/// Returns an error if the account ID is invalid, serialization fails, or the cache cannot be written.
 fn save_threads_cache_for_account_in(
     root: &std::path::Path,
     uin: &str,
@@ -1647,8 +1652,10 @@ fn save_threads_cache_for_account_in(
     let text = serde_json::to_string(&slim)?;
     let accounts = root.join("accounts");
     std::fs::create_dir_all(&accounts)?;
-    std::fs::write(accounts.join(format!("{uin}_threads.json")), text)?;
-    Ok(())
+    crate::data_dir::write_private_atomic(
+        &accounts.join(format!("{uin}_threads.json")),
+        text.as_bytes(),
+    )
 }
 
 /// `/api/social/friend/getfriends` — the friend list.

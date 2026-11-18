@@ -226,6 +226,16 @@ fn apply_extend_tweaks(extend_str: String) -> String {
     format!("{obj}\n")
 }
 
+/// Dispatch camera helper mode before loading the authenticated session used
+/// by the interactive diagnostics.
+///
+/// # Errors
+/// Returns an error if helper startup, session loading, argument selection,
+/// or the selected diagnostic operation fails.
+///
+/// # Panics
+/// An out-of-range or non-finite duration can panic when WebSocket watch or
+/// callee auto-answer converts it to a timer delay.
 #[tokio::main]
 async fn main() -> Result<()> {
     let arguments: Vec<String> = std::env::args().collect();
@@ -335,6 +345,8 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// Poll the control cursor and log each event with its elapsed time. Return an
+/// empty batch after a polling error so the diagnostic loop can continue.
 async fn poll_once(s: &Session, st: &mut CtrlPollState, t0: Instant) -> Vec<Value> {
     match poll_voip_controls(s, st).await {
         Ok(events) => {
@@ -359,6 +371,11 @@ async fn poll_once(s: &Session, st: &mut CtrlPollState, t0: Instant) -> Vec<Valu
     }
 }
 
+/// Observe VoIP control events through HTTP polling for the requested time.
+/// The initial poll advances the cursor before the steady polling loop.
+///
+/// # Errors
+/// Returns an error if the current directory cannot be read for the banner.
 async fn watch(s: &Session, secs: f64) -> Result<()> {
     let t0 = Instant::now();
     let mut st = CtrlPollState::default();
@@ -432,6 +449,12 @@ async fn ws_watch(s: &Session, secs: f64) -> Result<()> {
     Ok(())
 }
 
+/// Place a diagnostic call and observe control events for the allocated call,
+/// acknowledging a successful answer.
+///
+/// # Errors
+/// Returns an error if a required signaling request fails or the server
+/// rejects the initial call allocation.
 async fn call(s: &Session, uid: &str, video: bool, zrtp: bool, secs: f64) -> Result<()> {
     let t0 = Instant::now();
     let call_type = CallType::from_flags(video, false) as u8;
@@ -660,6 +683,15 @@ async fn call(s: &Session, uid: &str, video: bool, zrtp: bool, secs: f64) -> Res
     Ok(())
 }
 
+/// Observe incoming call events from WebSocket and HTTP polling, filtering
+/// stale replays and optionally sending one answer sequence per call ID.
+///
+/// # Errors
+/// Signaling failures are logged during the probe and the listener returns
+/// success when the observation window ends.
+///
+/// # Panics
+/// Panics if the clamped auto-answer delay exceeds the supported timer range.
 async fn serve(
     s: &Session,
     auto_answer: Option<f64>,

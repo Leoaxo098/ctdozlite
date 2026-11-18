@@ -366,6 +366,10 @@ fn check_thread_bound(bound: &BoundThread, tool: &str, got: Option<&str>) -> Opt
     }
 }
 
+/// Bind each request to a session snapshot and resolve the default database for its owner.
+///
+/// # Errors
+/// Returns an error if the account store cannot be opened on the blocking pool.
 async fn account_api_context(
     session: &Arc<Mutex<Session>>,
     db_path: &str,
@@ -386,6 +390,7 @@ async fn account_api_context(
     Ok((Arc::new(Mutex::new(snapshot)), path))
 }
 
+/// Dispatch a tool against one account context and report failures through the MCP error flag.
 async fn execute_tool_call(
     session: &Arc<Mutex<Session>>,
     name: &str,
@@ -1032,7 +1037,7 @@ mod tests {
     async fn logged_out_api_does_not_read_legacy_account_history() {
         let session = Arc::new(Mutex::new(Session::new(false, false, false).unwrap()));
         let (is_error, response) =
-            execute_tool_call(&session, "zalo_list_threads", &json!({}), "zalo_history.db").await;
+            execute_tool_call(&session, "zalo_list_threads", &json!({}), "zalo_history.db", &None).await;
         assert!(is_error);
         assert_eq!(response["error"], "Chưa đăng nhập phiên Zalo");
     }

@@ -30,6 +30,7 @@ fn thread(messages: Vec<ChatMessage>) -> Thread {
 }
 
 #[test]
+/// Preserve pending, failed, and delivered states when a newer incoming history item is merged.
 fn incoming_history_does_not_imply_outgoing_read_receipts() {
     for state in [
         DeliveryState::Pending,
@@ -48,6 +49,7 @@ fn incoming_history_does_not_imply_outgoing_read_receipts() {
 }
 
 #[test]
+/// Preserve outgoing delivery state when a direct conversation refresh brings in a newer preview.
 fn incoming_preview_does_not_imply_outgoing_read_receipts() {
     for state in [
         DeliveryState::Pending,

@@ -42,6 +42,8 @@ impl Fanout {
         self.next_id
     }
 
+    /// Drop queued references for every leg and require a fresh IDR before
+    /// forwarding frames again.
     fn invalidate(&mut self) {
         self.need_idr = true;
         for slot in self.slots.values_mut() {
@@ -50,6 +52,8 @@ impl Fanout {
         }
     }
 
+    /// Fan out an encoded access unit in order. A disabled or overrun leg
+    /// clears its queue and waits for an IDR independently of the other legs.
     fn publish(&mut self, au: Vec<u8>, idr: bool) {
         for slot in self.slots.values_mut() {
             if !slot
@@ -150,6 +154,7 @@ impl VideoSession {
 }
 
 impl Drop for VideoSession {
+    /// Join the capture supervisor before ending this call's preview generation.
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
         if let Ok(worker) = self.worker.get_mut() {
@@ -191,6 +196,7 @@ impl VideoSubscription {
 }
 
 impl Drop for VideoSubscription {
+    /// Remove this call leg's queue so the encoder skips future deliveries to it.
     fn drop(&mut self) {
         if let Ok(mut bus) = self.session.bus.lock() {
             bus.slots.remove(&self.id);
@@ -198,6 +204,8 @@ impl Drop for VideoSubscription {
     }
 }
 
+/// Run camera and encoder work for the current call. Keep capture active only
+/// while at least one leg requests video and tag previews with the call generation.
 fn supervise(
     stop: Arc<AtomicBool>,
     bus: Arc<Mutex<Fanout>>,
@@ -358,6 +366,13 @@ fn supervise(
     }
 }
 
+/// Resolve the UI camera selection, which can be a device ID, a label, or a
+/// combined label and ID. An empty list while discovery is pending returns
+/// `None` so capture can retry.
+///
+/// # Errors
+/// Returns an error for an invalid device list, no devices after completed
+/// discovery, or a missing or ambiguous selection.
 fn select_camera_after_discovery(
     devices: &[camera::CameraDevice],
     requested: &str,
@@ -374,6 +389,8 @@ fn select_camera_after_discovery(
     camera::resolve_device(devices, selection).map(Some)
 }
 
+/// Invalidate queued references, disable subscribed legs, and report the
+/// capture or encoding failure to the GUI when present.
 fn camera_failure(bus: &Mutex<Fanout>, gui: &Option<crate::gui::GuiTx>, error: anyhow::Error) {
     crate::voip_log::line("VCAM", format!("native camera failed: {error}"));
     if let Ok(mut bus) = bus.lock() {
@@ -423,6 +440,8 @@ mod tests {
         assert!(primary.camera_enabled().load(Ordering::Acquire));
     }
 
+    /// Drive one leg into overflow while consuming every frame on another,
+    /// then verify that the stalled leg resumes at the next IDR.
     #[test]
     fn overflow_waits_for_fresh_idr_without_skipping_other_legs() {
         let enabled = Arc::new(AtomicBool::new(true));

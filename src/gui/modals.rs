@@ -189,6 +189,8 @@ pub(crate) fn compute_call_per_page(stage_w: f32) -> usize {
 }
 
 impl ZaloGuiApp {
+    /// Queue a coalesced account-list refresh. A deletion invalidates the current
+    /// request so its late response cannot overwrite the updated profiles.
     fn request_saved_accounts(&mut self, delete: Option<String>) {
         if delete.is_some() {
             self.saved_accounts.invalidate();
@@ -211,6 +213,8 @@ impl ZaloGuiApp {
         }
     }
 
+    /// Show the active profile and saved-account shortcuts, and route account switches,
+    /// account addition and destructive actions from the navigation rail.
     pub(super) fn render_profile_popover(&mut self, ctx: &egui::Context, pal: &ThemePalette) {
         if !self.profile_menu_open {
             return;
@@ -1443,6 +1447,8 @@ impl ZaloGuiApp {
             self.phone_modal_open = false;
         }
     }
+    /// Show preferences and account management while the dialog is open, releasing the
+    /// backdrop texture when it closes.
     pub(super) fn render_settings_modal(&mut self, ctx: &egui::Context, pal: &ThemePalette) {
         if !self.settings_modal_open {
             self.settings_blur_tex = None;
@@ -4757,6 +4763,7 @@ impl ZaloGuiApp {
         }
     }
 
+    /// Edit the composer's delivery time or manage pending sends for the displayed account.
     pub(super) fn render_schedule_modal(&mut self, ctx: &egui::Context, pal: &ThemePalette) {
         if !self.schedule_modal_open {
             return;
@@ -5577,6 +5584,8 @@ impl ZaloGuiApp {
         }
     }
 
+    /// Render the current call's controls and participant video, scheduling repaints
+    /// while the call is visible so elapsed time and textures stay current.
     pub(super) fn render_call_overlay(&mut self, ctx: &egui::Context, pal: &ThemePalette) {
         let Some(mut call) = self.active_call.clone() else {
             return;
@@ -7766,6 +7775,7 @@ impl ZaloGuiApp {
         out.into_iter().rev().collect()
     }
 
+    /// Require explicit confirmation before queuing a wipe of the account's local history.
     pub(super) fn render_wipe_confirm(&mut self, ctx: &egui::Context, pal: &ThemePalette) {
         if !self.wipe_confirm_open {
             return;
@@ -7854,6 +7864,8 @@ impl ZaloGuiApp {
         }
     }
 
+    /// On confirmed logout, save the current profile for quick sign-in, clear the
+    /// displayed session and ask the worker to log out.
     pub(super) fn render_logout_confirm(&mut self, ctx: &egui::Context, pal: &ThemePalette) {
         if !self.logout_confirm_open {
             return;

@@ -115,6 +115,7 @@ pub struct VideoDecoder {
     decoder: Option<Decoder>,
     sps: BTreeMap<u32, (Vec<u8>, SpsInfo)>,
     pps: BTreeMap<u32, (Vec<u8>, u32)>,
+    parameter_sets_pending: bool,
     synchronized: bool,
 }
 impl VideoDecoder {
@@ -126,6 +127,7 @@ impl VideoDecoder {
             decoder: None,
             sps: BTreeMap::new(),
             pps: BTreeMap::new(),
+            parameter_sets_pending: false,
             synchronized: false,
         })
     }
@@ -148,6 +150,12 @@ impl VideoDecoder {
         result
     }
 
+    /// Validate and cache parameter sets before native decoding. Return no
+    /// frame while required sets, an initial IDR, or decoded output are pending.
+    ///
+    /// # Errors
+    /// Returns an error for malformed or unsupported H.264, exceeded buffer
+    /// limits, inconsistent dimensions, or native decoder failures.
     fn decode_inner(&mut self, annexb: &[u8]) -> Result<Option<DecodedFrame>> {
         let nals = annexb_nals(annexb)?;
         // Subset SPS and MVC/SVC extensions must not bypass the dimension preflight.
@@ -160,6 +168,8 @@ impl VideoDecoder {
             if nal[0] & 0x1f == 7 {
                 ensure!(nal.len() <= 65536, "SPS exceeds limit");
                 let info = inspect_sps(nal)?;
+                self.parameter_sets_pending |=
+                    self.sps.get(&info.id).is_none_or(|old| old.0 != *nal);
                 if self.sps.get(&info.id).is_some_and(|old| old.0 != *nal) {
                     self.decoder = None;
                     self.synchronized = false;
@@ -180,6 +190,7 @@ impl VideoDecoder {
                 let id = bits.ue()?;
                 let sps_id = bits.ue()?;
                 ensure!(id < 256 && sps_id < 32, "invalid parameter-set ID");
+                self.parameter_sets_pending |= self.pps.get(&id).is_none_or(|old| old.0 != *nal);
                 if self.pps.get(&id).is_some_and(|old| old.0 != *nal) {
                     self.decoder = None;
                     self.synchronized = false;
@@ -231,7 +242,7 @@ impl VideoDecoder {
         if !has_slice || (!self.synchronized && !has_idr) {
             return Ok(None);
         }
-        let prepend_sets = self.decoder.is_none() || has_idr;
+        let prepend_sets = self.decoder.is_none() || has_idr || self.parameter_sets_pending;
         let set_bytes = if prepend_sets {
             self.sps
                 .values()
@@ -284,10 +295,11 @@ impl VideoDecoder {
             );
         }
         let decoder = self.decoder.as_mut().context("missing H264 decoder")?;
-        let Some(yuv) = decoder
+        let frame = decoder
             .decode(&packet)
-            .context("decode native H264 frame")?
-        else {
+            .context("decode native H264 frame")?;
+        self.parameter_sets_pending = false;
+        let Some(yuv) = frame else {
             return Ok(None);
         };
         let (width, height) = yuv.dimensions();
@@ -354,6 +366,11 @@ struct SpsInfo {
     height: usize,
 }
 
+/// Borrow NAL payloads without their Annex B start codes or trailing padding.
+///
+/// # Errors
+/// Returns an error for oversized input, too many NALs, missing start codes,
+/// empty NALs, or invalid NAL headers.
 fn annexb_nals(bytes: &[u8]) -> Result<Vec<&[u8]>> {
     ensure!(
         !bytes.is_empty() && bytes.len() <= MAX_UNIT,
@@ -401,6 +418,11 @@ fn unescape(bytes: &[u8]) -> Result<Vec<u8>> {
     unescape_prefix(bytes, bytes.len())
 }
 
+/// Remove emulation-prevention bytes within the requested decoded prefix so
+/// callers can inspect slice headers without copying their full payload.
+///
+/// # Errors
+/// Returns an error if a scanned escape precedes a byte outside the permitted range.
 fn unescape_prefix(bytes: &[u8], limit: usize) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(bytes.len().min(limit));
     let mut zeros = 0;
@@ -431,6 +453,10 @@ impl<'a> Bits<'a> {
     fn new(bytes: &'a [u8]) -> Self {
         Self { bytes, offset: 0 }
     }
+    /// Consume up to 32 bits from the current position, most significant bit first.
+    ///
+    /// # Errors
+    /// Returns an error if the requested bits cannot fit in the result or input.
     fn read(&mut self, count: usize) -> Result<u32> {
         ensure!(
             count <= 32 && self.offset + count <= self.bytes.len() * 8,
@@ -444,6 +470,10 @@ impl<'a> Bits<'a> {
         }
         Ok(value)
     }
+    /// Consume one unsigned Exp-Golomb code from the H.264 bitstream.
+    ///
+    /// # Errors
+    /// Returns an error if the code is truncated or has more than 31 leading zeros.
     fn ue(&mut self) -> Result<u32> {
         let mut zeros = 0;
         while self.read(1)? == 0 {
@@ -452,6 +482,10 @@ impl<'a> Bits<'a> {
         }
         Ok(((1u64 << zeros) - 1 + u64::from(self.read(zeros)?)) as u32)
     }
+    /// Consume one signed Exp-Golomb code, mapping odd code numbers to positives.
+    ///
+    /// # Errors
+    /// Returns an error if the underlying Exp-Golomb code is truncated or too large.
     fn se(&mut self) -> Result<i64> {
         let code = i64::from(self.ue()?);
         Ok(if code & 1 == 0 {
@@ -462,6 +496,15 @@ impl<'a> Bits<'a> {
     }
 }
 
+/// Extract the SPS identifier and visible dimensions while enforcing codec
+/// and allocation limits before native decoding.
+///
+/// # Errors
+/// Returns an error for malformed fields, unsupported encoding parameters,
+/// or coded or cropped dimensions outside the supported range.
+///
+/// # Panics
+/// Panics if the caller supplies an empty NAL without its header byte.
 fn inspect_sps(nal: &[u8]) -> Result<SpsInfo> {
     let rbsp = unescape(&nal[1..])?;
     let mut bits = Bits::new(&rbsp);
@@ -568,6 +611,8 @@ mod tests {
         [240, 20, 20].repeat(width * height)
     }
 
+    /// Round-trip a red and black fixture through OpenH264 and check decoded
+    /// dimensions, pixel layout, and representative colors.
     #[test]
     fn native_roundtrip_preserves_dimensions_color_and_black_content() {
         let mut rgb = red_rgb(320, 240);
@@ -644,6 +689,8 @@ mod tests {
         assert!(decoder.decode(&[0, 0, 1, 0x65, 0xff]).unwrap().is_none());
     }
 
+    /// Check that separately received parameter sets enable IDR decoding
+    /// until a reset clears them.
     #[test]
     fn accepts_parameter_sets_delivered_separately_before_idr() {
         let encoded = VideoEncoder::new()
@@ -665,6 +712,65 @@ mod tests {
         assert!(decoder.decode(&slices).unwrap().is_some());
         decoder.reset().unwrap();
         assert!(decoder.decode(&slices).unwrap().is_none());
+    }
+
+    /// A synchronized decoder must accept a new PPS delivered before its first P slice.
+    #[test]
+    fn delivers_separate_pps_before_its_dependent_p_slice() {
+        /// Replace ue(0) with ue(1) and preserve the rest of the CAVLC RBSP.
+        fn with_pps_one(nal: &[u8], skip_fields: usize) -> Vec<u8> {
+            let rbsp = unescape(&nal[1..]).unwrap();
+            let start = {
+                let mut bits = Bits::new(&rbsp);
+                for _ in 0..skip_fields {
+                    bits.ue().unwrap();
+                }
+                bits
+            };
+            let bit = start.offset;
+            let mut bits = start;
+            assert_eq!(bits.ue().unwrap(), 0);
+            let mut rbsp_bits: Vec<_> = rbsp
+                .iter()
+                .flat_map(|byte| (0..8).rev().map(move |shift| (byte >> shift) & 1))
+                .collect();
+            rbsp_bits.splice(bit..bit + 1, [0, 1, 0]);
+            rbsp_bits.resize(rbsp_bits.len().next_multiple_of(8), 0);
+            let mut result = vec![0, 0, 0, 1, nal[0]];
+            let mut zeros = 0;
+            for chunk in rbsp_bits.chunks_exact(8) {
+                let byte = chunk.iter().fold(0u8, |byte, bit| (byte << 1) | bit);
+                if zeros == 2 && byte <= 3 {
+                    result.push(3);
+                    zeros = 0;
+                }
+                result.push(byte);
+                zeros = if byte == 0 { zeros + 1 } else { 0 };
+            }
+            result
+        }
+
+        let mut encoder = VideoEncoder::new().unwrap();
+        let idr = encoder
+            .encode_rgb(&red_rgb(320, 240), 320, 240, true)
+            .unwrap();
+        let p = encoder
+            .encode_rgb(&red_rgb(320, 240), 320, 240, false)
+            .unwrap();
+        let pps = annexb_nals(&idr)
+            .unwrap()
+            .into_iter()
+            .find(|nal| nal[0] & 0x1f == 8)
+            .unwrap();
+        let slice = annexb_nals(&p)
+            .unwrap()
+            .into_iter()
+            .find(|nal| nal[0] & 0x1f == 1)
+            .unwrap();
+        let mut decoder = VideoDecoder::new().unwrap();
+        assert!(decoder.decode(&idr).unwrap().is_some());
+        assert!(decoder.decode(&with_pps_one(pps, 0)).unwrap().is_none());
+        assert!(decoder.decode(&with_pps_one(slice, 2)).unwrap().is_some());
     }
 
     #[test]
@@ -698,8 +804,16 @@ mod tests {
         assert_eq!((frame.width, frame.height), (320, 240));
     }
 
-    // Synthetic baseline SPS fixtures encode only the fields needed for dimension bounds.
+    /// Build an Annex B baseline SPS fixture for coded and visible size checks.
+    ///
+    /// # Panics
+    /// With overflow checks enabled, panics if either macroblock dimension is zero
+    /// or the bottom crop is `u32::MAX`.
     fn baseline_sps(mb_width: u32, mb_height: u32, crop_bottom: u32) -> Vec<u8> {
+        /// Append the unsigned Exp-Golomb prefix and value bits to the fixture.
+        ///
+        /// # Panics
+        /// With overflow checks enabled, panics for `u32::MAX`.
         fn ue(bits: &mut Vec<bool>, value: u32) {
             let value = value + 1;
             let count = 32 - value.leading_zeros();
@@ -750,6 +864,8 @@ mod tests {
         assert!(decoder.decoder.is_none());
     }
 
+    /// Verify that invalid NAL headers and malformed parameter sets surface
+    /// as recoverable decoder errors.
     #[test]
     fn handles_malformed_annexb_without_panicking() {
         let mut decoder = VideoDecoder::new().unwrap();

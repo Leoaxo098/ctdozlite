@@ -263,6 +263,10 @@ pub fn save_current_account_snapshot(uin: &str) -> Result<()> {
     save_current_account_snapshot_in(Path::new("."), uin)
 }
 
+/// Return the original session bytes after verifying the saved login belongs to `uin`.
+///
+/// # Errors
+/// Returns an error if the file is unreadable, malformed, or belongs to another account.
 fn read_owned_session(path: &Path, uin: &str) -> Result<Vec<u8>> {
     let bytes = std::fs::read(path)?;
     let saved: crate::session::SavedSession = serde_json::from_slice(&bytes)
@@ -273,6 +277,10 @@ fn read_owned_session(path: &Path, uin: &str) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+/// Prepare the account history store before atomically saving a copy of its active session.
+///
+/// # Errors
+/// Returns an error if the account or session is invalid, or if local persistence fails.
 fn save_current_account_snapshot_in(root: &Path, uin: &str) -> Result<()> {
     validate_uin(uin)?;
     let session_path = root.join("session.json");
@@ -328,6 +336,10 @@ pub fn logout_account_in(root: &Path, uin: &str) -> Result<()> {
     remove_if_exists(&root.join("session.json"))
 }
 
+/// Remove a session artifact idempotently so interrupted cleanup can be retried.
+///
+/// # Errors
+/// Returns filesystem errors other than a missing file.
 fn remove_if_exists(path: &Path) -> Result<()> {
     match std::fs::remove_file(path) {
         Ok(()) => Ok(()),
@@ -484,6 +496,7 @@ mod tests {
     }
 
     #[test]
+    /// Verify that malformed account IDs leave the account directory empty.
     fn account_open_rejects_path_traversal_before_creating_files() {
         let root = root();
         for uin in ["", "../outside", "..\\outside", "C:outside", "user/a"] {
@@ -494,6 +507,7 @@ mod tests {
     }
 
     #[test]
+    /// Exercise a switch with preexisting history for both accounts and an owned legacy database.
     fn switch_imports_owned_legacy_without_overwriting_canonical_history() {
         let root = root();
         session_file(&root.join("session.json"), "user-a");

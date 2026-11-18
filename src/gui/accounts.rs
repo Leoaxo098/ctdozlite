@@ -19,6 +19,7 @@ impl SavedAccountsState {
         self.loaded = false;
     }
 
+    /// Reserve a request ID only when no request is pending and the cache needs loading.
     pub fn request(&mut self) -> Option<u64> {
         if self.loaded || self.pending.is_some() {
             return None;
@@ -32,6 +33,8 @@ impl SavedAccountsState {
         self.pending.is_some()
     }
 
+    /// Accept only the pending request's result. Both success and failure settle the
+    /// cache until the next invalidation, so repainting cannot trigger automatic retries.
     pub fn finish(&mut self, request_id: u64, result: Result<Vec<AccountProfile>, String>) {
         if self.pending != Some(request_id) {
             return;
@@ -52,6 +55,10 @@ impl SavedAccountsState {
 mod tests {
     use super::*;
 
+    /// Ensure repeated paints cannot start duplicate requests before or after a load.
+    ///
+    /// # Panics
+    /// Panics if an initial load is skipped or a reload bypasses invalidation.
     #[test]
     fn repaint_requests_are_coalesced_until_explicit_refresh() {
         let mut state = SavedAccountsState::default();
@@ -77,6 +84,7 @@ mod tests {
         assert!(state.loading());
         assert!(state.error.is_none());
         let profile = AccountProfile {
+            phone: String::new(),
             uin: "user-1".into(),
             display_name: "Test".into(),
             avatar: None,
