@@ -976,7 +976,10 @@ pub enum GuiEvent {
         msg_id: String,
         err: String,
     },
-    LoggedOut,
+    /// A completed sign-out, with the saved account to return to during add-account login.
+    LoggedOut { previous_account: Option<String> },
+    /// The active account could not be saved before opening the add-account login screen.
+    AddAccountFailed(String),
     HistoryReachedStart(String),
     /// An account that is signed in but not shown received new messages.
     BackgroundAccountActivity(crate::background_accounts::BackgroundActivity),
@@ -1665,6 +1668,8 @@ impl GuiTx {
         }
     }
 
+    /// Discard pending frames and request texture cleanup. A scoped reset only applies
+    /// while both its account and call generation are current.
     fn reset_video_generation(&self, generation: Option<u64>) {
         let mut state = self
             .video_frames
@@ -1687,6 +1692,8 @@ impl GuiTx {
         self.notify_video_frames(&mut state);
     }
 
+    /// Wake the GUI once per mailbox drain. Returns false and drops pending updates
+    /// if the GUI receiver has closed.
     fn notify_video_frames(&self, state: &mut VideoFrameState) -> bool {
         if state.notification_pending {
             return true;
@@ -1735,6 +1742,7 @@ impl GuiTx {
 }
 
 impl GuiEvent {
+    /// Unwrap account-scoped events only if every enclosing generation is still current.
     pub(crate) fn for_current_account(self) -> Option<Self> {
         match self {
             Self::AccountScoped {
@@ -2111,6 +2119,10 @@ fn thread_texts(threads: &[Thread]) -> impl Iterator<Item = &str> {
 }
 
 impl ZaloGuiApp {
+    /// Restore the desktop settings and initial account view, then start background processing.
+    ///
+    /// # Panics
+    /// Panics if the session worker thread cannot be spawned.
     pub fn new(
         cc: &eframe::CreationContext<'_>,
         mut session: Session,
@@ -2641,6 +2653,8 @@ impl ZaloGuiApp {
         self.request_scheduled_items(false);
     }
 
+    /// Refresh the displayed account's schedule through the worker, optionally reporting
+    /// sent items. Clear the view when no valid account owns the request.
     fn request_scheduled_items(&mut self, notify_sent: bool) {
         if crate::account_manager::validate_uin(&self.user_uin).is_err() {
             self.scheduled_items.clear();
@@ -2875,6 +2889,7 @@ impl ZaloGuiApp {
     /// socket control events (`pin_message` / `unpin_topic`) instead.
     fn maybe_refresh_board_pins(&mut self) {}
 
+    /// Publish current thread metadata for polling and queue an account-owned disk snapshot.
     fn persist_threads_async(&self) {
         self.publish_known_threads();
         if self.user_uin.is_empty() {
@@ -3017,6 +3032,8 @@ impl ZaloGuiApp {
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
     }
 
+    /// Apply available worker events to the active view without waiting for new events.
+    /// Discard completions from obsolete account generations before handling them.
     fn check_events(&mut self, ctx: &egui::Context) {
         while let Ok(event) = self.event_rx.try_recv() {
             let Some(event) = event.for_current_account() else {
@@ -3616,7 +3633,10 @@ impl ZaloGuiApp {
                             "Đang đăng nhập lại; lịch sử đã lưu vẫn có thể xem được.".into();
                     }
                 }
-                GuiEvent::LoggedOut => {
+                GuiEvent::AddAccountFailed(error) => self.show_toast(error),
+                GuiEvent::LoggedOut { previous_account } => {
+                    let adding_account = previous_account.is_some();
+                    self.pending_add_account_uin = previous_account;
                     self.reaction_inbox = Default::default();
                     self.input_message.clear();
                     self.replying_to = None;
@@ -3644,7 +3664,17 @@ impl ZaloGuiApp {
                     self.pending_leave_group = None;
                     self.selected_thread_index = 0;
                     self.qr_status = "Đang xin mã QR mới…".into();
-                    self.status_msg = "Đã đăng xuất".into();
+                    self.status_msg = if adding_account {
+                        self.qr_texture = None;
+                        self.login_tab = LoginTab::QrCode;
+                        self.login_in_progress = false;
+                        self.login_status_msg.clear();
+                        self.phone_input.clear();
+                        self.password_input.clear();
+                        "Đang xin mã QR đăng nhập tài khoản mới…".into()
+                    } else {
+                        "Đã đăng xuất".into()
+                    };
                     // Group workspace caches belong to the signed-out account.
                     self.group_note_drafts.clear();
                     self.group_note_loaded.clear();
@@ -3700,6 +3730,9 @@ impl ZaloGuiApp {
                     // Rebuild the vanish watch from the restored account's threads (#875).
                     self.refresh_vanish_watch();
                     self.active_call = None;
+                    self.scheduled_items.clear();
+                    self.schedule_editing_id = None;
+                    self.schedule_modal_open = false;
                     self.refresh_scheduled_items();
                     self.reaction_inbox = Default::default();
                     self.incoming_popup = None;
@@ -6728,34 +6761,17 @@ impl ZaloGuiApp {
 
     /// Open the login screen to sign in one more account while keeping the current one.
     pub(crate) fn begin_add_account(&mut self) {
-        self.flush_group_note_pending();
-        if let Err(e) = crate::account_manager::save_current_account_snapshot(&self.user_uin) {
-            // Without a snapshot the current account could not be restored afterwards.
-            self.show_toast(format!("⚠️ Không lưu được phiên hiện tại: {e}"));
-            self.pending_add_account_uin = None;
-            return;
-        }
-        // Keep the previous account available for "Thoát thêm tài khoản" and
-        // background listening while the worker opens another login.
-        if !self.user_uin.is_empty() {
-            self.pending_add_account_uin = Some(self.user_uin.clone());
-        }
-        self.is_logged_in = false;
-        self.user_name.clear();
-        self.user_uin.clear();
-        crate::account_manager::set_active_uin("");
-        self.threads.clear();
-        self.selected_thread_index = 0;
-        self.qr_texture = None;
-        self.login_tab = LoginTab::QrCode;
-        self.login_in_progress = true;
-        self.login_status_msg.clear();
-        self.phone_input.clear();
-        self.password_input.clear();
-        self.qr_status = "Đang xin mã QR mới…".into();
-        self.status_msg = "Đang xin mã QR đăng nhập tài khoản mới…".into();
-        if let Some(tx) = WORKER_TX.get() {
-            let _ = tx.send(WorkerCmd::BeginAddAccount);
+        let pending_notes = self
+            .group_note_edited_at
+            .keys()
+            .map(|id| (id.clone(), self.group_note_drafts.get(id).cloned().unwrap_or_default()))
+            .collect();
+        if WORKER_TX.get().is_some_and(|tx| {
+            tx.send(WorkerCmd::BeginAddAccount { pending_notes }).is_ok()
+        }) {
+            self.status_msg = "Đang lưu tài khoản hiện tại…".into();
+        } else {
+            self.show_toast("Không thể chuẩn bị thêm tài khoản: worker chưa sẵn sàng.");
         }
     }
 
@@ -6775,6 +6791,8 @@ impl ZaloGuiApp {
         }
     }
 
+    /// Rebind background work after a transition leaves the displayed account in place.
+    /// Refresh account-dependent views before showing the transition status.
     fn resume_account_work(&mut self, status: String) {
         self.saved_accounts.invalidate();
         if let Some(tx) = WORKER_TX.get() {
@@ -7048,7 +7066,8 @@ fn unread_counts_from_read_points(threads: &[Thread]) -> HashMap<String, usize> 
     counts
 }
 
-// Cached-history mode can look logged in while authentication is still pending.
+/// Allow cached history to accompany a session only when a nonempty displayed owner
+/// matches the authenticated account. Cached-history mode can precede authentication.
 fn same_history_owner(displayed_uin: &str, authenticated_uin: &str) -> bool {
     !displayed_uin.is_empty() && displayed_uin == authenticated_uin
 }
@@ -7178,6 +7197,11 @@ mod tests {
         eframe::egui::ColorImage::new([1, 1], color)
     }
 
+    /// Exercise a stalled GUI across all supported streams and verify that draining
+    /// the mailbox allows the next frame to schedule a new wake.
+    ///
+    /// # Panics
+    /// Panics if the stream limit, frame coalescing or wake behavior regresses.
     #[test]
     fn video_mailbox_keeps_only_latest_frame_per_bounded_stream_when_ui_stalls() {
         let (tx, rx) = std::sync::mpsc::channel();
@@ -7305,6 +7329,11 @@ mod tests {
         );
     }
 
+    /// Verify that repeated removal of one peer replaces that peer's pending frame
+    /// with a single texture removal, while an earlier call's request is discarded.
+    ///
+    /// # Panics
+    /// Panics if stale removal is accepted or the GUI receives an unexpected mailbox update.
     #[test]
     fn video_mailbox_coalesces_peer_removal_and_rejects_old_call_removal() {
         let (tx, rx) = std::sync::mpsc::channel();

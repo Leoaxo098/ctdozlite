@@ -142,7 +142,10 @@ synthetic regression evidence; live peer fallback interoperability is pending.
 
 The native decoder uses OpenH264 and cannot decode HEVC. Unlike the previous
 FFmpeg-availability-dependent value, `extendData.supportHevcDecode` is now
-always `0` in caller invites (`401` / `416`) and callee answers (`402`). This is
+always `0` in the caller's `416` request and the callee's `402` answer when
+they carry `extendData`. The application's initial direct `401` dial omits
+`extendData`. The dispatcher also supports a media-bearing `401` used by the
+diagnostic call probe. This is
 an intentional outbound capability-value change: advertising HEVC would allow
 a peer to choose a codec that the application cannot decode. Both builders
 continue to advertise the existing H.264 video codec with payload `97`.

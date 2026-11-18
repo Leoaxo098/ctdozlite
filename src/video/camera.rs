@@ -248,6 +248,12 @@ struct HelperChild {
 }
 
 impl HelperChild {
+    /// Start the current executable in helper mode with a dedicated stdout
+    /// pipe and an environment limited to OS and temporary-directory paths.
+    ///
+    /// # Errors
+    /// Returns an error if the executable path cannot be resolved or the child
+    /// cannot be launched.
     fn spawn(args: &[&str]) -> Result<Self> {
         let mut command = Command::new(std::env::current_exe()?);
         command
@@ -275,6 +281,11 @@ impl HelperChild {
         })
     }
 
+    /// Terminate the helper if it is still running and reap it exactly once.
+    ///
+    /// # Errors
+    /// Returns an error if the child's status is unavailable, termination
+    /// fails while the child is still running, or reaping fails.
     fn stop(&mut self) -> Result<()> {
         if self.reaped {
             return Ok(());
@@ -302,6 +313,8 @@ impl Drop for HelperChild {
     }
 }
 
+/// Drain the helper pipe into a single replaceable frame slot. A terminal
+/// read error wakes the consumer with the failure reason.
 fn read_frames(mut reader: impl Read, mailbox: Mailbox) {
     loop {
         let result = read_frame(&mut reader);
@@ -320,6 +333,10 @@ fn read_frames(mut reader: impl Read, mailbox: Mailbox) {
     }
 }
 
+/// Return the byte length of a packed RGB frame within the capture bounds.
+///
+/// # Errors
+/// Returns an error for empty dimensions or dimensions above 1920 by 1088.
 fn rgb_len(width: u32, height: u32) -> Result<usize> {
     if width == 0 || height == 0 || width > MAX_WIDTH || height > MAX_HEIGHT {
         bail!("Kích thước hình ảnh camera vượt giới hạn 1920×1088.");
@@ -327,6 +344,12 @@ fn rgb_len(width: u32, height: u32) -> Result<usize> {
     Ok(width as usize * height as usize * 3)
 }
 
+/// Read one helper frame, validating its version, dimensions, and declared
+/// length before allocating the pixel buffer.
+///
+/// # Errors
+/// Returns an error for invalid headers, unsupported dimensions, or an
+/// incomplete read of the header or pixels.
 fn read_frame(reader: &mut impl Read) -> Result<RawFrame> {
     let mut header = [0_u8; HEADER_LEN];
     reader.read_exact(&mut header).context(CAMERA_STOPPED)?;
@@ -345,6 +368,11 @@ fn read_frame(reader: &mut impl Read) -> Result<RawFrame> {
     Ok(RawFrame { width, height, rgb })
 }
 
+/// Write and flush a versioned frame so the parent can consume it immediately.
+///
+/// # Errors
+/// Returns an error for invalid dimensions, a mismatched RGB length, or an
+/// output failure.
 fn write_frame(writer: &mut impl Write, frame: &RawFrame) -> Result<()> {
     let len = rgb_len(frame.width, frame.height)?;
     if frame.rgb.len() != len {
@@ -361,6 +389,8 @@ fn write_frame(writer: &mut impl Write, frame: &RawFrame) -> Result<()> {
     Ok(())
 }
 
+/// Encode the backend index for storage with distinct prefixes for numeric
+/// and string identifiers.
 fn index_key(index: &CameraIndex) -> String {
     match index {
         CameraIndex::Index(index) => format!("nokhwa:index:{index}"),
@@ -368,6 +398,11 @@ fn index_key(index: &CameraIndex) -> String {
     }
 }
 
+/// Recover the backend index from a stored camera identifier.
+///
+/// # Errors
+/// Returns an error for unknown prefixes, invalid numeric values, empty
+/// string identifiers, embedded NULs, or identifiers that exceed the limit.
 fn parse_index(key: &str) -> Result<CameraIndex> {
     if key.len() > MAX_ID_BYTES || key.contains('\0') {
         bail!("Mã camera không hợp lệ.");
@@ -386,6 +421,12 @@ fn parse_index(key: &str) -> Result<CameraIndex> {
     bail!("Mã camera không hợp lệ.")
 }
 
+/// Validate that each helper-discovered camera has a unique, usable key
+/// within the discovery output limits.
+///
+/// # Errors
+/// Returns an error for too many devices, invalid or duplicate identifiers,
+/// or labels that exceed the byte limit.
 fn validate_devices(devices: &[CameraDevice]) -> Result<()> {
     if devices.len() > MAX_DEVICES {
         bail!("Danh sách camera vượt giới hạn 128 thiết bị.");
@@ -403,6 +444,10 @@ fn validate_devices(devices: &[CameraDevice]) -> Result<()> {
     Ok(())
 }
 
+/// Decode the helper's JSON output after bounding the input size.
+///
+/// # Errors
+/// Returns an error for oversized or malformed JSON or an invalid device list.
 fn parse_devices(bytes: &[u8]) -> Result<Vec<CameraDevice>> {
     if bytes.len() > MAX_LIST_BYTES {
         bail!("Danh sách camera vượt giới hạn 1 MiB.");
@@ -412,6 +457,10 @@ fn parse_devices(bytes: &[u8]) -> Result<Vec<CameraDevice>> {
     Ok(devices)
 }
 
+/// Query native camera devices without triggering capture permission.
+///
+/// # Errors
+/// Returns an error if enumeration fails or returns an invalid device list.
 fn native_devices() -> Result<Vec<CameraDevice>> {
     // Enumeration does not call initialization: macOS permission is requested only on capture.
     let devices = nokhwa::query(nokhwa::utils::ApiBackend::Auto)
@@ -426,6 +475,12 @@ fn native_devices() -> Result<Vec<CameraDevice>> {
     Ok(devices)
 }
 
+/// Choose a decodable mode nearest 640 by 480, breaking resolution ties by
+/// proximity to 15 frames per second.
+///
+/// # Errors
+/// Returns an error if there is no bounded mode with valid chroma geometry
+/// and a positive frame rate.
 fn nearest_format(formats: impl IntoIterator<Item = CameraFormat>) -> Result<CameraFormat> {
     formats
         .into_iter()
@@ -451,6 +506,12 @@ fn nearest_format(formats: impl IntoIterator<Item = CameraFormat>) -> Result<Cam
         .ok_or_else(|| anyhow!("Camera không hỗ trợ định dạng RGB/YUYV/NV12/MJPEG trong giới hạn."))
 }
 
+/// Convert a camera buffer to packed RGB with allocation limits derived from
+/// the reported dimensions.
+///
+/// # Errors
+/// Returns an error for invalid dimensions, unexpected data lengths,
+/// unsupported pixel formats, or conversion failures.
 fn decode_rgb(buffer: &nokhwa::Buffer) -> Result<RawFrame> {
     let resolution = buffer.resolution();
     let width = resolution.width();
@@ -506,6 +567,12 @@ fn decode_rgb(buffer: &nokhwa::Buffer) -> Result<RawFrame> {
     Ok(RawFrame { width, height, rgb })
 }
 
+/// Run native capture in the helper process and stream packed RGB frames to
+/// stdout at a target cadence of 15 frames per second.
+///
+/// # Errors
+/// Returns an error if the camera selection, permission, native capture,
+/// conversion, or pipe write fails.
 fn capture_native(device_id: &str) -> Result<()> {
     let index = parse_index(device_id)?;
     #[cfg(target_os = "macos")]
@@ -572,6 +639,7 @@ mod tests {
         assert_eq!(frame.rgb, [1, 2, 3, 4, 5, 6]);
     }
 
+    /// Exercise both truncated reads and corrupt version or size fields.
     #[test]
     fn rejects_frame_when_header_or_payload_is_invalid() {
         for len in [0, 7, 19, 20, 25] {
@@ -741,6 +809,8 @@ mod tests {
         assert!(run_helper_if_requested(&["app".into(), CAPTURE_FLAG.into()]).is_err());
     }
 
+    /// Verify that stopping a blocked helper closes its stdout pipe and lets
+    /// the reader thread finish within the shutdown budget.
     #[test]
     fn stops_and_reaps_blocked_helper_within_two_seconds() {
         const CHILD_ENV: &str = "CTDO_CAMERA_LIFECYCLE_TEST_CHILD";

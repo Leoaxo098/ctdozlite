@@ -15,6 +15,7 @@ pub(super) fn session_matches_active(s: &Session) -> bool {
     !uin.is_empty() && uin == crate::account_manager::active_uin()
 }
 
+/// Clear the polling and expiry lists before a different account can use them.
 fn clear_account_thread_lists() {
     if let Ok(mut known) = KNOWN_THREADS.lock() {
         known.clear();
@@ -388,6 +389,7 @@ struct VoiceRecording {
 }
 
 impl Drop for VoiceRecording {
+    /// Remove temporary recording files even when an account transition cancels upload.
     fn drop(&mut self) {
         // Removal is best effort and also runs when an account switch cancels the upload.
         let _ = std::fs::remove_file(&self.path);
@@ -397,6 +399,7 @@ impl Drop for VoiceRecording {
     }
 }
 
+/// Queue a sync without prompting the phone, preserving the snapshot's original account scope.
 fn queue_automatic_phone_sync(scope: &GuiTx, uin: &str, threads: Vec<Thread>) {
     if let Some(tx) = WORKER_TX.get() {
         // The original scope travels with the snapshot in case a switch is queued ahead of it.
@@ -408,6 +411,8 @@ fn queue_automatic_phone_sync(scope: &GuiTx, uin: &str, threads: Vec<Thread>) {
     }
 }
 
+/// Route phone sync controls through the account task queue so a transition can
+/// cancel downloads and imports tied to the supplied session.
 fn queue_mobile_sync_controls(
     events: Vec<crate::chat::MobileSyncControlEvent>,
     session: &Session,
@@ -447,6 +452,40 @@ fn spawn_history_write<T: Send + 'static>(
     rx
 }
 
+#[derive(Clone)]
+struct ScopedHistoryWriter {
+    sender: tokio::sync::mpsc::UnboundedSender<Box<dyn FnOnce() + Send>>,
+}
+
+impl ScopedHistoryWriter {
+    fn new(writes: &mut tokio::task::JoinSet<()>) -> Self {
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<Box<dyn FnOnce() + Send>>();
+        // The account task owns the sender. Aborting that task closes the queue, while
+        // the wipe still waits for the blocking jobs already submitted to the receiver.
+        writes.spawn(async move {
+            while let Some(write) = receiver.recv().await {
+                if let Err(error) = tokio::task::spawn_blocking(write).await {
+                    crate::logger::log_error("history::write", &error.to_string());
+                }
+            }
+        });
+        Self { sender }
+    }
+
+    async fn write<T: Send + 'static>(
+        &self,
+        write: impl FnOnce() -> anyhow::Result<T> + Send + 'static,
+    ) -> anyhow::Result<T> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.sender.send(Box::new(move || {
+            // A cancelled account task may no longer need the result, but wipe waits for the write.
+            let _ = tx.send(write());
+        })).map_err(|_| anyhow::anyhow!("Không thể ghi lịch sử."))?;
+        rx.await?
+    }
+}
+
+/// Cancel history tasks and drain their blocking writes before local rows can be deleted.
 async fn stop_history_tasks(
     tasks: &mut tokio::task::JoinSet<()>,
     writes: &mut tokio::task::JoinSet<()>,
@@ -468,6 +507,32 @@ async fn restore_failed_switch(
     let _ = events.send(GuiEvent::AccountSwitchFailed(format!(
         "⚠️ Lỗi chuyển tài khoản: {error}"
     )));
+}
+
+async fn prepare_add_account(uin: &str, pending_notes: Vec<(String, String)>, events: &GuiTx) -> bool {
+    let uin = uin.to_owned();
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        crate::account_manager::save_current_account_snapshot(&uin)?;
+        if !pending_notes.is_empty() {
+            let mut store = crate::store::MessageStore::open_account(&uin)?;
+            for (thread_id, draft) in pending_notes {
+                store.set_group_note(&thread_id, &draft, chrono::Local::now().timestamp())?;
+            }
+        }
+        // The saved copy must be restorable before the active session is removed.
+        std::fs::remove_file("session.json")?;
+        Ok(())
+    })
+    .await
+    .unwrap_or_else(|error| Err(error.into()));
+    if let Err(error) = result {
+        // A disconnected UI can no longer display the failure.
+        let _ = events.send(GuiEvent::AddAccountFailed(format!(
+            "⚠️ Không lưu được phiên hiện tại: {error}"
+        )));
+        return false;
+    }
+    true
 }
 
 pub enum WorkerCmd {
@@ -695,7 +760,10 @@ pub enum WorkerCmd {
     },
     Logout,
     /// Preserve this account's saved session before opening login for another account.
-    BeginAddAccount,
+    /// Save the current account and pending group drafts before opening another login.
+    BeginAddAccount {
+        pending_notes: Vec<(String, String)>,
+    },
     /// Clear the account history database and thread cache without
     /// touching credentials. Separate from [`WorkerCmd::Logout`] by design (#21).
     WipeLocalData,
@@ -834,6 +902,18 @@ impl QueuedWorkerCommand {
             .is_none_or(|origin| origin == uin)
     }
 
+    fn reject(self, events: &GuiTx) {
+        if let Some(notice) = self.command.stale_notice() {
+            // Shutdown can close the receiver while stale work is being discarded.
+            let _ = events.send(notice);
+        }
+        if let WorkerCmd::SendVoice { voice_path, voice_dir, .. } = self.command {
+            drop(VoiceRecording { path: voice_path, dir: voice_dir });
+        }
+    }
+
+    /// Enforce the enqueue-time account at dispatch. Authentication can replace the
+    /// identity, and cleanup can proceed after the worker has cleared it.
     fn accepts_account(&self, current_uin: &str) -> bool {
         // Authentication replaces an identity; its enqueue-time epoch is checked first.
         if matches!(
@@ -844,7 +924,7 @@ impl QueuedWorkerCommand {
         }
         self.origin_matches(current_uin)
             || (current_uin.is_empty()
-                && matches!(self.command, WorkerCmd::Logout | WorkerCmd::BeginAddAccount))
+                && matches!(self.command, WorkerCmd::Logout | WorkerCmd::BeginAddAccount { .. }))
     }
 }
 
@@ -868,6 +948,7 @@ impl WorkerTx {
         }
     }
 
+    /// Bind future GUI commands to the account and generation now shown on screen.
     pub(super) fn set_visible_account(&self, uin: &str) {
         if let Ok(mut visible) = self.visible_account.lock() {
             *visible = (uin.to_string(), self.root_events.scoped());
@@ -881,6 +962,11 @@ impl WorkerTx {
         }
     }
 
+    /// Queue a command with the account and work scope visible to the GUI at enqueue time.
+    /// App-wide commands carry no account binding.
+    ///
+    /// # Errors
+    /// Returns an error if the visible-account lock is poisoned or the worker queue is closed.
     pub(super) fn send(
         &self,
         command: WorkerCmd,
@@ -918,6 +1004,10 @@ impl WorkerTx {
             .map_err(|_| tokio::sync::mpsc::error::SendError(()))
     }
 
+    /// Queue follow-up work with its original scope, silently skipping an obsolete scope.
+    ///
+    /// # Errors
+    /// Returns an error if the visible-account lock is poisoned or the worker queue is closed.
     fn send_if_current(
         &self,
         command: WorkerCmd,
@@ -949,7 +1039,8 @@ impl WorkerCmd {
                 | Self::DeleteForMe { .. }
                 | Self::RecallMessage { .. }
                 | Self::SendSticker { .. }
-                | Self::PickAndSendAttachment { .. }
+                | Self::SendAttachments { .. }
+                | Self::SendVoice { .. }
                 | Self::TriggerScreenshot
                 | Self::StartCall { .. }
                 | Self::AnswerCall { .. }
@@ -965,7 +1056,7 @@ impl WorkerCmd {
                 | Self::CancelScheduledMessage { .. }
                 | Self::SendScheduledMessageNow { .. }
                 | Self::Logout
-                | Self::BeginAddAccount
+                | Self::BeginAddAccount { .. }
                 | Self::WipeLocalData
                 | Self::SwitchAccount { .. }
                 | Self::PinThread { .. }
@@ -993,7 +1084,7 @@ impl WorkerCmd {
         matches!(
             self,
             Self::Logout
-                | Self::BeginAddAccount
+                | Self::BeginAddAccount { .. }
                 | Self::SwitchAccount { .. }
                 | Self::RequestQr
                 | Self::LoginPassword { .. }
@@ -1026,6 +1117,8 @@ impl WorkerCmd {
 
 pub(super) static WORKER_TX: std::sync::OnceLock<WorkerTx> = std::sync::OnceLock::new();
 
+/// Allow incoming transitions and app-wide commands to bypass deferred account work.
+/// Keep ordinary commands in FIFO order and retry the oldest when the queue is quiet.
 async fn next_worker_command(
     receiver: &mut tokio::sync::mpsc::UnboundedReceiver<QueuedWorkerCommand>,
     deferred: &mut std::collections::VecDeque<QueuedWorkerCommand>,
@@ -1048,6 +1141,8 @@ async fn next_worker_command(
     }
 }
 
+/// Return `Some(None)` for app-wide work. Account commands take a session snapshot
+/// when the lock is free and defer dispatch on `None`.
 fn try_command_snapshot(
     command: &WorkerCmd,
     live: &std::sync::Arc<tokio::sync::Mutex<Session>>,
@@ -1059,6 +1154,8 @@ fn try_command_snapshot(
     }
 }
 
+/// Keep ordinary actions on their dispatch-time session across account switches.
+/// Authentication and session maintenance share the live session.
 fn session_for_command(
     command: &WorkerCmd,
     snapshot: Option<&Session>,
@@ -1072,6 +1169,8 @@ fn session_for_command(
     live.clone()
 }
 
+/// Start a new event generation for authentication, ending the previous account's
+/// call and invalidating the thread list used by polling.
 fn authentication_events(
     command: &WorkerCmd,
     events: GuiTx,
@@ -1276,6 +1375,11 @@ async fn prefetch_missing_sticker_thumbnails(
     futures_util::future::join_all(futs).await;
 }
 
+/// Register the GUI command sender and start the background runtime for session work.
+///
+/// # Panics
+/// Panics if the worker thread cannot start. Runtime initialization failure panics
+/// on the worker thread.
 pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: egui::Context) {
     let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<QueuedWorkerCommand>();
     let visible_uin = session
@@ -2024,9 +2128,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                     while history_writes.try_join_next().is_some() {}
                     while global_tasks.try_join_next().is_some() {}
                     if !queued.origin_is_current() {
-                        if let Some(notice) = queued.command.stale_notice() {
-                            let _ = gui_tx.send(notice);
-                        }
+                        queued.reject(&gui_tx);
                         continue;
                     }
                     // Login tasks can hold the session across network awaits. Cancel them
@@ -2046,9 +2148,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                     let current_uin = snapshot.as_ref().and_then(|snapshot| snapshot.login.as_ref())
                         .map(|login| login.uin.clone()).unwrap_or_default();
                     if !queued.accepts_account(&current_uin) {
-                        if let Some(notice) = queued.command.stale_notice() {
-                            let _ = gui_tx.send(notice);
-                        }
+                        queued.reject(&gui_tx);
                         continue;
                     }
                     let command_origin = queued.origin_uin.clone().unwrap_or_default();
@@ -2211,12 +2311,25 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                 ));
                             });
                         }
-                        WorkerCmd::Logout | WorkerCmd::BeginAddAccount => {
-                            let adding_account = matches!(cmd, WorkerCmd::BeginAddAccount);
+                        WorkerCmd::Logout | WorkerCmd::BeginAddAccount { .. } => {
                             account_tasks.abort_all();
                             if let Some(task) = current_qr_task.take() {
                                 task.abort();
                             }
+                            let previous_account = if let WorkerCmd::BeginAddAccount { pending_notes } = cmd {
+                                // A cancelled session refresh must finish before we remove its active session file.
+                                while account_tasks.join_next().await.is_some() {}
+                                let uin = {
+                                    let active = session.lock().await;
+                                    departing_account_uin(&active, &command_origin)
+                                };
+                                if !prepare_add_account(&uin, pending_notes, &gui_tx).await {
+                                    continue;
+                                }
+                                Some(uin)
+                            } else {
+                                None
+                            };
                             let (cur_uin, gui_tx) = {
                                 let mut s = session.lock().await;
                                 call_bridge.end_call_for_account(s.clone(), gui_tx.scoped());
@@ -2229,17 +2342,14 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             poll_state = Default::default();
                             crate::account_manager::set_active_uin("");
                             clear_account_thread_lists();
-                            let result = tokio::task::spawn_blocking(move || {
-                                if adding_account && !cur_uin.is_empty() {
-                                    crate::account_manager::save_current_account_snapshot(&cur_uin)?;
-                                    std::fs::remove_file("session.json")?;
-                                    Ok(())
-                                } else {
-                                    crate::account_manager::logout_account(&cur_uin)
-                                }
-                            }).await.unwrap_or_else(|error| Err(error.into()));
+                            let result = if previous_account.is_none() {
+                                tokio::task::spawn_blocking(move || crate::account_manager::logout_account(&cur_uin))
+                                    .await.unwrap_or_else(|error| Err(error.into()))
+                            } else {
+                                Ok(())
+                            };
                             crate::background_accounts::request_reconcile();
-                            let _ = gui_tx.send(GuiEvent::LoggedOut);
+                            let _ = gui_tx.send(GuiEvent::LoggedOut { previous_account });
                             if let Err(error) = result {
                                 crate::logger::log_error("account::logout", &error.to_string());
                                 let _ = gui_tx.send(GuiEvent::StatusUpdate("Không thể xoá hết phiên đã lưu; vui lòng thử đăng xuất lại.".into()));
@@ -2310,8 +2420,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             if let Ok(mut known) = KNOWN_THREADS.lock() { known.clear(); }
                             let uin = current_uin.clone();
                             let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-                                let store = crate::store::MessageStore::open_account(&uin)?;
-                                store.conn.execute_batch("BEGIN IMMEDIATE; DELETE FROM messages; DELETE FROM threads; COMMIT;")?;
+                                crate::store::MessageStore::open_account(&uin)?.wipe_history()?;
                                 crate::chat::save_threads_cache_for_account(&uin, &[]);
                                 Ok(())
                             }).await.unwrap_or_else(|error| Err(error.into()));
@@ -3416,15 +3525,13 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             }
                             crate::history_sync::CANCEL.store(false, Ordering::Relaxed);
                             let running_permit = RunningPermit(&crate::history_sync::RUNNING);
+                            let writer = ScopedHistoryWriter::new(&mut history_writes);
 
-                            let session_clone = command_session.clone();
+                            let s = command_session.lock().await.clone();
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
                             tasks.spawn(async move {
                                 let _running_permit = running_permit;
-
-
-                                let s = session_clone.lock().await.clone();
                                 let uin = s
                                     .login
                                     .as_ref()
@@ -3454,7 +3561,13 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                         messages: Vec::new(),
                                         ..Default::default()
                                     };
-                                    match crate::history_sync::sync_thread(&s, &mut t).await {
+                                    let persist_page = |uin: String, snapshot: Thread| {
+                                        let writer = writer.clone();
+                                        async move {
+                                            writer.write(move || crate::history_sync::persist_thread_snapshot(&uin, snapshot)).await
+                                        }
+                                    };
+                                    match crate::history_sync::sync_thread_with_writer(&s, &mut t, persist_page).await {
                                         Ok(n) => {
                                             added += n;
                                             if !t.messages.is_empty() {
@@ -3465,9 +3578,8 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                     }
                                 }
                                 let db_path = crate::store::db_path_for_account(&uin);
-                                let uin_cache = uin.clone();
-                                if let Ok(updated_threads) = tokio::task::spawn_blocking(move || {
-                                    let mut updated_threads = crate::chat::load_threads_cache_for(&uin_cache);
+                                match writer.write(move || {
+                                    let mut updated_threads = crate::chat::load_threads_cache_for_account(&uin);
                                     crate::store::load_history_into_threads(
                                         &db_path,
                                         &mut updated_threads,
@@ -3482,14 +3594,15 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                             updated_threads.push(synced);
                                         }
                                     }
-                                    crate::chat::save_threads_cache_for(&uin_cache, &updated_threads);
-                                    updated_threads
+                                    crate::chat::save_threads_cache_for_account(&uin, &updated_threads);
+                                    Ok(updated_threads)
                                 })
                                 .await
                                 {
-                                    if session_matches_active(&s) {
+                                    Ok(updated_threads) => {
                                         let _ = gui_tx_clone.send(GuiEvent::ThreadsUpdated(updated_threads));
                                     }
+                                    Err(error) => errors.push(error.to_string()),
                                 }
                                 if session_matches_active(&s) {
                                     let _ = gui_tx_clone.send(GuiEvent::SyncFinished {
@@ -6455,6 +6568,11 @@ mod account_task_tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
 
+    /// Check that dropped background work preserves the transition status while a
+    /// dropped user action receives feedback.
+    ///
+    /// # Panics
+    /// Panics if a background command gets a notice or a user action loses its notice.
     #[test]
     fn stale_background_work_is_quiet_but_user_mutations_get_a_notice() {
         let automatic = [
@@ -6482,6 +6600,54 @@ mod account_task_tests {
         .stale_notice()
         .is_some());
         assert!(WorkerCmd::RefreshThreadsManual.stale_notice().is_some());
+    }
+
+    #[test]
+    fn rejected_queued_voice_removes_recording_and_notifies_the_gui() {
+        let recording_dir = std::env::temp_dir().join(format!(
+            "ctdozlite-voice-{}",
+            crate::param_cipher::random_hex(8)
+        ));
+        std::fs::create_dir(&recording_dir).unwrap();
+        let recording_path = recording_dir.join("voice.mp3");
+        std::fs::write(&recording_path, b"sample recording").unwrap();
+        let (sender, mut commands) = tokio::sync::mpsc::unbounded_channel();
+        let (events, completions) = std::sync::mpsc::channel();
+        let root = GuiTx::new(events, egui::Context::default());
+        let tx = WorkerTx::new(sender, "account-a".into(), &root);
+        tx.send(WorkerCmd::SendVoice {
+            to_id: "peer-1".into(),
+            is_group: false,
+            voice_path: recording_path.clone(),
+            voice_dir: Some(recording_dir.clone()),
+            mime: "audio/mpeg".into(),
+            duration_secs: 1,
+        })
+        .unwrap();
+        root.advance_account();
+        let queued = commands.try_recv().unwrap();
+        assert!(!queued.origin_is_current());
+        queued.reject(&root);
+        assert!(!recording_path.exists());
+        assert!(!recording_dir.exists());
+        assert!(matches!(
+            completions.try_recv().unwrap().for_current_account(),
+            Some(GuiEvent::StatusUpdate(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn invalid_add_account_preparation_reports_failure_without_advancing_scope() {
+        let (events, completions) = std::sync::mpsc::channel();
+        let root = GuiTx::new(events, egui::Context::default());
+        let current = root.scoped();
+        assert!(!prepare_add_account("../invalid-account", Vec::new(), &current).await);
+        assert!(current.is_current());
+        assert!(matches!(
+            completions.try_recv().unwrap().for_current_account(),
+            Some(GuiEvent::AddAccountFailed(_))
+        ));
+        assert!(completions.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -6518,6 +6684,11 @@ mod account_task_tests {
         assert!(commands.try_recv().unwrap().origin_is_current());
     }
 
+    /// Block a write after its async waiter is cancelled to check that the wipe still
+    /// waits for the blocking closure to finish.
+    ///
+    /// # Panics
+    /// Panics if the write cannot start or the drain completes before the write exits.
     #[tokio::test]
     async fn wipe_waits_for_non_abortable_history_writes() {
         let mut tasks = tokio::task::JoinSet::new();
@@ -6548,6 +6719,37 @@ mod account_task_tests {
         release_tx.send(()).unwrap();
         drain.await;
         assert!(finished.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn wipe_waits_for_a_sync_write_submitted_by_a_running_account_task() {
+        let mut tasks = tokio::task::JoinSet::new();
+        let mut writes = tokio::task::JoinSet::new();
+        let writer = ScopedHistoryWriter::new(&mut writes);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (finished_tx, mut finished_rx) = tokio::sync::oneshot::channel();
+        tasks.spawn(async move {
+            writer.write(move || {
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                finished_tx.send(()).unwrap();
+                Ok(())
+            }).await.unwrap();
+        });
+        started_rx.await.unwrap();
+        tasks.abort_all();
+        while tasks.join_next().await.is_some() {}
+        let drain = stop_history_tasks(&mut tasks, &mut writes);
+        tokio::pin!(drain);
+        assert!(std::future::Future::poll(
+            drain.as_mut(),
+            &mut std::task::Context::from_waker(std::task::Waker::noop()),
+        )
+        .is_pending());
+        release_tx.send(()).unwrap();
+        drain.await;
+        assert_eq!(finished_rx.try_recv(), Ok(()));
     }
 
     #[test]
@@ -6725,6 +6927,11 @@ mod account_task_tests {
         assert!(receiver.try_recv().unwrap().origin_is_current());
     }
 
+    /// Check that dispatched chat mutations retain the old account's credentials
+    /// after a switch and that the next QR login uses the live session.
+    ///
+    /// # Panics
+    /// Panics if the fixture session or task fails, or a command uses the wrong session.
     #[tokio::test]
     async fn dispatched_actions_keep_their_session_after_an_account_switch() {
         let mut snapshot = Session::new(false, false, false).unwrap();
@@ -6780,6 +6987,11 @@ mod account_task_tests {
         assert!(receiver.try_recv().is_err());
     }
 
+    /// Exercise cancellation both before and after the task starts so the running
+    /// guard is released even if the task never reaches its first poll.
+    ///
+    /// # Panics
+    /// Panics if the task cannot signal startup or cancellation leaves the guard set.
     #[tokio::test]
     async fn running_permit_resets_after_task_cancellation() {
         static RUNNING: AtomicBool = AtomicBool::new(false);

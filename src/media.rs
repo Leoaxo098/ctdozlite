@@ -38,6 +38,7 @@ impl VideoWorkers {
 }
 
 impl Drop for VideoWorkers {
+    /// Return this media leg’s slot to the pool when its owner drops.
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
         for handle in self.handles.drain(..) {
@@ -68,7 +69,6 @@ pub fn mic_level_permille() -> u32 {
 pub fn set_mic_level_from_peak(peak: f32) {
     MIC_LEVEL_PERMILLE.store((peak.clamp(0.0, 1.0) * 1000.0) as u32, Ordering::Relaxed);
 }
-
 
 /// Whether remote peer audio is currently above the speaking threshold.
 pub fn is_remote_speaking() -> bool {
@@ -154,10 +154,10 @@ pub fn list_media_devices(refresh: bool) -> (Vec<String>, Vec<String>) {
 /// # Errors
 /// Returns a native camera discovery failure; microphone snapshots remain available.
 pub fn refresh_media_devices() -> Result<()> {
-    let Ok(enumeration) = DEVICE_ENUMERATION.try_lock() else {
+    let Some(mut refresh) = DeviceRefresh::try_start(&DEVICE_ENUMERATION, &DEVICE_REFRESH_PENDING)
+    else {
         return Ok(());
     };
-    DEVICE_REFRESH_PENDING.store(true, Ordering::Release);
     let mut microphones = Vec::new();
     if let Ok(devices) = cpal::default_host().input_devices() {
         for device in devices {
@@ -183,15 +183,47 @@ pub fn refresh_media_devices() -> Result<()> {
             .map_err(|_| anyhow::anyhow!("Không thể cập nhật danh sách thiết bị."))?;
         update_device_snapshots(&mut cameras, &mut cache, microphones, result)
     })();
-    finish_device_refresh(enumeration, || {
-        DEVICE_REFRESH_PENDING.store(false, Ordering::Release)
-    });
+    refresh.finish();
     publication
 }
 
-fn finish_device_refresh(enumeration: std::sync::MutexGuard<'_, ()>, publish: impl FnOnce()) {
-    drop(enumeration);
-    publish();
+/// Own the enumeration lock and publish completion even if a driver panics.
+struct DeviceRefresh<'a> {
+    enumeration: Option<std::sync::MutexGuard<'a, ()>>,
+    pending: &'a AtomicBool,
+}
+
+impl<'a> DeviceRefresh<'a> {
+    /// Coalesce concurrent requests and recover the unit lock after an unwind.
+    fn try_start(lock: &'a Mutex<()>, pending: &'a AtomicBool) -> Option<Self> {
+        let enumeration = match lock.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(error)) => {
+                lock.clear_poison();
+                error.into_inner()
+            }
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        };
+        pending.store(true, Ordering::Release);
+        Some(Self {
+            enumeration: Some(enumeration),
+            pending,
+        })
+    }
+
+    /// Release enumeration before accepting the next refresh request.
+    fn finish(&mut self) {
+        if let Some(guard) = self.enumeration.take() {
+            drop(guard);
+            self.pending.store(false, Ordering::Release);
+        }
+    }
+}
+
+impl Drop for DeviceRefresh<'_> {
+    fn drop(&mut self) {
+        self.finish();
+    }
 }
 
 fn update_device_snapshots(
@@ -683,11 +715,13 @@ fn annexb_au(nals: &[&[u8]]) -> Vec<u8> {
 }
 
 #[cfg(test)]
+/// Recognize packets that begin with an Annex B start code.
 fn is_annexb(p: &[u8]) -> bool {
     p.starts_with(&[0, 0, 0, 1]) || p.starts_with(&[0, 0, 1])
 }
 
 #[cfg(test)]
+/// Recognize relay payloads that use Zalo fragmentation.
 fn is_zalo_frag(p: &[u8]) -> bool {
     p.len() >= 2 && (p[0] & 0x1F) == 28 && (p[1] & 0x1F) == 0
 }
@@ -1014,6 +1048,7 @@ fn build_zrtp_incall_negotiate_packet(call_id: u32, relay_token: u32, nego_seq: 
 }
 
 #[cfg(test)]
+/// Find the next Annex B access-unit delimiter in codec fixture bytes.
 fn find_aud_delimiter(buf: &[u8], start_from: usize) -> Option<usize> {
     if buf.len() < start_from + 6 {
         return None;
@@ -1032,6 +1067,7 @@ fn find_aud_delimiter(buf: &[u8], start_from: usize) -> Option<usize> {
 }
 
 #[cfg(test)]
+/// Skip an optional leading access-unit delimiter in a codec fixture.
 fn strip_leading_aud(au: &[u8]) -> Vec<u8> {
     if au.len() >= 6 && au[0..4] == [0, 0, 0, 1] && (au[4] & 0x1F) == 9 {
         normalize_annexb_au_4byte(&au[6..])
@@ -1308,6 +1344,7 @@ type IncomingVideoStream = (
     Option<std::time::Instant>,
 );
 
+/// Collect distinct PLI destinations for video streams awaiting recovery.
 fn video_pli_targets(
     primary_video_ssrc: u32,
     peer_ssrc: u32,
@@ -1326,6 +1363,7 @@ fn video_pli_targets(
     targets
 }
 
+/// Use the last peer SSRC as a fallback until primary video identifies itself.
 fn primary_video_target(primary_video_ssrc: u32, peer_ssrc: u32) -> u32 {
     if primary_video_ssrc != 0 {
         primary_video_ssrc
@@ -1334,6 +1372,7 @@ fn primary_video_target(primary_video_ssrc: u32, peer_ssrc: u32) -> u32 {
     }
 }
 
+/// Track primary sequence gaps without counting packets from secondary streams.
 fn record_primary_video_sequence(
     stats: &mut RxStats,
     primary_video_ssrc: u32,
@@ -1344,6 +1383,7 @@ fn record_primary_video_sequence(
     (primary_video_ssrc == 0 || packet_ssrc == primary_video_ssrc) && stats.update(sequence)
 }
 
+/// Request a new reference frame on startup, source transitions or decoder feedback.
 fn should_force_video_keyframe(
     camera_on: bool,
     transition: bool,
@@ -1359,6 +1399,7 @@ fn should_force_video_keyframe(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Drive RTP audio and video, RTCP feedback and stream recovery for one call leg.
 fn run_media_loop(
     stop: Arc<AtomicBool>,
     mic_muted: Arc<AtomicBool>,
@@ -2417,6 +2458,7 @@ fn trim_black_borders(rgba: &[u8], w: usize, h: usize) -> (usize, usize, Vec<u8>
     (cw, ch, out)
 }
 
+/// Decode queued H.264 access units and publish frames in the current call generation.
 fn run_native_video_decoder(
     stop: Arc<AtomicBool>,
     queue: Arc<crate::video::decode_queue::DecodeQueue>,
@@ -2471,6 +2513,7 @@ fn run_native_video_decoder(
     }
 }
 
+/// Queue complete video access units and reset references after ingress loss.
 fn receive_video_packet(
     ingress: &mut crate::video::ingress::VideoIngress,
     queue: &crate::video::decode_queue::DecodeQueue,
@@ -2568,15 +2611,32 @@ mod tests {
     #[test]
     fn device_refresh_completion_allows_the_next_enumeration_to_start() {
         let enumeration = Mutex::new(());
-        let pending = AtomicBool::new(true);
-        finish_device_refresh(enumeration.lock().unwrap(), || {
-            pending.store(false, Ordering::Release);
-            assert!(!pending.swap(true, Ordering::AcqRel));
-            assert!(
-                enumeration.try_lock().is_ok(),
-                "a refresh requested after completion must be able to acquire enumeration"
-            );
+        let pending = AtomicBool::new(false);
+        let mut first = DeviceRefresh::try_start(&enumeration, &pending).unwrap();
+        assert!(DeviceRefresh::try_start(&enumeration, &pending).is_none());
+        assert!(pending.load(Ordering::Acquire));
+        first.finish();
+        assert!(!pending.load(Ordering::Acquire));
+        let second = DeviceRefresh::try_start(&enumeration, &pending).unwrap();
+        drop(first);
+        assert!(pending.load(Ordering::Acquire));
+        drop(second);
+        assert!(!pending.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn device_refresh_recovers_after_unwinding_with_the_lock() {
+        let enumeration = Mutex::new(());
+        let pending = AtomicBool::new(false);
+        let result = std::panic::catch_unwind(|| {
+            let _refresh = DeviceRefresh::try_start(&enumeration, &pending).unwrap();
+            panic!("simulated driver panic");
         });
+        assert!(result.is_err());
+        assert!(!pending.load(Ordering::Acquire));
+        assert!(enumeration.is_poisoned());
+        assert!(DeviceRefresh::try_start(&enumeration, &pending).is_some());
+        assert!(!enumeration.is_poisoned());
     }
 
     #[test]
@@ -2613,6 +2673,7 @@ mod tests {
     }
 
     #[test]
+    /// Verify the first valid unit after a discontinuity can seed decoder recovery.
     fn first_recovery_unit_survives_sequence_loss_and_timestamp_change() {
         for next_sequence in [2_u16, 3] {
             let mut ingress = crate::video::ingress::VideoIngress::default();
@@ -2689,6 +2750,7 @@ mod tests {
     }
 
     #[test]
+    /// Exercise native codec recovery through packetization, sequence wrap and fragment loss.
     fn native_codec_roundtrips_zalo_fragments_and_recovers_after_loss() {
         use crate::video::{
             codec::{VideoDecoder, VideoEncoder},

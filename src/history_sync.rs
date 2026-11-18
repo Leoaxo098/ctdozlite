@@ -30,15 +30,15 @@ pub static PHONE_SYNC_CANCEL: AtomicBool = AtomicBool::new(false);
 /// True while a phone message sync (`sync_phone_messages`) is active (#68).
 pub static PHONE_SYNC_RUNNING: AtomicBool = AtomicBool::new(false);
 
-async fn persist_thread_snapshot(uin: &str, snapshot: Thread) -> Result<usize> {
-    let uin = uin.to_string();
-    tokio::task::spawn_blocking(move || {
-        store::persist_threads(
-            &mut MessageStore::open_account(&uin)?,
-            std::slice::from_ref(&snapshot),
-        )
-    })
-    .await?
+/// Commit a fetched page to the captured account on the blocking pool and count new messages.
+///
+/// # Errors
+/// Returns an error if the task fails or SQLite cannot open or persist the snapshot.
+pub(crate) fn persist_thread_snapshot(uin: &str, snapshot: Thread) -> Result<usize> {
+    store::persist_threads(
+        &mut MessageStore::open_account(uin)?,
+        std::slice::from_ref(&snapshot),
+    )
 }
 
 /// Fetch older pages for `t` until the server has nothing older, `MAX_PAGES` is hit, or the user
@@ -46,6 +46,24 @@ async fn persist_thread_snapshot(uin: &str, snapshot: Thread) -> Result<usize> {
 /// runs on the blocking pool; no connection is held across an await.
 /// Returns how many messages were new to the database.
 pub async fn sync_thread(s: &Session, t: &mut Thread) -> Result<usize> {
+    sync_thread_with_writer(s, t, |uin, snapshot| async move {
+        tokio::task::spawn_blocking(move || persist_thread_snapshot(&uin, snapshot)).await?
+    })
+    .await
+}
+
+/// Fetch history using a writer controlled by the caller's account lifecycle.
+///
+/// # Errors
+/// Returns an error if the account is unavailable, fetching fails, or the writer cannot persist a page.
+pub(crate) async fn sync_thread_with_writer<F>(
+    s: &Session,
+    t: &mut Thread,
+    persist_page: impl Fn(String, Thread) -> F + Send,
+) -> Result<usize>
+where
+    F: std::future::Future<Output = Result<usize>> + Send,
+{
     let id = t.id.clone();
     let uin = s
         .login
@@ -79,7 +97,7 @@ pub async fn sync_thread(s: &Session, t: &mut Thread) -> Result<usize> {
         let before = t.messages.len();
         chat::merge_group_history(t, &resp);
         if t.messages.len() > before {
-            added += persist_thread_snapshot(&uin, t.clone()).await?;
+            added += persist_page(uin.clone(), t.clone()).await?;
         }
         let (has_more, next_is_old, resp_cursor) = chat::parse_cloud_page_meta(&resp);
         if !has_more {
@@ -105,7 +123,7 @@ pub async fn sync_thread(s: &Session, t: &mut Thread) -> Result<usize> {
         let before = t.messages.len();
         chat::merge_group_history(t, &resp);
         if t.messages.len() > before {
-            added += persist_thread_snapshot(&uin, t.clone()).await?;
+            added += persist_page(uin.clone(), t.clone()).await?;
         }
         if t.messages.len() == before && !is_old && next_is_old && has_more {
             // Server signaled cold-storage pagination (`isOld = 1`) for this cursor; retry page once via getoldv2.
@@ -858,6 +876,10 @@ where
 
 // The existing znoise response maps numeric backup user IDs to web IDs. A decimal web
 // UIN alone is not evidence of the Android SenderId namespace (re-notes/39_phone_sync_safety.md).
+/// Resolve the account's numeric Android sender ID from direct-chat backup database names.
+///
+/// # Errors
+/// Returns an error if there is no matching positive ID or the backup maps multiple IDs to the account.
 fn android_self_sender_id(
     uin: &str,
     id_map: &std::collections::HashMap<String, String>,
@@ -1311,6 +1333,10 @@ pub struct SyncV2Meta {
     pub sender_identity: String,
 }
 
+/// Decrypt the Sync V2 metadata and retain its session record for subsequent message packages.
+///
+/// # Errors
+/// Returns an error if sync keys are missing, the host or download fails, or metadata cannot be decoded.
 pub async fn import_sync_v2_meta(s: &Session, url: &str) -> Result<SyncV2Meta> {
     // Validate local decryption prerequisites before downloading a peer package.
     let keys = current_v2_keys_raw()?;
@@ -1626,6 +1652,7 @@ pub struct ParsedProtoPartition {
     pub messages: Vec<ParsedProtoMsg>,
 }
 
+/// Read a protobuf varint and return the next byte offset when a terminating byte is found.
 fn parse_vli(buf: &[u8], mut offset: usize) -> Option<(u64, usize)> {
     let mut result: u64 = 0;
     let mut shift = 0;
@@ -1770,6 +1797,7 @@ fn parse_proto_metadata(buf: &[u8]) -> Option<(Vec<ParsedProtoAttach>, Option<Pa
     Some((attaches, quote))
 }
 
+/// Decode the Sync V2 fields needed for storage, including any readable attachment and quote data.
 fn parse_message(buf: &[u8]) -> Option<ParsedProtoMsg> {
     let mut msg = ParsedProtoMsg::default();
     let mut offset = 0;
@@ -1822,6 +1850,7 @@ fn parse_message(buf: &[u8]) -> Option<ParsedProtoMsg> {
     Some(msg)
 }
 
+/// Decode a conversation partition while retaining independently readable message records.
 fn parse_partition(buf: &[u8]) -> Option<ParsedProtoPartition> {
     let mut part = ParsedProtoPartition::default();
     let mut offset = 0;
@@ -1893,6 +1922,12 @@ pub fn decompress_sync_payload(buf: &[u8]) -> Vec<u8> {
     buf.to_vec()
 }
 
+/// Extract conversation partitions from an uncompressed Sync V2 protobuf payload.
+///
+/// An unreadable partition can be skipped when its length is available.
+///
+/// # Panics
+/// A length field that overflows a platform byte offset can panic with overflow checks enabled.
 pub fn parse_sync_chunk(buf: &[u8]) -> Option<Vec<ParsedProtoPartition>> {
     let mut parts = Vec::new();
     let mut offset = 0;
@@ -2651,6 +2686,10 @@ pub async fn import_sync_v2_messages(s: &Session, url: &str, is_last: bool) -> R
     import_sync_v2_messages_inner(s, url, None, is_last).await
 }
 
+/// Import one decrypted Sync V2 message package into the captured account and count newly stored messages.
+///
+/// # Errors
+/// Returns an error if the metadata session is missing or the package cannot be fetched, decoded, or opened for import.
 pub(crate) async fn import_sync_v2_messages_inner(
     s: &Session,
     url: &str,

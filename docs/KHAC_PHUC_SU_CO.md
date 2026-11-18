@@ -41,8 +41,12 @@ file và không tự nhập vào tài khoản đang đăng nhập.
 
 Mở **Cài đặt → Đồng bộ tin nhắn → Di chuyển / Nhập lịch sử tin nhắn có sẵn**,
 bấm **Chọn file lịch sử** và chọn `zalo_history.db` trong thư mục dữ liệu của
-ứng dụng. Chỉ chọn file thuộc chính tài khoản hiện tại. Lịch sử được ghép vào
-kho tài khoản mà không xoá tin nhắn đang có; việc chọn file là xác nhận của bạn.
+ứng dụng. Chỉ chọn file thuộc chính tài khoản hiện tại.
+
+**Sao lưu kho lịch sử của tài khoản trước khi nhập.** Khi bản sao lưu có cùng
+`msg_id` và trường `raw_json` không rỗng, ứng dụng giữ hàng tin nhắn hiện có
+nhưng dữ liệu từ bản sao lưu cũ có thể thay thế nội dung, loại tin nhắn và dữ
+liệu gốc của hàng đó.
 
 ## 3. Sự cố phiên đăng nhập
 

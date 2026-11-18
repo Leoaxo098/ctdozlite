@@ -176,6 +176,11 @@ impl VideoIngress {
         result
     }
 
+    /// Append bytes while capping both the assembled access unit and the
+    /// buffer capacity requested from the allocator.
+    ///
+    /// # Errors
+    /// Returns an error if the bytes would grow the access unit beyond 1 MiB.
     fn append(&mut self, bytes: &[u8]) -> Result<()> {
         ensure!(
             bytes.len() <= MAX_ACCESS_UNIT - self.unit.len(),
@@ -288,6 +293,8 @@ mod tests {
         assert!(ingress.push(3, 2, true, &[0x1c, 0x40, 4]).is_err());
     }
 
+    /// Check allocation capacity across repeated fragment appends, including
+    /// the append that exceeds the access-unit limit.
     #[test]
     fn allocation_capacity_stays_bounded_while_appending_fragments() {
         let mut ingress = VideoIngress::new();

@@ -1187,6 +1187,19 @@ struct PureRustCallState {
 }
 
 impl PureRustCallState {
+    /// Match an answer to the still-ringing call and the account that accepted it.
+    fn matches_pending_answer(
+        &self,
+        identity: (i64, std::time::Instant),
+        events: &crate::gui::GuiTx,
+    ) -> bool {
+        events.is_current()
+            && !self.is_caller
+            && !self.is_connected
+            && (self.call_id, self.started_at) == identity
+    }
+
+    /// Check for a native group host before selecting group signalling.
     fn uses_group_protocol(&self) -> bool {
         // Per-member fallback retains the group conversation but uses direct peer legs.
         self.is_group && !self.group_host_call.is_empty()
@@ -1223,6 +1236,7 @@ impl Drop for PureRustCallState {
     }
 }
 
+/// Install an outgoing call only while its account, dial generation and slot still match.
 async fn try_install_dialed_call(
     active: &Mutex<Option<PureRustCallState>>,
     events: &crate::gui::GuiTx,
@@ -1241,6 +1255,7 @@ async fn try_install_dialed_call(
     None
 }
 
+/// Build teardown signals for the primary dial and any connected or ringing peer legs.
 fn pending_dial_cancel_signals(state: &PureRustCallState) -> Vec<(i64, Value)> {
     let mut signals = Vec::new();
     if state.uses_group_protocol() {
@@ -1276,6 +1291,7 @@ fn pending_dial_cancel_signals(state: &PureRustCallState) -> Vec<(i64, Value)> {
     signals
 }
 
+/// Release local resources before cancelling a late dial with its originating session.
 async fn cancel_orphaned_dial(session: &Session, state: PureRustCallState) {
     let signals = pending_dial_cancel_signals(&state);
     // Release microphone, video and relay keepalives before best-effort network cleanup.
@@ -1999,6 +2015,7 @@ pub fn build_pure_rust_invite_fields_with_port(
     build_pure_rust_invite_fields_with_probe(resp_401, is_video, local_udp_port, None)
 }
 
+/// Build the caller media description from relay and optional UDP probe results.
 pub fn build_pure_rust_invite_fields_with_probe(
     resp_401: &Value,
     is_video: bool,
@@ -3111,6 +3128,13 @@ impl CallBridge {
                         accept,
                         cam_start_off,
                     } => {
+                        let identity = {
+                            let active = active_call.lock().await;
+                            let Some(call) = active.as_ref() else {
+                                continue;
+                            };
+                            (call.call_id, call.started_at)
+                        };
                         let s_snap = session.lock().await.clone();
                         let active_clone = active_call.clone();
                         let gui_tx_clone = gui_tx.clone();
@@ -3123,43 +3147,35 @@ impl CallBridge {
                                     .lock()
                                     .await
                                     .as_ref()
-                                    .map(|s| !s.is_caller && !s.ringing_sent)
+                                    .map(|s| {
+                                        s.matches_pending_answer(identity, &gui_tx_clone)
+                                            && !s.ringing_sent
+                                    })
                                     .unwrap_or(false);
                                 if need_probe {
                                     // Gửi 407 ringing trước.
-                                    let (cid, caller, grp, gid, imei) = {
+                                    let (cid, caller, grp, gid, host) = {
                                         let g = active_clone.lock().await;
-                                        match g.as_ref() {
+                                        match g.as_ref().filter(|s| {
+                                            s.matches_pending_answer(identity, &gui_tx_clone)
+                                        }) {
                                             Some(s) => (
                                                 s.call_id,
                                                 s.partner_id.clone(),
-                                                s.is_group,
+                                                s.uses_group_protocol(),
                                                 s.group_id_u32,
-                                                s_snap.imei.clone(),
+                                                s.group_host_call.clone(),
                                             ),
                                             None => return,
                                         }
                                     };
+                                    let imei = &s_snap.imei;
                                     if grp && gid != 0 {
-                                        let g = active_clone.lock().await;
-                                        let host = g
-                                            .as_ref()
-                                            .map(|s| s.group_host_call.clone())
-                                            .unwrap_or_default();
-                                        drop(g);
                                         let host_val: Value = host
                                             .parse::<u64>()
                                             .map(|n| json!(n))
                                             .unwrap_or_else(|_| json!(host));
-                                        let gid_str = active_clone
-                                            .lock()
-                                            .await
-                                            .as_ref()
-                                            .map(|s| {
-                                                // group_id dạng số; server nhận cả string.
-                                                gid.to_string()
-                                            })
-                                            .unwrap_or_default();
+                                        let gid_str = gid.to_string();
                                         let req_12439 = json!({
                                             "calleeId": host_val,
                                             "hostCall": host_val,
@@ -3171,6 +3187,11 @@ impl CallBridge {
                                         let _ =
                                             dispatch_send_signal(&s_snap, 12439, &req_12439).await;
                                     }
+                                    if !active_clone.lock().await.as_ref().is_some_and(|s| {
+                                        s.matches_pending_answer(identity, &gui_tx_clone)
+                                    }) {
+                                        return;
+                                    }
                                     let req_407 = json!({
                                         "callerId": caller,
                                         "callId": cid,
@@ -3179,16 +3200,11 @@ impl CallBridge {
                                     });
                                     let _ = dispatch_send_signal(&s_snap, 407, &req_407).await;
                                     // Probe UDP relay + ZRTP (logic cũ chuyển từ invite sang).
-                                    let (
-                                        relay_src,
-                                        from_u,
-                                        part_u,
-                                        is_vid,
-                                        sess_raw,
-                                        grp_u32,
-                                    ) = {
+                                    let (relay_src, from_u, part_u, is_vid, sess_raw, grp_u32) = {
                                         let g = active_clone.lock().await;
-                                        match g.as_ref() {
+                                        match g.as_ref().filter(|s| {
+                                            s.matches_pending_answer(identity, &gui_tx_clone)
+                                        }) {
                                             Some(s) => (
                                                 s.invite_payload.clone(),
                                                 s.from_uid_u32,
@@ -3200,25 +3216,21 @@ impl CallBridge {
                                             None => return,
                                         }
                                     };
-                                    let (
-                                        udp_rtp_sock,
-                                        udp_rtcp_sock,
-                                        keepalive_abort,
-                                        zrtp_probe,
-                                    ) = start_zrtp_udp_relay_session_with_probe(
-                                        &relay_src,
-                                        from_u,
-                                        part_u,
-                                        cid as u32,
-                                        false,
-                                        &sess_raw,
-                                        if grp && grp_u32 != 0 {
-                                            Some(grp_u32)
-                                        } else {
-                                            None
-                                        },
-                                    )
-                                    .await;
+                                    let (udp_rtp_sock, udp_rtcp_sock, keepalive_abort, zrtp_probe) =
+                                        start_zrtp_udp_relay_session_with_probe(
+                                            &relay_src,
+                                            from_u,
+                                            part_u,
+                                            cid as u32,
+                                            false,
+                                            &sess_raw,
+                                            if grp && grp_u32 != 0 {
+                                                Some(grp_u32)
+                                            } else {
+                                                None
+                                            },
+                                        )
+                                        .await;
                                     let (
                                         mut rtp_ip,
                                         mut rtcp_ip,
@@ -3250,21 +3262,23 @@ impl CallBridge {
                                         Some(&zrtp_probe),
                                     );
                                     let mut g = active_clone.lock().await;
-                                    if let Some(st) = g.as_mut() {
-                                        if st.call_id == cid {
-                                            st.sess_id = sess_id;
-                                            if !rtp_ip.is_empty() {
-                                                st.rtp_ip = rtp_ip;
-                                                st.rtcp_ip = rtcp_ip;
-                                            }
-                                            st.extend_data = extend_str;
-                                            st.relay_token = zrtp_probe.token;
-                                            st.server_tokens = zrtp_probe.server_tokens;
-                                            st.udp_rtp_sock = udp_rtp_sock;
-                                            st.udp_rtcp_sock = udp_rtcp_sock;
-                                            st.keepalive_abort = keepalive_abort;
-                                            st.ringing_sent = true;
+                                    if let Some(st) = g.as_mut().filter(|s| {
+                                        s.matches_pending_answer(identity, &gui_tx_clone)
+                                    }) {
+                                        st.sess_id = sess_id;
+                                        if !rtp_ip.is_empty() {
+                                            st.rtp_ip = rtp_ip;
+                                            st.rtcp_ip = rtcp_ip;
                                         }
+                                        st.extend_data = extend_str;
+                                        st.relay_token = zrtp_probe.token;
+                                        st.server_tokens = zrtp_probe.server_tokens;
+                                        st.udp_rtp_sock = udp_rtp_sock;
+                                        st.udp_rtcp_sock = udp_rtcp_sock;
+                                        st.keepalive_abort = keepalive_abort;
+                                        st.ringing_sent = true;
+                                    } else {
+                                        return;
                                     }
                                 }
                             }
@@ -3272,12 +3286,18 @@ impl CallBridge {
                             eprintln!(
                                 "[call] AnswerCall accept={} guard={}",
                                 accept,
-                                guard.as_ref().map(|st| format!(
-                                    "call_id={} connected={} ringing_sent={}",
-                                    st.call_id, st.is_connected, st.ringing_sent
-                                )).unwrap_or_else(|| "None".into())
+                                guard
+                                    .as_ref()
+                                    .map(|st| format!(
+                                        "call_id={} connected={} ringing_sent={}",
+                                        st.call_id, st.is_connected, st.ringing_sent
+                                    ))
+                                    .unwrap_or_else(|| "None".into())
                             );
-                            if let Some(ref mut st) = *guard {
+                            if let Some(st) = guard
+                                .as_mut()
+                                .filter(|s| s.matches_pending_answer(identity, &gui_tx_clone))
+                            {
                                 let call_id = st.call_id;
                                 let caller_id = st.partner_id.clone();
                                 let thread_id = st.thread_id.clone();
@@ -3876,10 +3896,13 @@ impl CallBridge {
                                     "[call] answer evt: ev_call_id={} status={} state={}",
                                     ev_call_id,
                                     status,
-                                    guard.as_ref().map(|st| format!(
-                                        "call_id={} connected={} caller={}",
-                                        st.call_id, st.is_connected, st.is_caller
-                                    )).unwrap_or_else(|| "None".into())
+                                    guard
+                                        .as_ref()
+                                        .map(|st| format!(
+                                            "call_id={} connected={} caller={}",
+                                            st.call_id, st.is_connected, st.is_caller
+                                        ))
+                                        .unwrap_or_else(|| "None".into())
                                 );
                                 if guard.is_none() {
                                     let self_uin = s_snap
@@ -3932,8 +3955,13 @@ impl CallBridge {
                                                 }),
                                             );
                                         }
-                                        let _ =
-                                            cmd_tx_inner.send(CallEngineCmd::ControlEvent(synth));
+                                        let _ = cmd_tx_inner.send(CallEngineCmd::AccountCommand(
+                                            Box::new((
+                                                s_snap,
+                                                gui_tx.clone(),
+                                                CallEngineCmd::ControlEvent(synth),
+                                            )),
+                                        ));
                                     }
                                     continue;
                                 }
@@ -4048,7 +4076,10 @@ impl CallBridge {
                                     //    or rejected/ended on another device (eff_status != 0).
                                     // Dismiss ringing on this desktop client and clean up active call resources.
                                     let is_group = st_check.is_group;
-                                    eprintln!("[call] dismiss: mobile handled call {}, eff_status={}", ev_call_id, eff_status);
+                                    eprintln!(
+                                        "[call] dismiss: mobile handled call {}, eff_status={}",
+                                        ev_call_id, eff_status
+                                    );
                                     let _taken = guard.take();
                                     dismissed_by_peer.insert(ev_call_id);
                                     let _ = gui_tx.send(GuiEvent::CallStateChanged("free".into()));
@@ -4783,7 +4814,8 @@ impl CallBridge {
                                     let gui_tx_timeout = gui_tx.clone();
                                     let ctx_timeout = egui_ctx.clone();
                                     tokio::spawn(async move {
-                                        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                                        tokio::time::sleep(std::time::Duration::from_secs(60))
+                                            .await;
                                         let mut g = active_timeout.lock().await;
                                         if let Some(st) = g.as_ref() {
                                             if st.call_id == call_id
@@ -4795,11 +4827,11 @@ impl CallBridge {
                                                 let _ = gui_tx_timeout.send(
                                                     GuiEvent::CallStateChanged("free".into()),
                                                 );
-                                                let _ = gui_tx_timeout.send(
-                                                    GuiEvent::StatusUpdate(
-                                                        "Cuộc gọi đến đã kết thúc (hết chuông)".into(),
-                                                    ),
-                                                );
+                                                let _ =
+                                                    gui_tx_timeout.send(GuiEvent::StatusUpdate(
+                                                        "Cuộc gọi đến đã kết thúc (hết chuông)"
+                                                            .into(),
+                                                    ));
                                                 ctx_timeout.request_repaint();
                                             }
                                         }
@@ -4827,6 +4859,7 @@ impl CallBridge {
         }
     }
 
+    /// Queue a command with the bound account snapshot when the bridge has one.
     fn send_command(&self, command: CallEngineCmd) {
         let command = if let Some(context) = &self.account_context {
             CallEngineCmd::AccountCommand(Box::new((context.0.clone(), context.1.clone(), command)))
@@ -4931,6 +4964,23 @@ mod tests {
         }
     }
 
+    /// Reject delayed answers for a replacement invite or an obsolete account.
+    #[test]
+    fn pending_answer_requires_same_call_and_current_account() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let root = crate::gui::GuiTx::new(tx, eframe::egui::Context::default());
+        let events = root.scoped();
+        let mut incoming = pending_test_call();
+        incoming.is_caller = false;
+        let identity = (incoming.call_id, incoming.started_at);
+        assert!(incoming.matches_pending_answer(identity, &events));
+        incoming.started_at += std::time::Duration::from_secs(1);
+        assert!(!incoming.matches_pending_answer(identity, &events));
+        incoming.started_at = identity.1;
+        root.advance_account();
+        assert!(!incoming.matches_pending_answer(identity, &events));
+    }
+
     #[tokio::test]
     async fn late_dial_is_rejected_after_account_change_and_its_keepalive_stops() {
         let (tx, _rx) = std::sync::mpsc::channel();
@@ -5002,6 +5052,7 @@ mod tests {
     }
 
     #[test]
+    /// Verify per-member fallback sends direct cancellation for audio and video.
     fn fallback_group_dial_cancels_primary_as_a_direct_leg() {
         for is_video in [false, true] {
             let mut state = pending_test_call();
@@ -5658,6 +5709,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Verify a same-account answer on another device closes the local ringing call.
     async fn callee_dismisses_ringing_when_answered_on_another_device() {
         let (tx, rx) = std::sync::mpsc::channel();
         let egui_ctx = eframe::egui::Context::default();
@@ -5745,6 +5797,7 @@ mod tests {
     }
 
     #[tokio::test]
+    /// Verify a benign status update leaves the incoming call available to answer.
     async fn callee_ignores_benign_status_5_while_ringing() {
         let (tx, rx) = std::sync::mpsc::channel();
         let egui_ctx = eframe::egui::Context::default();

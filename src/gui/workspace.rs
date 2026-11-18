@@ -186,6 +186,11 @@ impl ZaloGuiApp {
         Some(hk)
     }
 
+    /// Lay out navigation, conversation search and the active chat at the current
+    /// viewport width, then apply input from those panels.
+    ///
+    /// # Panics
+    /// Panics if a cached row index used during rendering is outside its backing list.
     pub(super) fn render_chat_workspace(&mut self, ctx: &egui::Context, pal: &ThemePalette) {
         // Responsive breakpoints based on live viewport width
         // -------------------------------------------------------------------

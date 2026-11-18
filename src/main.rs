@@ -581,6 +581,10 @@ fn startup_account_threads(session: &Session, limit: usize) -> Vec<chat::Thread>
     threads
 }
 
+/// Open the authenticated account's history store before exposing its path to the local API.
+///
+/// # Errors
+/// Returns an error if login is required or the store cannot be opened.
 fn authenticated_db_path(session: &Session) -> Result<String> {
     let login = session
         .login
@@ -590,6 +594,10 @@ fn authenticated_db_path(session: &Session) -> Result<String> {
     Ok(store::db_path_for_account(&login.uin))
 }
 
+/// Resolve the API database, allowing an interactive client to start with its API disabled.
+///
+/// # Errors
+/// Propagates account resolution failures when API-only mode is requested.
 fn api_startup_path(session: &Session, api_only: bool) -> Result<Option<String>> {
     match authenticated_db_path(session) {
         Ok(path) => Ok(Some(path)),
