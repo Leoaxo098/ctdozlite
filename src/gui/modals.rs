@@ -5892,13 +5892,11 @@ impl ZaloGuiApp {
                         );
 
                         // 3) Camera selector button + popup menu
-                        let cur_cam_lbl = if self.settings.selected_camera_device.is_empty() {
-                            cams.first()
-                                .map(String::as_str)
-                                .unwrap_or("Camera mặc định")
-                        } else {
-                            &self.settings.selected_camera_device
-                        };
+                        let cur_cam_lbl = crate::gui::format_call_camera_label(
+                            &self.settings.selected_camera_device,
+                            &cams,
+                            call_dev_scanning,
+                        );
                         let cam_id = Id::new("call_vp_cam_popup");
                         let cam_resp = ui.interact(cam_rect, cam_id, Sense::click());
                         if cam_resp.clicked() {
@@ -5966,6 +5964,17 @@ impl ZaloGuiApp {
                                         crate::media::set_selected_camera_device(c);
                                         self.settings.save();
                                     }
+                                }
+                                if cams.is_empty() {
+                                    ui.label(
+                                        RichText::new(if call_dev_scanning {
+                                            "⏳ Đang quét thiết bị…"
+                                        } else {
+                                            "⚠️ Không phát hiện camera (bấm Quét lại)"
+                                        })
+                                        .size(11.5)
+                                        .color(pal.text_muted),
+                                    );
                                 }
                             },
                         );
@@ -6422,10 +6431,19 @@ impl ZaloGuiApp {
                                         {
                                             call.is_incoming_ringing = false;
                                             call.state_label = "Đang kết nối cuộc gọi…".into();
+                                            let cam_start_off = if call.is_video {
+                                                let can_cam = self.probe_local_camera_readiness(true)
+                                                    == crate::gui::CameraReadiness::Ready;
+                                                call.cam_enabled = can_cam;
+                                                !can_cam
+                                            } else {
+                                                call.cam_enabled = false;
+                                                false
+                                            };
                                             if let Some(tx) = WORKER_TX.get() {
                                                 let _ = tx.send(WorkerCmd::AnswerCall {
                                                     accept: true,
-                                                    cam_start_off: false,
+                                                    cam_start_off,
                                                 });
                                             }
                                         }
@@ -6583,28 +6601,33 @@ impl ZaloGuiApp {
                                         })
                                         .clicked()
                                     {
+                                        let prev_cam = call.cam_enabled;
                                         if !call.cam_enabled {
-                                            if !crate::media::is_ffmpeg_available() {
-                                                self.show_toast(
-                                                    "⚠️ Cần cài đặt ffmpeg trong PATH để bật Camera (winget install Gyan.FFmpeg)",
-                                                );
-                                            } else if crate::media::list_media_devices(false).1.is_empty() {
-                                                self.show_toast(
-                                                    "⚠️ Không tìm thấy thiết bị Camera nào trên máy",
-                                                );
-                                            } else {
+                                            let readiness = self.probe_local_camera_readiness(false);
+                                            let (next_cam, _) = crate::gui::next_camera_toggle_state(
+                                                call.cam_enabled,
+                                                readiness,
+                                            );
+                                            if next_cam {
                                                 call.cam_enabled = true;
                                                 call.is_video = true;
                                             }
                                         } else {
                                             call.cam_enabled = false;
-                                            self.sticker_textures.remove("call_local_video");
+                                            crate::gui::remove_cached_texture(
+                                                &mut self.sticker_textures,
+                                                &mut self.texture_lru,
+                                                &mut self.last_frame_textures,
+                                                "call_local_video",
+                                            );
                                         }
-                                        if let Some(tx) = WORKER_TX.get() {
-                                            let _ = tx.send(WorkerCmd::SetCallMediaState {
-                                                is_on_mic: !call.mic_muted,
-                                                is_on_cam: call.cam_enabled,
-                                            });
+                                        if call.cam_enabled != prev_cam {
+                                            if let Some(tx) = WORKER_TX.get() {
+                                                let _ = tx.send(WorkerCmd::SetCallMediaState {
+                                                    is_on_mic: !call.mic_muted,
+                                                    is_on_cam: call.cam_enabled,
+                                                });
+                                            }
                                         }
                                     }
                                     // 4) Layout Switcher (Gallery <-> Speaker View)
@@ -7082,6 +7105,7 @@ impl ZaloGuiApp {
                                         && self.sticker_textures.contains_key(&tex_key);
                                     let has_vid = if show_tex {
                                         if let Some(vtex) = self.sticker_textures.get(&tex_key) {
+                                            crate::gui::mark_texture_used(&tex_key);
                                             let t_inner = tile_rect.shrink(6.0);
                                             let tex_size = vtex.size_vec2();
                                             let tex_aspect = if tex_size.y > 0.0 {
@@ -7206,6 +7230,7 @@ impl ZaloGuiApp {
                             } else if let Some(vtex) =
                                 self.sticker_textures.get("call_remote_video")
                             {
+                                crate::gui::mark_texture_used("call_remote_video");
                                 let inner = stage_rect.shrink(10.0);
                                 let tex_size = vtex.size_vec2();
                                 let tex_aspect = if tex_size.y > 0.0 {
@@ -7294,6 +7319,7 @@ impl ZaloGuiApp {
                                 );
                                 if call.cam_enabled {
                                     if let Some(ltex) = self.sticker_textures.get("call_local_video") {
+                                        crate::gui::mark_texture_used("call_local_video");
                                         let inner_pip = pip_rect.shrink(2.0);
                                         let lsize = ltex.size_vec2();
                                         let laspect = if lsize.y > 0.0 {
@@ -7437,15 +7463,20 @@ impl ZaloGuiApp {
         });
 
         if retry_clicked {
-            self.sticker_textures.remove("call_remote_video");
-            self.sticker_textures.remove("call_remote_video_1");
-            self.sticker_textures.remove("call_remote_video_2");
-            self.sticker_textures.remove("call_remote_video_3");
-            self.sticker_textures.remove("call_remote_video_4");
-            self.sticker_textures.remove("call_remote_video_5");
+            crate::gui::clear_call_video_textures(
+                &mut self.sticker_textures,
+                &mut self.texture_lru,
+                &mut self.last_frame_textures,
+                false,
+            );
             call.error_code = None;
             call.error_reason = None;
             call.started_at = std::time::Instant::now();
+            call.cam_enabled = if call.is_video {
+                self.probe_local_camera_readiness(true) == crate::gui::CameraReadiness::Ready
+            } else {
+                false
+            };
             call.state_label = if call.is_video {
                 "Đang kết nối cuộc gọi video…".into()
             } else {
@@ -7463,13 +7494,12 @@ impl ZaloGuiApp {
             self.active_call = Some(call);
         } else if hangup_clicked {
             self.active_call = None;
-            self.sticker_textures.remove("call_remote_video");
-            self.sticker_textures.remove("call_remote_video_1");
-            self.sticker_textures.remove("call_remote_video_2");
-            self.sticker_textures.remove("call_remote_video_3");
-            self.sticker_textures.remove("call_remote_video_4");
-            self.sticker_textures.remove("call_remote_video_5");
-            self.sticker_textures.remove("call_local_video");
+            crate::gui::clear_call_video_textures(
+                &mut self.sticker_textures,
+                &mut self.texture_lru,
+                &mut self.last_frame_textures,
+                true,
+            );
             if let Some(tx) = WORKER_TX.get() {
                 let _ = tx.send(WorkerCmd::EndCall);
             }

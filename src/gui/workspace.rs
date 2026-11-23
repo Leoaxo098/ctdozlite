@@ -5908,50 +5908,17 @@ impl ZaloGuiApp {
                                         })
                                         .clicked()
                                     {
-                                        let ff_ok = crate::media::is_ffmpeg_available();
-                                        let (_, cams) = crate::media::list_media_devices(false);
-                                        let can_cam = ff_ok && !cams.is_empty();
-                                        if !ff_ok {
-                                            self.show_toast(
-                                                "⚠️ Không tìm thấy ffmpeg trong PATH để bật Camera (cài bằng: winget install Gyan.FFmpeg)",
-                                            );
-                                        } else if cams.is_empty() {
-                                            self.show_toast(
-                                                "⚠️ Không phát hiện thiết bị Camera trên máy — đang gọi không hình",
-                                            );
-                                        }
-                                        self.active_call = Some(ActiveCallOverlay {
-                                            partner_id: thread_id.clone(),
-                                            partner_name: thread_name.clone(),
-                                            is_video: true,
+                                        self.start_outgoing_call(
+                                            thread_id.clone(),
+                                            thread_name.clone(),
+                                            true,
                                             is_group,
-                                            state_label: if is_group {
+                                            if is_group {
                                                 "Đang gọi nhóm Zavi…".into()
                                             } else {
                                                 "Đang kết nối cuộc gọi video…".into()
                                             },
-                                            started_at: std::time::Instant::now(),
-                                            mic_muted: false,
-                                            cam_enabled: can_cam,
-                                            is_incoming_ringing: false,
-                                            error_code: None,
-                                            error_reason: None,
-                                            speaker_view: false,
-                                            pinned_tile_idx: 0,
-                                            call_page: 0,
-                                            members_popover_open: false,
-                                            invite_search_query: String::new(),
-                                            quick_reply_popover_open: false,
-                                        });
-                                        if let Some(tx) = WORKER_TX.get() {
-                                            let _ = tx.send(WorkerCmd::StartCall {
-                                                partner_id: thread_id.clone(),
-                                                partner_name: thread_name.clone(),
-                                                partner_avatar: None,
-                                                is_video: true,
-                                                is_group,
-                                            });
-                                        }
+                                        );
                                     }
 
                                     // Voice Call Button
@@ -5985,38 +5952,17 @@ impl ZaloGuiApp {
                                         })
                                         .clicked()
                                     {
-                                        self.active_call = Some(ActiveCallOverlay {
-                                            partner_id: thread_id.clone(),
-                                            partner_name: thread_name.clone(),
-                                            is_video: false,
+                                        self.start_outgoing_call(
+                                            thread_id.clone(),
+                                            thread_name.clone(),
+                                            false,
                                             is_group,
-                                            state_label: if is_group {
+                                            if is_group {
                                                 "Đang gọi nhóm Zavi…".into()
                                             } else {
                                                 "Đang kết nối cuộc gọi thoại…".into()
                                             },
-                                            started_at: std::time::Instant::now(),
-                                            mic_muted: false,
-                                            cam_enabled: false,
-                                            is_incoming_ringing: false,
-                                            error_code: None,
-                                            error_reason: None,
-                                            speaker_view: false,
-                                            pinned_tile_idx: 0,
-                                            call_page: 0,
-                                            members_popover_open: false,
-                                            invite_search_query: String::new(),
-                                            quick_reply_popover_open: false,
-                                        });
-                                        if let Some(tx) = WORKER_TX.get() {
-                                            let _ = tx.send(WorkerCmd::StartCall {
-                                                partner_id: thread_id.clone(),
-                                                partner_name: thread_name.clone(),
-                                                partner_avatar: None,
-                                                is_video: false,
-                                                is_group,
-                                            });
-                                        }
+                                        );
                                     }
                                     }
                                     if !header_narrow {
@@ -7577,38 +7523,17 @@ impl ZaloGuiApp {
                                     self.show_toast("🕒 Chọn mốc thời gian để đặt nhắc hẹn");
                                 }
                                 BubbleAction::CallAgain { is_video } => {
-                                    self.active_call = Some(ActiveCallOverlay {
-                                        partner_id: thread_id.clone(),
-                                        partner_name: thread_name.clone(),
+                                    self.start_outgoing_call(
+                                        thread_id.clone(),
+                                        thread_name.clone(),
                                         is_video,
                                         is_group,
-                                        state_label: if is_video {
+                                        if is_video {
                                             "Đang kết nối cuộc gọi video…".into()
                                         } else {
                                             "Đang kết nối cuộc gọi thoại…".into()
                                         },
-                                        started_at: std::time::Instant::now(),
-                                        mic_muted: false,
-                                        cam_enabled: is_video,
-                                        is_incoming_ringing: false,
-                                        error_code: None,
-                                        error_reason: None,
-                                        speaker_view: false,
-                                        pinned_tile_idx: 0,
-                                        call_page: 0,
-                                        members_popover_open: false,
-                                        invite_search_query: String::new(),
-                                        quick_reply_popover_open: false,
-                                    });
-                                    if let Some(tx) = WORKER_TX.get() {
-                                        let _ = tx.send(WorkerCmd::StartCall {
-                                            partner_id: thread_id.clone(),
-                                            partner_name: thread_name.clone(),
-                                            partner_avatar: None,
-                                            is_video,
-                                            is_group,
-                                        });
-                                    }
+                                    );
                                 }
                                 BubbleAction::DeleteForMe => {
                                     if let Some(tx) = WORKER_TX.get() {

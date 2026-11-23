@@ -1097,6 +1097,40 @@ struct ActiveCallOverlay {
     quick_reply_popover_open: bool,
 }
 
+impl ActiveCallOverlay {
+    /// Creates an active call overlay state with consistent defaults across call entry points.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn new(
+        partner_id: String,
+        partner_name: String,
+        is_video: bool,
+        is_group: bool,
+        state_label: String,
+        cam_enabled: bool,
+        is_incoming_ringing: bool,
+    ) -> Self {
+        Self {
+            partner_id,
+            partner_name,
+            is_video,
+            is_group,
+            state_label,
+            started_at: std::time::Instant::now(),
+            mic_muted: false,
+            cam_enabled,
+            is_incoming_ringing,
+            error_code: None,
+            error_reason: None,
+            speaker_view: false,
+            pinned_tile_idx: 0,
+            call_page: 0,
+            members_popover_open: false,
+            invite_search_query: String::new(),
+            quick_reply_popover_open: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ImageViewerModal {
     tex_key: String,
@@ -2255,6 +2289,124 @@ fn drain_frame_touched_textures() -> HashSet<String> {
     })
 }
 
+pub(super) const CALL_REMOTE_VIDEO_KEYS: [&str; 6] = [
+    "call_remote_video",
+    "call_remote_video_1",
+    "call_remote_video_2",
+    "call_remote_video_3",
+    "call_remote_video_4",
+    "call_remote_video_5",
+];
+
+/// Inserts or replaces a texture in both `textures` and `texture_lru`, protecting active call
+/// video frames from same-batch eviction before their first paint in `render_call_overlay`.
+pub(super) fn insert_texture_with_lru<T>(
+    textures: &mut HashMap<String, T>,
+    texture_lru: &mut crate::media_resources::ResourceLru,
+    last_frame_textures: &mut HashSet<String>,
+    key: String,
+    tex: T,
+    bytes: u64,
+    protect_call_frame: bool,
+) {
+    textures.insert(key.clone(), tex);
+    if protect_call_frame && key.starts_with("call_") {
+        mark_texture_used(&key);
+        last_frame_textures.insert(key.clone());
+    }
+    for evicted_key in texture_lru.insert_protecting(key, bytes, last_frame_textures) {
+        textures.remove(&evicted_key);
+    }
+}
+
+/// Removes a cached texture from `textures`, `texture_lru`, and `last_frame_textures`.
+pub(super) fn remove_cached_texture<T>(
+    textures: &mut HashMap<String, T>,
+    texture_lru: &mut crate::media_resources::ResourceLru,
+    last_frame_textures: &mut HashSet<String>,
+    key: &str,
+) {
+    textures.remove(key);
+    texture_lru.remove(key);
+    last_frame_textures.remove(key);
+}
+
+/// Clears remote call video textures (and local preview when `include_local` is true) from
+/// both `textures` and `texture_lru` so stale frame byte counts do not leak across calls.
+pub(super) fn clear_call_video_textures<T>(
+    textures: &mut HashMap<String, T>,
+    texture_lru: &mut crate::media_resources::ResourceLru,
+    last_frame_textures: &mut HashSet<String>,
+    include_local: bool,
+) {
+    for key in CALL_REMOTE_VIDEO_KEYS {
+        remove_cached_texture(textures, texture_lru, last_frame_textures, key);
+    }
+    if include_local {
+        remove_cached_texture(textures, texture_lru, last_frame_textures, "call_local_video");
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CameraReadiness {
+    Ready,
+    MissingFfmpeg,
+    NoCameraDevice,
+}
+
+/// Evaluates whether local camera capture is ready given FFmpeg availability and camera list.
+pub(super) fn evaluate_camera_readiness(ffmpeg_ok: bool, cams: &[String]) -> CameraReadiness {
+    if !ffmpeg_ok {
+        CameraReadiness::MissingFfmpeg
+    } else if cams.is_empty() {
+        CameraReadiness::NoCameraDevice
+    } else {
+        CameraReadiness::Ready
+    }
+}
+
+/// Computes the next `cam_enabled` state on camera toggle and returns the failure reason when
+/// enabling is blocked locally so callers skip redundant `SetCallMediaState(false)` signaling.
+pub(super) fn next_camera_toggle_state(
+    current_enabled: bool,
+    readiness: CameraReadiness,
+) -> (bool, Option<CameraReadiness>) {
+    if current_enabled {
+        (false, None)
+    } else if readiness == CameraReadiness::Ready {
+        (true, None)
+    } else {
+        (false, Some(readiness))
+    }
+}
+
+/// Computes initial `cam_enabled` for an incoming call without blocking the UI event loop.
+pub(super) fn incoming_initial_cam_enabled(
+    is_video: bool,
+    ffmpeg_ok: bool,
+    cams: &[String],
+    scanning: bool,
+) -> bool {
+    is_video && ffmpeg_ok && (scanning || !cams.is_empty())
+}
+
+/// Formats the call toolbar camera label without masking an empty camera list as an active default.
+pub(super) fn format_call_camera_label<'a>(
+    selected_camera: &'a str,
+    cams: &'a [String],
+    scanning: bool,
+) -> &'a str {
+    if !selected_camera.is_empty() {
+        selected_camera
+    } else if let Some(first) = cams.first() {
+        first.as_str()
+    } else if scanning {
+        "Đang quét…"
+    } else {
+        "Không có camera"
+    }
+}
+
 /// Queues a worker download for a sticker/avatar/thumbnail without borrowing the full `ZaloGuiApp`.
 pub(crate) fn queue_sticker_fetch(
     sticker_textures: &HashMap<String, TextureHandle>,
@@ -2280,6 +2432,68 @@ pub(crate) fn queue_sticker_fetch(
 }
 
 impl ZaloGuiApp {
+    /// Checks FFmpeg availability and discovered camera devices, displaying a distinct toast
+    /// when FFmpeg is absent versus when no local camera device is detected.
+    pub(super) fn probe_local_camera_readiness(&mut self, call_start: bool) -> CameraReadiness {
+        let ff_ok = crate::media::is_ffmpeg_available();
+        if !ff_ok {
+            let msg = if call_start {
+                "⚠️ Không tìm thấy ffmpeg để bật Camera (cài bằng: winget install Gyan.FFmpeg hoặc đặt FFMPEG_PATH)"
+            } else {
+                "⚠️ Cần cài đặt ffmpeg để bật Camera (winget install Gyan.FFmpeg hoặc đặt FFMPEG_PATH)"
+            };
+            self.show_toast(msg);
+            return CameraReadiness::MissingFfmpeg;
+        }
+        let (_, cams) = crate::media::list_media_devices(false);
+        let readiness = evaluate_camera_readiness(true, &cams);
+        if readiness == CameraReadiness::NoCameraDevice {
+            let _ = crate::media::list_media_devices_nonblocking(true);
+            let msg = if call_start {
+                "⚠️ Không phát hiện thiết bị Camera trên máy — đang gọi không hình"
+            } else {
+                "⚠️ Không tìm thấy thiết bị Camera nào trên máy (kiểm tra kết nối hoặc bấm Quét lại)"
+            };
+            self.show_toast(msg);
+        }
+        readiness
+    }
+
+    /// Initializes the call overlay and dispatches `WorkerCmd::StartCall` with consistent
+    /// camera readiness checks across header buttons and call-again bubble actions.
+    pub(super) fn start_outgoing_call(
+        &mut self,
+        partner_id: String,
+        partner_name: String,
+        is_video: bool,
+        is_group: bool,
+        state_label: String,
+    ) {
+        let can_cam = if is_video {
+            self.probe_local_camera_readiness(true) == CameraReadiness::Ready
+        } else {
+            false
+        };
+        self.active_call = Some(ActiveCallOverlay::new(
+            partner_id.clone(),
+            partner_name.clone(),
+            is_video,
+            is_group,
+            state_label,
+            can_cam,
+            false,
+        ));
+        if let Some(tx) = WORKER_TX.get() {
+            let _ = tx.send(WorkerCmd::StartCall {
+                partner_id,
+                partner_name,
+                partner_avatar: None,
+                is_video,
+                is_group,
+            });
+        }
+    }
+
     /// Ask the worker to save a photo/video into the OS Downloads folder, ignoring repeat
     /// clicks while the same URL is still being saved.
     pub(super) fn save_media(&mut self, url: String, file_name: String) {
@@ -4004,18 +4218,25 @@ impl ZaloGuiApp {
                         .saturating_mul(image.size[1] as u64)
                         .saturating_mul(4);
                     let tex = ctx.load_texture(&key, image, options);
-                    self.sticker_textures.insert(key.clone(), tex);
-                    for evicted_key in
-                        self.texture_lru
-                            .insert_protecting(key, bytes, &self.last_frame_textures)
-                    {
-                        self.sticker_textures.remove(&evicted_key);
-                    }
+                    insert_texture_with_lru(
+                        &mut self.sticker_textures,
+                        &mut self.texture_lru,
+                        &mut self.last_frame_textures,
+                        key,
+                        tex,
+                        bytes,
+                        self.active_call.is_some(),
+                    );
                 }
                 GuiEvent::StickerImageFailed { key } => {
                     self.loading_stickers.remove(&key);
                     if key.starts_with("call_remote_video") {
-                        self.sticker_textures.remove(&key);
+                        remove_cached_texture(
+                            &mut self.sticker_textures,
+                            &mut self.texture_lru,
+                            &mut self.last_frame_textures,
+                            &key,
+                        );
                         ctx.request_repaint();
                     } else {
                         record_sticker_fetch_failure(
@@ -4232,17 +4453,18 @@ impl ZaloGuiApp {
                             .as_ref()
                             .and_then(|c| c.error_reason.as_ref())
                             .is_some();
-                        self.sticker_textures.remove("call_remote_video");
-                        self.sticker_textures.remove("call_remote_video_1");
-                        self.sticker_textures.remove("call_remote_video_2");
-                        self.sticker_textures.remove("call_remote_video_3");
-                        self.sticker_textures.remove("call_remote_video_4");
-                        self.sticker_textures.remove("call_remote_video_5");
-                        self.sticker_textures.remove("call_local_video");
+                        clear_call_video_textures(
+                            &mut self.sticker_textures,
+                            &mut self.texture_lru,
+                            &mut self.last_frame_textures,
+                            true,
+                        );
                         if !has_error {
                             self.active_call = None;
                         }
                     } else if let Some(ref mut call) = self.active_call {
+                        let was_connected =
+                            call.state_label == "Đang trong cuộc gọi (Pure-Rust VoIP)";
                         if state == "incall" || state == "connected" {
                             call.is_incoming_ringing = false;
                         }
@@ -4256,6 +4478,18 @@ impl ZaloGuiApp {
                                 }
                                 _ => format!("Đang kết nối ({state})…"),
                             };
+                        }
+                        if (state == "incall" || state == "connected")
+                            && !was_connected
+                            && call.is_video
+                            && !call.cam_enabled
+                        {
+                            if let Some(tx) = WORKER_TX.get() {
+                                let _ = tx.send(WorkerCmd::SetCallMediaState {
+                                    is_on_mic: !call.mic_muted,
+                                    is_on_cam: false,
+                                });
+                            }
                         }
                     }
                 }
@@ -4276,25 +4510,22 @@ impl ZaloGuiApp {
                         "📲 Cuộc gọi {} đến từ {resolved_name}…",
                         if is_video { "video" } else { "thoại" }
                     );
-                    self.active_call = Some(ActiveCallOverlay {
-                        partner_id: caller_id,
-                        partner_name: resolved_name,
+                    let cam_enabled = if is_video && crate::media::is_ffmpeg_available() {
+                        let (_, cams, scanning) =
+                            crate::media::list_media_devices_nonblocking(false);
+                        incoming_initial_cam_enabled(true, true, &cams, scanning)
+                    } else {
+                        false
+                    };
+                    self.active_call = Some(ActiveCallOverlay::new(
+                        caller_id,
+                        resolved_name,
                         is_video,
                         is_group,
-                        state_label: "Cuộc gọi đến đang đổ chuông…".into(),
-                        started_at: std::time::Instant::now(),
-                        mic_muted: false,
-                        cam_enabled: is_video,
-                        is_incoming_ringing: true,
-                        error_code: None,
-                        error_reason: None,
-                        speaker_view: false,
-                        pinned_tile_idx: 0,
-                        call_page: 0,
-                        members_popover_open: false,
-                        invite_search_query: String::new(),
-                        quick_reply_popover_open: false,
-                    });
+                        "Cuộc gọi đến đang đổ chuông…".into(),
+                        cam_enabled,
+                        true,
+                    ));
                     ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
                         egui::UserAttentionType::Critical,
                     ));
@@ -6987,6 +7218,175 @@ mod tests {
         assert!((fast_scroll.normalized_scroll_speed() - 4.0).abs() < f32::EPSILON);
         fast_scroll.scroll_speed = -1.0;
         assert!((fast_scroll.normalized_scroll_speed() - 2.2).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn call_video_textures_stay_protected_under_lru_pressure_and_clear_accounting() {
+        let _ = super::drain_frame_touched_textures();
+        let mut textures: std::collections::HashMap<String, ()> =
+            std::collections::HashMap::new();
+        let mut lru = crate::media_resources::ResourceLru::new(100);
+        let mut last_frame = std::collections::HashSet::new();
+
+        super::insert_texture_with_lru(
+            &mut textures,
+            &mut lru,
+            &mut last_frame,
+            "call_remote_video".to_string(),
+            (),
+            55,
+            true,
+        );
+        super::insert_texture_with_lru(
+            &mut textures,
+            &mut lru,
+            &mut last_frame,
+            "call_local_video".to_string(),
+            (),
+            40,
+            true,
+        );
+        assert!(textures.contains_key("call_remote_video"));
+        assert!(textures.contains_key("call_local_video"));
+        assert_eq!(lru.used(), 95);
+
+        let touched_frame1 = super::drain_frame_touched_textures();
+        assert!(touched_frame1.contains("call_remote_video"));
+        assert!(touched_frame1.contains("call_local_video"));
+        last_frame = touched_frame1;
+
+        super::insert_texture_with_lru(
+            &mut textures,
+            &mut lru,
+            &mut last_frame,
+            "old_avatar".to_string(),
+            (),
+            30,
+            false,
+        );
+        assert!(textures.contains_key("old_avatar"));
+        assert!(textures.contains_key("call_remote_video"));
+        assert!(textures.contains_key("call_local_video"));
+        assert_eq!(lru.used(), 125);
+
+        super::insert_texture_with_lru(
+            &mut textures,
+            &mut lru,
+            &mut last_frame,
+            "new_sticker".to_string(),
+            (),
+            20,
+            false,
+        );
+        assert!(textures.contains_key("call_remote_video"));
+        assert!(textures.contains_key("call_local_video"));
+        assert!(!textures.contains_key("old_avatar"));
+        assert!(textures.contains_key("new_sticker"));
+        assert_eq!(lru.used(), 115);
+
+        super::remove_cached_texture(
+            &mut textures,
+            &mut lru,
+            &mut last_frame,
+            "new_sticker",
+        );
+        assert_eq!(lru.used(), 95);
+
+        super::mark_texture_used("call_remote_video");
+        super::mark_texture_used("call_local_video");
+        let touched_frame2 = super::drain_frame_touched_textures();
+        for k in &touched_frame2 {
+            lru.touch(k);
+        }
+        last_frame = touched_frame2;
+
+        super::insert_texture_with_lru(
+            &mut textures,
+            &mut lru,
+            &mut last_frame,
+            "call_remote_video_1".to_string(),
+            (),
+            30,
+            true,
+        );
+        assert!(textures.contains_key("call_remote_video"));
+        assert!(textures.contains_key("call_local_video"));
+        assert!(textures.contains_key("call_remote_video_1"));
+        assert_eq!(lru.used(), 125);
+
+        super::remove_cached_texture(
+            &mut textures,
+            &mut lru,
+            &mut last_frame,
+            "call_local_video",
+        );
+        assert!(!textures.contains_key("call_local_video"));
+        assert!(!last_frame.contains("call_local_video"));
+        assert_eq!(lru.used(), 85);
+
+        super::clear_call_video_textures(&mut textures, &mut lru, &mut last_frame, true);
+        assert!(textures.is_empty());
+        assert!(last_frame.is_empty());
+        assert_eq!(lru.used(), 0);
+    }
+
+    #[test]
+    fn camera_readiness_toggle_and_label_helpers_handle_missing_ffmpeg_and_empty_devices() {
+        let no_cams: Vec<String> = Vec::new();
+        let cams = vec!["Integrated Webcam".to_string()];
+
+        assert_eq!(
+            super::evaluate_camera_readiness(false, &cams),
+            super::CameraReadiness::MissingFfmpeg
+        );
+        assert_eq!(
+            super::evaluate_camera_readiness(true, &no_cams),
+            super::CameraReadiness::NoCameraDevice
+        );
+        assert_eq!(
+            super::evaluate_camera_readiness(true, &cams),
+            super::CameraReadiness::Ready
+        );
+
+        assert_eq!(
+            super::next_camera_toggle_state(false, super::CameraReadiness::MissingFfmpeg),
+            (false, Some(super::CameraReadiness::MissingFfmpeg))
+        );
+        assert_eq!(
+            super::next_camera_toggle_state(false, super::CameraReadiness::NoCameraDevice),
+            (false, Some(super::CameraReadiness::NoCameraDevice))
+        );
+        assert_eq!(
+            super::next_camera_toggle_state(false, super::CameraReadiness::Ready),
+            (true, None)
+        );
+        assert_eq!(
+            super::next_camera_toggle_state(true, super::CameraReadiness::MissingFfmpeg),
+            (false, None)
+        );
+
+        assert!(!super::incoming_initial_cam_enabled(true, false, &cams, false));
+        assert!(!super::incoming_initial_cam_enabled(true, true, &no_cams, false));
+        assert!(super::incoming_initial_cam_enabled(true, true, &no_cams, true));
+        assert!(super::incoming_initial_cam_enabled(true, true, &cams, false));
+        assert!(!super::incoming_initial_cam_enabled(false, true, &cams, false));
+
+        assert_eq!(
+            super::format_call_camera_label("", &no_cams, true),
+            "Đang quét…"
+        );
+        assert_eq!(
+            super::format_call_camera_label("", &no_cams, false),
+            "Không có camera"
+        );
+        assert_eq!(
+            super::format_call_camera_label("", &cams, false),
+            "Integrated Webcam"
+        );
+        assert_eq!(
+            super::format_call_camera_label("USB Cam", &cams, false),
+            "USB Cam"
+        );
     }
 }
 
