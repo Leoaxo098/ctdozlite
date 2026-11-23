@@ -1152,6 +1152,7 @@ struct PureRustCallState {
     partner_id: String,
     partner_name: String,
     is_video: bool,
+    cam_enabled: bool,
     is_group: bool,
     is_caller: bool,
     is_connected: bool,
@@ -1216,6 +1217,12 @@ impl Drop for PureRustCallState {
             let _ = tx.send(true);
         }
     }
+}
+
+/// Return true only when an active call already has a connected relay endpoint and RTP socket,
+/// preventing `SetMediaState` from spawning `MediaHandle` with empty addresses and `None` sockets.
+fn can_upgrade_call_media(st: &PureRustCallState) -> bool {
+    st.is_connected && !st.rtp_ip.trim().is_empty() && st.udp_rtp_sock.is_some()
 }
 
 /// Convert a decimal 64-bit Zalo user ID string to the lower 32-bit `u32` ID used in ZRTP UDP headers (`std::stoull` cast to `uint32_t`).
@@ -2110,7 +2117,7 @@ pub fn build_pure_rust_invite_fields_with_probe(
         "srtcp": 0,
         "srtpMode": 0,
         "supportCallBusy": 1,
-        "supportHevcDecode": if crate::media::is_ffmpeg_available() { 1 } else { 0 },
+        "supportHevcDecode": 0,
         "tpType": 0,
         "video": {
             "codec": [
@@ -2184,7 +2191,7 @@ pub fn build_callee_extend_data(
         "srtcp": 0,
         "srtpMode": 0,
         "supportCallBusy": 1,
-        "supportHevcDecode": if crate::media::is_ffmpeg_available() { 1 } else { 0 },
+        "supportHevcDecode": 0,
         "tpType": 0,
         "video": {
             "codec": [
@@ -2652,6 +2659,7 @@ impl CallBridge {
                                             partner_id,
                                             partner_name: grp_name.clone(),
                                             is_video,
+                                            cam_enabled: is_video,
                                             is_group: true,
                                             is_caller: true,
                                             is_connected: false,
@@ -2925,6 +2933,7 @@ impl CallBridge {
                                 partner_id: primary.partner_id.clone(),
                                 partner_name: partner_name.clone(),
                                 is_video,
+                                cam_enabled: is_video,
                                 is_group,
                                 is_caller: true,
                                 is_connected: false,
@@ -3221,6 +3230,7 @@ impl CallBridge {
                                     ) {
                                         Ok(m) => {
                                             if cam_start_off {
+                                                st.cam_enabled = false;
                                                 m.set_cam_enabled(false);
                                             }
                                             st.media = Some(m);
@@ -3356,16 +3366,25 @@ impl CallBridge {
                         let mut guard = active_call.lock().await;
                         if let Some(ref mut st) = *guard {
                             st.is_video = st.is_video || is_on_cam;
-                            if st.media.is_none() && is_on_cam {
+                            st.cam_enabled = is_on_cam;
+                            if st.media.is_none()
+                                && is_on_cam
+                                && can_upgrade_call_media(st)
+                            {
+                                let rtcp_addr = if st.rtcp_ip.trim().is_empty() {
+                                    st.rtp_ip.clone()
+                                } else {
+                                    st.rtcp_ip.clone()
+                                };
                                 st.media = crate::media::MediaHandle::start_with_sockets(
-                                    String::new(),
-                                    String::new(),
+                                    st.rtp_ip.clone(),
+                                    rtcp_addr,
                                     st.from_uid_u32,
                                     st.partner_uid_u32,
                                     st.is_caller,
                                     st.relay_token,
-                                    None,
-                                    None,
+                                    st.udp_rtp_sock.clone(),
+                                    st.udp_rtcp_sock.clone(),
                                     0,
                                     true,
                                     Some(gui_tx.clone()),
@@ -4095,6 +4114,9 @@ impl CallBridge {
                                                 Some(egui_ctx.clone()),
                                             ) {
                                                 Ok(m) => {
+                                                    if !st.cam_enabled {
+                                                        m.set_cam_enabled(false);
+                                                    }
                                                     st.media = Some(m);
                                                 }
                                                 Err(e) => {
@@ -4110,6 +4132,7 @@ impl CallBridge {
                                         let call_id = st.call_id;
                                         let callee_id = st.partner_id.clone();
                                         let is_vid_now = st.is_video;
+                                        let cam_now = st.cam_enabled;
                                         let group_host_now = st.group_host_call.clone();
                                         let self_uid32_now = st.from_uid_u32;
                                         if is_group_call {
@@ -4124,7 +4147,7 @@ impl CallBridge {
                                                     "userId": self_uid32_now as u64,
                                                     "callState": 3,
                                                     "audioState": 1,
-                                                    "videoState": if is_vid_now { 1 } else { 0 },
+                                                    "videoState": if is_vid_now && cam_now { 1 } else { 0 },
                                                     "params": ""
                                                 });
                                                 let _ = dispatch_send_signal(
@@ -4145,7 +4168,7 @@ impl CallBridge {
                                                     let req_12006 = json!({
                                                         "calleeId": callee_id,
                                                         "callId": call_id,
-                                                        "isOnCam": 1,
+                                                        "isOnCam": if cam_now { 1 } else { 0 },
                                                         "isOnMic": 1,
                                                         "data": ""
                                                     });
@@ -4577,6 +4600,7 @@ impl CallBridge {
                                             partner_id: caller_id.clone(),
                                             partner_name: caller_name.clone(),
                                             is_video,
+                                            cam_enabled: is_video,
                                             is_group,
                                             is_caller: false,
                                             is_connected: false,
@@ -5454,5 +5478,75 @@ mod tests {
             !got_connected,
             "Call must not connect on intermediate status 5"
         );
+    }
+
+    #[test]
+    fn invite_and_answer_extend_data_disable_hevc_until_hevc_decoder_exists() {
+        let (_, _, _, _, invite_ext) = build_pure_rust_invite_fields(&json!({}), true);
+        let invite_json: Value =
+            serde_json::from_str(invite_ext.trim()).expect("invite extendData JSON");
+        assert_eq!(invite_json["supportHevcDecode"], 0);
+        assert_eq!(invite_json["video"]["codec"][0]["name"], "h264");
+        assert_eq!(invite_json["video"]["codec"][0]["payload"], 97);
+
+        let callee_ext =
+            build_callee_extend_data("1.2.3.4:4200", "1.2.3.4:4200", true, Some(60000), None);
+        let callee_json: Value =
+            serde_json::from_str(callee_ext.trim()).expect("callee extendData JSON");
+        assert_eq!(callee_json["supportHevcDecode"], 0);
+        assert_eq!(callee_json["video"]["codec"][0]["name"], "h264");
+        assert_eq!(callee_json["video"]["codec"][0]["payload"], 97);
+    }
+
+    #[tokio::test]
+    async fn can_upgrade_call_media_requires_connected_nonempty_relay_and_socket() {
+        let mut st = PureRustCallState {
+            call_id: 1,
+            thread_id: "u1".into(),
+            partner_id: "u1".into(),
+            partner_name: "Peer".into(),
+            is_video: false,
+            cam_enabled: false,
+            is_group: false,
+            is_caller: true,
+            is_connected: false,
+            started_at: std::time::Instant::now(),
+            sess_id: "sess".into(),
+            rtp_ip: String::new(),
+            rtcp_ip: String::new(),
+            extend_data: String::new(),
+            from_uid_u32: 10,
+            partner_uid_u32: 20,
+            relay_token: 30,
+            group_id_u32: 0,
+            group_host_call: String::new(),
+            group_partners_str: String::new(),
+            group_pending_uids: Vec::new(),
+            group_active_uids: Vec::new(),
+            server_tokens: BTreeMap::new(),
+            udp_rtp_sock: None,
+            udp_rtcp_sock: None,
+            keepalive_abort: None,
+            audio: None,
+            media: None,
+            extra_legs: Vec::new(),
+            invite_payload: Value::Null,
+            ringing_sent: false,
+        };
+        assert!(!can_upgrade_call_media(&st));
+
+        st.is_connected = true;
+        assert!(!can_upgrade_call_media(&st));
+
+        st.rtp_ip = "127.0.0.1:4200".into();
+        assert!(!can_upgrade_call_media(&st));
+
+        let sock = Arc::new(
+            tokio::net::UdpSocket::bind("127.0.0.1:0")
+                .await
+                .expect("bind test udp socket"),
+        );
+        st.udp_rtp_sock = Some(sock);
+        assert!(can_upgrade_call_media(&st));
     }
 }

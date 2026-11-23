@@ -89,22 +89,240 @@ pub fn selected_camera_device() -> String {
         .unwrap_or_default()
 }
 
-/// Check whether `ffmpeg` is installed and reachable in `PATH` (cached after first probe).
-pub fn is_ffmpeg_available() -> bool {
-    static FFMPEG_OK: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        let mut cmd = std::process::Command::new("ffmpeg");
-        cmd.arg("-version")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-        #[cfg(target_os = "windows")]
-        {
-            use std::os::windows::process::CommandExt;
-            cmd.creation_flags(0x08000000);
+static VERIFIED_FFMPEG_EXE: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
+
+#[cfg(target_os = "windows")]
+const FFMPEG_BIN_NAME: &str = "ffmpeg.exe";
+#[cfg(not(target_os = "windows"))]
+const FFMPEG_BIN_NAME: &str = "ffmpeg";
+
+fn is_usable_ffmpeg_file(path: &std::path::Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if (meta.permissions().mode() & 0o111) == 0 {
+            return false;
         }
-        cmd.status().map(|s| s.success()).unwrap_or(false)
-    });
-    *FFMPEG_OK
+    }
+    true
+}
+
+fn scan_winget_gyan_ffmpeg(local_app_data: &std::path::Path) -> Option<std::path::PathBuf> {
+    let pkgs = local_app_data.join("Microsoft").join("WinGet").join("Packages");
+    let entries = std::fs::read_dir(&pkgs).ok()?;
+    for entry in entries.take(64).flatten() {
+        let name = entry.file_name();
+        let name_lossy = name.to_string_lossy();
+        if !name_lossy.to_ascii_lowercase().starts_with("gyan.ffmpeg") {
+            continue;
+        }
+        let pkg_dir = entry.path();
+        let direct = pkg_dir.join("bin").join("ffmpeg.exe");
+        if is_usable_ffmpeg_file(&direct) {
+            return Some(direct);
+        }
+        if let Ok(sub_entries) = std::fs::read_dir(&pkg_dir) {
+            for sub in sub_entries.take(16).flatten() {
+                let candidate = sub.path().join("bin").join("ffmpeg.exe");
+                if is_usable_ffmpeg_file(&candidate) {
+                    return Some(candidate);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn resolve_ffmpeg_exe_with(
+    env_overrides: &[Option<std::ffi::OsString>],
+    exe_dir: Option<&std::path::Path>,
+    path_env: Option<&std::ffi::OsStr>,
+    win_userprofile: Option<&std::path::Path>,
+    win_localappdata: Option<&std::path::Path>,
+    win_programdata: Option<&std::path::Path>,
+    win_programfiles: Option<&std::path::Path>,
+    win_programfiles_x86: Option<&std::path::Path>,
+    include_system_fallbacks: bool,
+) -> Option<std::path::PathBuf> {
+    for raw_opt in env_overrides {
+        if let Some(raw) = raw_opt {
+            let trimmed = raw.to_string_lossy().trim().trim_matches('"').to_string();
+            if !trimmed.is_empty() {
+                let p = std::path::PathBuf::from(trimmed);
+                if is_usable_ffmpeg_file(&p) {
+                    return Some(p);
+                }
+            }
+        }
+    }
+
+    if let Some(dir) = exe_dir {
+        for cand in [dir.join(FFMPEG_BIN_NAME), dir.join("bin").join(FFMPEG_BIN_NAME)] {
+            if is_usable_ffmpeg_file(&cand) {
+                return Some(cand);
+            }
+        }
+    }
+
+    if let Some(pv) = path_env {
+        for dir in std::env::split_paths(pv) {
+            if dir.as_os_str().is_empty() {
+                continue;
+            }
+            let cand = dir.join(FFMPEG_BIN_NAME);
+            if is_usable_ffmpeg_file(&cand) {
+                return Some(cand);
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(up) = win_userprofile {
+            for cand in [
+                up.join("scoop").join("apps").join("ffmpeg").join("current").join("bin").join("ffmpeg.exe"),
+                up.join("scoop").join("shims").join("ffmpeg.exe"),
+            ] {
+                if is_usable_ffmpeg_file(&cand) {
+                    return Some(cand);
+                }
+            }
+        }
+        if let Some(la) = win_localappdata {
+            let link = la.join("Microsoft").join("WinGet").join("Links").join("ffmpeg.exe");
+            if is_usable_ffmpeg_file(&link) {
+                return Some(link);
+            }
+            if let Some(found) = scan_winget_gyan_ffmpeg(la) {
+                return Some(found);
+            }
+        }
+        if let Some(pd) = win_programdata {
+            let choco = pd.join("chocolatey").join("bin").join("ffmpeg.exe");
+            if is_usable_ffmpeg_file(&choco) {
+                return Some(choco);
+            }
+        }
+        if let Some(pf) = win_programfiles {
+            let cand = pf.join("ffmpeg").join("bin").join("ffmpeg.exe");
+            if is_usable_ffmpeg_file(&cand) {
+                return Some(cand);
+            }
+        }
+        if let Some(pf86) = win_programfiles_x86 {
+            let cand = pf86.join("ffmpeg").join("bin").join("ffmpeg.exe");
+            if is_usable_ffmpeg_file(&cand) {
+                return Some(cand);
+            }
+        }
+        if include_system_fallbacks {
+            let root_cand = std::path::Path::new(r"C:\ffmpeg\bin\ffmpeg.exe");
+            if is_usable_ffmpeg_file(root_cand) {
+                return Some(root_cand.to_path_buf());
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (
+            win_userprofile,
+            win_localappdata,
+            win_programdata,
+            win_programfiles,
+            win_programfiles_x86,
+        );
+        if include_system_fallbacks {
+            for cand in [
+                "/opt/homebrew/bin/ffmpeg",
+                "/usr/local/bin/ffmpeg",
+                "/usr/bin/ffmpeg",
+            ] {
+                let p = std::path::Path::new(cand);
+                if is_usable_ffmpeg_file(p) {
+                    return Some(p.to_path_buf());
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Resolve the `ffmpeg` executable path from env overrides, sibling binaries, `PATH`, and OS fallbacks.
+pub fn resolve_ffmpeg_exe() -> Option<std::path::PathBuf> {
+    let env_overrides = [
+        std::env::var_os("FFMPEG_PATH"),
+        std::env::var_os("CTDOZLITE_FFMPEG"),
+    ];
+    let current_exe = std::env::current_exe().ok();
+    let exe_dir = current_exe.as_deref().and_then(|p| p.parent());
+    let path_env = std::env::var_os("PATH");
+    let win_userprofile = std::env::var_os("USERPROFILE").map(std::path::PathBuf::from);
+    let win_localappdata = std::env::var_os("LOCALAPPDATA").map(std::path::PathBuf::from);
+    let win_programdata = std::env::var_os("ProgramData").map(std::path::PathBuf::from);
+    let win_programfiles = std::env::var_os("ProgramFiles").map(std::path::PathBuf::from);
+    let win_programfiles_x86 = std::env::var_os("ProgramFiles(x86)").map(std::path::PathBuf::from);
+    resolve_ffmpeg_exe_with(
+        &env_overrides,
+        exe_dir,
+        path_env.as_deref(),
+        win_userprofile.as_deref(),
+        win_localappdata.as_deref(),
+        win_programdata.as_deref(),
+        win_programfiles.as_deref(),
+        win_programfiles_x86.as_deref(),
+        true,
+    )
+}
+
+/// Build a `Command` targeting the resolved `ffmpeg` binary (suppressing console flash on Windows).
+pub fn ffmpeg_command() -> std::process::Command {
+    let mut cmd = match resolve_ffmpeg_exe() {
+        Some(path) => std::process::Command::new(path),
+        None => std::process::Command::new("ffmpeg"),
+    };
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000);
+    }
+    cmd
+}
+
+/// Check whether `ffmpeg` is available and passes `-version` (caches only verified path, never poisons missing).
+pub fn is_ffmpeg_available() -> bool {
+    let Some(exe) = resolve_ffmpeg_exe() else {
+        return false;
+    };
+    if let Ok(g) = VERIFIED_FFMPEG_EXE.lock() {
+        if g.as_ref() == Some(&exe) {
+            return true;
+        }
+    }
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.arg("-version")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000);
+    }
+    let ok = cmd.status().map(|s| s.success()).unwrap_or(false);
+    if ok {
+        if let Ok(mut g) = VERIFIED_FFMPEG_EXE.lock() {
+            *g = Some(exe);
+        }
+    }
+    ok
 }
 fn probe_media_devices_sync() -> (Vec<String>, Vec<String>) {
     let mut mics = Vec::new();
@@ -183,8 +401,7 @@ pub fn list_media_devices_nonblocking(refresh: bool) -> (Vec<String>, Vec<String
 fn enumerate_ffmpeg_cameras() -> Vec<String> {
     #[cfg(target_os = "windows")]
     {
-        use std::os::windows::process::CommandExt;
-        let mut cmd = std::process::Command::new("ffmpeg");
+        let mut cmd = ffmpeg_command();
         cmd.args([
             "-hide_banner",
             "-list_devices",
@@ -193,8 +410,7 @@ fn enumerate_ffmpeg_cameras() -> Vec<String> {
             "dshow",
             "-i",
             "dummy",
-        ])
-        .creation_flags(0x08000000);
+        ]);
         if let Ok(out) = cmd.output() {
             let stderr = String::from_utf8_lossy(&out.stderr);
             let mut cams = Vec::new();
@@ -239,7 +455,7 @@ fn enumerate_ffmpeg_cameras() -> Vec<String> {
     }
     #[cfg(target_os = "macos")]
     {
-        let mut cmd = std::process::Command::new("ffmpeg");
+        let mut cmd = ffmpeg_command();
         cmd.args([
             "-hide_banner",
             "-f",
@@ -1017,6 +1233,46 @@ fn build_zrtp_incall_negotiate_packet(call_id: u32, relay_token: u32, nego_seq: 
     pkt
 }
 
+/// Choose the active capture camera device, falling back to the first non-failed enumerated camera
+/// when `selected` is empty or refers to a disconnected device.
+pub fn resolve_capture_camera_device(
+    selected: &str,
+    cams: &[String],
+    failed: &[String],
+) -> Option<String> {
+    let sel = selected.trim();
+    if !sel.is_empty()
+        && !failed.iter().any(|f| f == sel)
+        && (cams.is_empty() || cams.iter().any(|c| c == sel))
+    {
+        return Some(sel.to_string());
+    }
+    cams.iter().find(|c| !failed.iter().any(|f| f == *c)).cloned()
+}
+
+fn spawn_ffmpeg_stderr_logger(tag: &'static str, stderr: Option<std::process::ChildStderr>) {
+    let Some(mut err) = stderr else {
+        return;
+    };
+    thread::spawn(move || {
+        use std::io::Read;
+        let mut buf = [0u8; 512];
+        let mut chunks = 0u32;
+        while let Ok(n) = err.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            chunks += 1;
+            if chunks <= 20 {
+                let text = String::from_utf8_lossy(&buf[..n]).trim().to_string();
+                if !text.is_empty() {
+                    crate::voip_log::line(tag, format!("ffmpeg: {text}"));
+                }
+            }
+        }
+    });
+}
+
 /// Spawn a background webcam capture thread via `ffmpeg -f dshow` (on Windows) that encodes live 320x240 15fps
 /// Constrained Baseline H.264 access units for RTP transmission AND decodes a local PIP preview for the call window.
 fn spawn_camera_capture_thread(
@@ -1029,7 +1285,7 @@ fn spawn_camera_capture_thread(
 ) {
     thread::spawn(move || {
         use std::io::Read;
-        use std::process::{Command, Stdio};
+        use std::process::Stdio;
 
         let mut current_dev = String::new();
         let mut child_opt: Option<std::process::Child> = None;
@@ -1037,6 +1293,7 @@ fn spawn_camera_capture_thread(
         let mut read_buf = [0u8; 8192];
         let mut stream_acc: Vec<u8> = Vec::with_capacity(65536);
         let mut warned_missing = false;
+        let mut refreshed_empty_cams = false;
 
         // Optional local preview decoder (`ffmpeg` H.264 -> 240x180 RGBA)
         let (prev_tx, prev_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(15);
@@ -1051,6 +1308,7 @@ fn spawn_camera_capture_thread(
             if !cam_enabled.load(Ordering::Relaxed) {
                 if let Some(mut c) = child_opt.take() {
                     let _ = c.kill();
+                    let _ = c.wait();
                 }
                 thread::sleep(Duration::from_millis(80));
                 continue;
@@ -1061,7 +1319,7 @@ fn spawn_camera_capture_thread(
                     warned_missing = true;
                     crate::voip_log::line(
                         "VCAM",
-                        "ffmpeg not found in PATH; camera capture unavailable",
+                        "ffmpeg not found in PATH or standard install dirs; camera capture unavailable",
                     );
                     if let Some(ref gtx) = gui_tx {
                         let _ = gtx.send(crate::gui::GuiEvent::StatusUpdate(
@@ -1078,18 +1336,17 @@ fn spawn_camera_capture_thread(
 
             let desired = {
                 let sel = selected_camera_device();
-                if !sel.is_empty() && !failed_devs.contains(&sel) {
-                    sel
-                } else {
-                    let (_, cams) = list_media_devices(false);
-                    cams.into_iter()
-                        .find(|c| !failed_devs.contains(c))
-                        .unwrap_or_default()
+                let (_, mut cams) = list_media_devices(false);
+                if cams.is_empty() && !refreshed_empty_cams {
+                    refreshed_empty_cams = true;
+                    cams = list_media_devices(true).1;
                 }
+                resolve_capture_camera_device(&sel, &cams, &failed_devs).unwrap_or_default()
             };
             if desired.is_empty() {
                 if !warned_missing {
                     warned_missing = true;
+                    crate::voip_log::line("VCAM", "no available camera device found");
                     if let Some(ref gtx) = gui_tx {
                         let _ = gtx.send(crate::gui::GuiEvent::StatusUpdate(
                             "⚠️ Không tìm thấy thiết bị Camera khả dụng trên máy".into(),
@@ -1106,11 +1363,12 @@ fn spawn_camera_capture_thread(
             if child_opt.is_none() || current_dev != desired {
                 if let Some(mut c) = child_opt.take() {
                     let _ = c.kill();
+                    let _ = c.wait();
                 }
                 current_dev = desired.clone();
                 stream_acc.clear();
 
-                let mut cmd = Command::new("ffmpeg");
+                let mut cmd = ffmpeg_command();
                 cmd.args(["-hide_banner", "-loglevel", "error"]);
                 #[cfg(target_os = "windows")]
                 cmd.args([
@@ -1159,15 +1417,12 @@ fn spawn_camera_capture_thread(
                 ])
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
-                .stderr(Stdio::null());
-                #[cfg(target_os = "windows")]
-                {
-                    use std::os::windows::process::CommandExt;
-                    cmd.creation_flags(0x08000000);
-                }
+                .stderr(Stdio::piped());
 
                 match cmd.spawn() {
-                    Ok(c) => {
+                    Ok(mut c) => {
+                        warned_missing = false;
+                        spawn_ffmpeg_stderr_logger("VCAM", c.stderr.take());
                         crate::voip_log::line(
                             "VCAM",
                             format!("started webcam capture: {current_dev}"),
@@ -1180,6 +1435,9 @@ fn spawn_camera_capture_thread(
                             "VCAM",
                             format!("webcam spawn failed ({current_dev}): {e}"),
                         );
+                        if !current_dev.is_empty() && !failed_devs.contains(&current_dev) {
+                            failed_devs.push(current_dev.clone());
+                        }
                         thread::sleep(Duration::from_millis(500));
                         continue;
                     }
@@ -1196,6 +1454,7 @@ fn spawn_camera_capture_thread(
             match stdout.read(&mut read_buf) {
                 Ok(0) | Err(_) => {
                     let _ = child.kill();
+                    let status = child.wait().ok();
                     child_opt = None;
                     if stream_acc.is_empty()
                         && !current_dev.is_empty()
@@ -1204,10 +1463,15 @@ fn spawn_camera_capture_thread(
                         crate::voip_log::line(
                             "VCAM",
                             format!(
-                                "webcam device produced 0 bytes, marking failed: {current_dev}"
+                                "webcam device produced 0 bytes (exit={status:?}), marking failed: {current_dev}"
                             ),
                         );
                         failed_devs.push(current_dev.clone());
+                    } else if !stop.load(Ordering::Relaxed) && cam_enabled.load(Ordering::Relaxed) {
+                        crate::voip_log::line(
+                            "VCAM",
+                            format!("webcam ffmpeg stream closed unexpectedly (dev={current_dev}, exit={status:?})"),
+                        );
                     }
                     thread::sleep(Duration::from_millis(250));
                 }
@@ -1451,13 +1715,24 @@ fn run_local_preview_decoder(
     egui_ctx: eframe::egui::Context,
 ) {
     use std::io::{Read, Write};
-    use std::process::{Command, Stdio};
+    use std::process::Stdio;
 
     const PREV_W: usize = 240;
     const PREV_H: usize = 180;
     const PREV_BYTES: usize = PREV_W * PREV_H * 4;
 
-    let mut cmd = Command::new("ffmpeg");
+    let first_au = loop {
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(au) => break au,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+        }
+    };
+
+    let mut cmd = ffmpeg_command();
     cmd.args([
         "-hide_banner",
         "-loglevel",
@@ -1484,31 +1759,39 @@ fn run_local_preview_decoder(
     ])
     .stdin(Stdio::piped())
     .stdout(Stdio::piped())
-    .stderr(Stdio::null());
+    .stderr(Stdio::piped());
 
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x08000000);
-    }
-
-    let Ok(mut child) = cmd.spawn() else {
-        return;
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            crate::voip_log::line("LPDEC", format!("ffmpeg spawn failed: {e}"));
+            return;
+        }
     };
+    crate::voip_log::line("LPDEC", "ffmpeg local preview decoder started");
+    spawn_ffmpeg_stderr_logger("LPDEC", child.stderr.take());
     let Some(mut stdin) = child.stdin.take() else {
         let _ = child.kill();
+        let _ = child.wait();
         return;
     };
     let Some(mut stdout) = child.stdout.take() else {
         let _ = child.kill();
+        let _ = child.wait();
         return;
     };
     let stop_w = stop.clone();
     thread::spawn(move || {
+        if stdin.write_all(H264_AUD).is_err() || stdin.write_all(&first_au).is_err() {
+            crate::voip_log::line("LPDEC", "ffmpeg stdin failed on first AU");
+            return;
+        }
+        let _ = stdin.flush();
         while !stop_w.load(Ordering::Relaxed) {
             match rx.recv_timeout(Duration::from_millis(100)) {
                 Ok(au) => {
                     if stdin.write_all(H264_AUD).is_err() || stdin.write_all(&au).is_err() {
+                        crate::voip_log::line("LPDEC", "ffmpeg stdin closed while feeding AU");
                         break;
                     }
                     let _ = stdin.flush();
@@ -1530,10 +1813,14 @@ fn run_local_preview_decoder(
             });
             egui_ctx.request_repaint();
         } else {
+            if !stop.load(Ordering::Relaxed) {
+                crate::voip_log::line("LPDEC", "ffmpeg local preview stdout closed early");
+            }
             break;
         }
     }
     let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// Result counters of every UDP send. They used to be dropped silently (`let _ = try_send_to`) while the
@@ -1614,6 +1901,41 @@ fn extract_rtp_opus_payload(rtp: &[u8]) -> Option<&[u8]> {
         Some(&rtp[offset..end])
     } else {
         None
+    }
+}
+
+/// Choose the outbound H.264 access unit for one 66ms video TX tick.
+/// Returns `None` whenever `cam_enabled` is false so disabled cameras do not emit placeholder video.
+fn select_outbound_video_au(
+    cam_enabled: bool,
+    latest_cam_au: Option<Vec<u8>>,
+    has_live_cam_idr: bool,
+    force_kf: bool,
+    vid_gop_pos: &mut usize,
+    vid_idr_parity: &mut u8,
+) -> Option<Vec<u8>> {
+    if !cam_enabled {
+        return None;
+    }
+    if let Some(au) = latest_cam_au {
+        return Some(au);
+    }
+    if has_live_cam_idr {
+        return None;
+    }
+    let idr_nal = if (*vid_idr_parity & 1) == 0 {
+        H264_IDR
+    } else {
+        H264_IDR_ALT
+    };
+    let p_nal = H264_PSLICES[(*vid_gop_pos).min(H264_PSLICES.len() - 1)];
+    if force_kf {
+        *vid_idr_parity = vid_idr_parity.wrapping_add(1);
+        *vid_gop_pos = 0;
+        Some(annexb_au(&[H264_SPS, H264_PPS, idr_nal]))
+    } else {
+        *vid_gop_pos += 1;
+        Some(annexb_au(&[p_nal]))
     }
 }
 
@@ -1966,6 +2288,7 @@ fn run_media_loop(
             && last_video_tx.elapsed() >= Duration::from_millis(66)
         {
             last_video_tx = std::time::Instant::now();
+            let cam_on = cam_enabled.load(Ordering::Relaxed);
             let force_kf = vid_frame_no == 0
                 || vid_gop_pos >= H264_PSLICES.len()
                 || vid_frame_no % VIDEO_IDR_INTERVAL_FRAMES == 0
@@ -1974,12 +2297,16 @@ fn run_media_loop(
             // Drain latest live webcam access unit if available (or read shared webcam stream for extra legs)
             let mut latest_cam_au: Option<Vec<u8>> = None;
             while let Ok(au) = cam_au_rx.try_recv() {
-                if au_has_idr(&au) {
-                    last_cam_idr = Some(au.clone());
+                if cam_on {
+                    if au_has_idr(&au) {
+                        last_cam_idr = Some(au.clone());
+                    }
+                    latest_cam_au = Some(au);
                 }
-                latest_cam_au = Some(au);
             }
-            if latest_cam_au.is_none() && slot_idx > 0 {
+            if !cam_on {
+                last_cam_idr = None;
+            } else if latest_cam_au.is_none() && slot_idx > 0 {
                 if let Ok(sh) = SHARED_CAM_H264.lock() {
                     if !sh.2.is_empty() {
                         last_cam_idr = Some(sh.2.clone());
@@ -1990,45 +2317,14 @@ fn run_media_loop(
                     }
                 }
             }
-            let au_opt: Option<Vec<u8>> = if cam_enabled.load(Ordering::Relaxed) {
-                if let Some(au) = latest_cam_au {
-                    Some(au)
-                } else if last_cam_idr.is_some() {
-                    // Live webcam already started: never inject synthetic P-slices or stale IDR
-                    // into the active libx264 reference chain when a 66ms tick happens between webcam frames.
-                    None
-                } else {
-                    let idr_nal = if (vid_idr_parity & 1) == 0 {
-                        H264_IDR
-                    } else {
-                        H264_IDR_ALT
-                    };
-                    let p_nal = H264_PSLICES[vid_gop_pos.min(H264_PSLICES.len() - 1)];
-                    if force_kf {
-                        vid_idr_parity = vid_idr_parity.wrapping_add(1);
-                        vid_gop_pos = 0;
-                        Some(annexb_au(&[H264_SPS, H264_PPS, idr_nal]))
-                    } else {
-                        vid_gop_pos += 1;
-                        Some(annexb_au(&[p_nal]))
-                    }
-                }
-            } else {
-                let idr_nal = if (vid_idr_parity & 1) == 0 {
-                    H264_IDR
-                } else {
-                    H264_IDR_ALT
-                };
-                let p_nal = H264_PSLICES[vid_gop_pos.min(H264_PSLICES.len() - 1)];
-                if force_kf {
-                    vid_idr_parity = vid_idr_parity.wrapping_add(1);
-                    vid_gop_pos = 0;
-                    Some(annexb_au(&[H264_SPS, H264_PPS, idr_nal]))
-                } else {
-                    vid_gop_pos += 1;
-                    Some(annexb_au(&[p_nal]))
-                }
-            };
+            let au_opt = select_outbound_video_au(
+                cam_on,
+                latest_cam_au,
+                last_cam_idr.is_some(),
+                force_kf,
+                &mut vid_gop_pos,
+                &mut vid_idr_parity,
+            );
 
             if let Some(au_bytes) = au_opt {
                 let is_group_sfu = rtp_addr.ends_with(":3000") || rtcp_addr.ends_with(":3500");
@@ -2699,7 +2995,7 @@ fn run_h264_ffmpeg_decoder(
     tex_key: String,
 ) {
     use std::io::{Read, Write};
-    use std::process::{Child, Command, Stdio};
+    use std::process::{Child, Stdio};
     use std::sync::atomic::AtomicU64;
 
     const VID_W: usize = 640;
@@ -2707,7 +3003,7 @@ fn run_h264_ffmpeg_decoder(
     const FRAME_BYTES: usize = VID_W * VID_H * 4;
 
     fn spawn_ffmpeg_h264_child() -> Option<Child> {
-        let mut cmd = Command::new("ffmpeg");
+        let mut cmd = ffmpeg_command();
         cmd.args([
             "-hide_banner",
             "-loglevel",
@@ -2735,12 +3031,6 @@ fn run_h264_ffmpeg_decoder(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-
-        #[cfg(target_os = "windows")]
-        {
-            use std::os::windows::process::CommandExt;
-            cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
-        }
 
         match cmd.spawn() {
             Ok(c) => Some(c),
@@ -3437,6 +3727,288 @@ mod tests {
             t0.elapsed() < Duration::from_millis(100),
             "list_media_devices_nonblocking blocked UI thread for {:?}",
             t0.elapsed()
+        );
+    }
+
+    #[test]
+    fn resolve_ffmpeg_exe_search_order_and_fallbacks() {
+        struct TempRoot(std::path::PathBuf);
+        impl Drop for TempRoot {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        fn make_exe(path: &std::path::Path) {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(path, b"stub").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut perms = std::fs::metadata(path).unwrap().permissions();
+                perms.set_mode(0o755);
+                std::fs::set_permissions(path, perms).unwrap();
+            }
+        }
+
+        let root = TempRoot(
+            std::env::temp_dir().join(format!("zalo_ffmpeg_resolve_{}", std::process::id())),
+        );
+        let _ = std::fs::remove_dir_all(&root.0);
+        std::fs::create_dir_all(&root.0).unwrap();
+
+        let override_exe = root.0.join("override").join(FFMPEG_BIN_NAME);
+        let sibling_exe = root.0.join("app").join(FFMPEG_BIN_NAME);
+        let sibling_bin_exe = root.0.join("app").join("bin").join(FFMPEG_BIN_NAME);
+        let path_dir = root.0.join("path_dir");
+        let path_exe = path_dir.join(FFMPEG_BIN_NAME);
+        let scoop_root = root.0.join("userprofile");
+        let scoop_cur_exe = scoop_root
+            .join("scoop")
+            .join("apps")
+            .join("ffmpeg")
+            .join("current")
+            .join("bin")
+            .join("ffmpeg.exe");
+        let scoop_shim_exe = scoop_root.join("scoop").join("shims").join("ffmpeg.exe");
+        let local_app = root.0.join("localapp");
+        let winget_pkg_exe = local_app
+            .join("Microsoft")
+            .join("WinGet")
+            .join("Packages")
+            .join("Gyan.FFmpeg_Microsoft.Winget.Source_test")
+            .join("ffmpeg-8.1-full_build")
+            .join("bin")
+            .join("ffmpeg.exe");
+        let choco_root = root.0.join("programdata");
+        let choco_exe = choco_root
+            .join("chocolatey")
+            .join("bin")
+            .join("ffmpeg.exe");
+
+        make_exe(&choco_exe);
+        make_exe(&winget_pkg_exe);
+        make_exe(&scoop_shim_exe);
+        make_exe(&scoop_cur_exe);
+        make_exe(&path_exe);
+        make_exe(&sibling_bin_exe);
+        make_exe(&sibling_exe);
+        make_exe(&override_exe);
+
+        let path_val = std::env::join_paths([&path_dir]).unwrap();
+        let app_dir = root.0.join("app");
+
+        assert_eq!(
+            resolve_ffmpeg_exe_with(
+                &[Some(override_exe.as_os_str().to_os_string()), None],
+                Some(&app_dir),
+                Some(&path_val),
+                Some(&scoop_root),
+                Some(&local_app),
+                Some(&choco_root),
+                None,
+                None,
+                false,
+            ),
+            Some(override_exe.clone())
+        );
+
+        assert_eq!(
+            resolve_ffmpeg_exe_with(
+                &[None, None],
+                Some(&app_dir),
+                Some(&path_val),
+                Some(&scoop_root),
+                Some(&local_app),
+                Some(&choco_root),
+                None,
+                None,
+                false,
+            ),
+            Some(sibling_exe.clone())
+        );
+        let _ = std::fs::remove_file(&sibling_exe);
+        assert_eq!(
+            resolve_ffmpeg_exe_with(
+                &[None, None],
+                Some(&app_dir),
+                Some(&path_val),
+                Some(&scoop_root),
+                Some(&local_app),
+                Some(&choco_root),
+                None,
+                None,
+                false,
+            ),
+            Some(sibling_bin_exe.clone())
+        );
+        let _ = std::fs::remove_file(&sibling_bin_exe);
+
+        assert_eq!(
+            resolve_ffmpeg_exe_with(
+                &[None, None],
+                Some(&app_dir),
+                Some(&path_val),
+                Some(&scoop_root),
+                Some(&local_app),
+                Some(&choco_root),
+                None,
+                None,
+                false,
+            ),
+            Some(path_exe.clone())
+        );
+
+        #[cfg(target_os = "windows")]
+        {
+            assert_eq!(
+                resolve_ffmpeg_exe_with(
+                    &[None, None],
+                    None,
+                    None,
+                    Some(&scoop_root),
+                    Some(&local_app),
+                    Some(&choco_root),
+                    None,
+                    None,
+                    false,
+                ),
+                Some(scoop_cur_exe.clone())
+            );
+            let _ = std::fs::remove_file(&scoop_cur_exe);
+
+            assert_eq!(
+                resolve_ffmpeg_exe_with(
+                    &[None, None],
+                    None,
+                    None,
+                    Some(&scoop_root),
+                    Some(&local_app),
+                    Some(&choco_root),
+                    None,
+                    None,
+                    false,
+                ),
+                Some(scoop_shim_exe.clone())
+            );
+            let _ = std::fs::remove_file(&scoop_shim_exe);
+
+            assert_eq!(
+                resolve_ffmpeg_exe_with(
+                    &[None, None],
+                    None,
+                    None,
+                    Some(&scoop_root),
+                    Some(&local_app),
+                    Some(&choco_root),
+                    None,
+                    None,
+                    false,
+                ),
+                Some(winget_pkg_exe.clone())
+            );
+            let _ = std::fs::remove_file(&winget_pkg_exe);
+
+            assert_eq!(
+                resolve_ffmpeg_exe_with(
+                    &[None, None],
+                    None,
+                    None,
+                    Some(&scoop_root),
+                    Some(&local_app),
+                    Some(&choco_root),
+                    None,
+                    None,
+                    false,
+                ),
+                Some(choco_exe.clone())
+            );
+            let _ = std::fs::remove_file(&choco_exe);
+        }
+
+        assert_eq!(
+            resolve_ffmpeg_exe_with(
+                &[None, None],
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                false,
+            ),
+            None
+        );
+
+        let cmd = ffmpeg_command();
+        if let Some(resolved) = resolve_ffmpeg_exe() {
+            assert_eq!(std::path::PathBuf::from(cmd.get_program()), resolved);
+        } else {
+            assert_eq!(cmd.get_program(), std::ffi::OsStr::new("ffmpeg"));
+        }
+    }
+
+    #[test]
+    fn resolve_capture_camera_device_falls_back_when_empty_or_disconnected() {
+        let cams = vec!["Integrated Webcam".to_string(), "USB Cam".to_string()];
+        assert_eq!(
+            resolve_capture_camera_device("", &cams, &[]),
+            Some("Integrated Webcam".to_string())
+        );
+        assert_eq!(
+            resolve_capture_camera_device("Disconnected Cam", &cams, &[]),
+            Some("Integrated Webcam".to_string())
+        );
+        assert_eq!(
+            resolve_capture_camera_device("USB Cam", &cams, &[]),
+            Some("USB Cam".to_string())
+        );
+        assert_eq!(
+            resolve_capture_camera_device("USB Cam", &cams, &["USB Cam".to_string()]),
+            Some("Integrated Webcam".to_string())
+        );
+        assert_eq!(resolve_capture_camera_device("", &cams, &cams), None);
+    }
+
+    #[test]
+    fn select_outbound_video_au_stops_synthetic_frames_when_cam_disabled() {
+        let mut gop_pos = 0usize;
+        let mut idr_parity = 0u8;
+        assert_eq!(
+            select_outbound_video_au(false, None, false, true, &mut gop_pos, &mut idr_parity),
+            None
+        );
+        assert_eq!(
+            select_outbound_video_au(
+                false,
+                Some(vec![0, 0, 0, 1, 0x65]),
+                false,
+                true,
+                &mut gop_pos,
+                &mut idr_parity
+            ),
+            None
+        );
+        assert_eq!(
+            select_outbound_video_au(
+                true,
+                Some(vec![0, 0, 0, 1, 0x65, 0x88]),
+                false,
+                false,
+                &mut gop_pos,
+                &mut idr_parity
+            ),
+            Some(vec![0, 0, 0, 1, 0x65, 0x88])
+        );
+        assert_eq!(
+            select_outbound_video_au(true, None, true, true, &mut gop_pos, &mut idr_parity),
+            None
+        );
+        assert!(
+            select_outbound_video_au(true, None, false, true, &mut gop_pos, &mut idr_parity)
+                .is_some()
         );
     }
 }

@@ -5680,7 +5680,7 @@ fn decode_image_with_fallback(
 
 /// Transcode stdin media bytes to PNG via `ffmpeg` without flashing a console window on Windows.
 fn transcode_pipe_to_png_with_ffmpeg(bytes: &[u8], vf: Option<&str>) -> Option<Vec<u8>> {
-    let mut cmd = std::process::Command::new("ffmpeg");
+    let mut cmd = crate::media::ffmpeg_command();
     cmd.args(["-hide_banner", "-loglevel", "error", "-i", "pipe:0", "-vframes", "1"]);
     if let Some(filter) = vf {
         cmd.args(["-vf", filter]);
@@ -5689,11 +5689,6 @@ fn transcode_pipe_to_png_with_ffmpeg(bytes: &[u8], vf: Option<&str>) -> Option<V
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null());
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-    }
     let mut child = cmd.spawn().ok()?;
     use std::io::Write;
     if let Some(mut stdin) = child.stdin.take() {
