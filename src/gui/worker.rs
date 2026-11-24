@@ -890,9 +890,8 @@ fn abort_pending_login_tasks(
     }
 }
 
-/// Reset worker session state, cached thread lists, legacy root caches, and poll cursors.
-async fn reset_worker_session_state(
-    session: &tokio::sync::Mutex<Session>,
+/// Clear in-memory thread caches, history sync state, legacy root caches, and poll cursors.
+async fn reset_poll_and_thread_caches(
     poll_state: &tokio::sync::Mutex<crate::chat::PollState>,
     ctrl_poll_state: &tokio::sync::Mutex<crate::call::CtrlPollState>,
 ) {
@@ -902,10 +901,6 @@ async fn reset_worker_session_state(
     crate::history_sync::reset_for_account_switch();
     crate::account_manager::remove_legacy_shared_caches();
     {
-        let mut s = session.lock().await;
-        s.logout();
-    }
-    {
         let mut ps = poll_state.lock().await;
         *ps = crate::chat::PollState::default();
     }
@@ -913,6 +908,48 @@ async fn reset_worker_session_state(
         let mut cps = ctrl_poll_state.lock().await;
         *cps = crate::call::CtrlPollState::default();
     }
+}
+
+/// Reset worker session state, cached thread lists, legacy root caches, and poll cursors.
+async fn reset_worker_session_state(
+    session: &tokio::sync::Mutex<Session>,
+    poll_state: &tokio::sync::Mutex<crate::chat::PollState>,
+    ctrl_poll_state: &tokio::sync::Mutex<crate::call::CtrlPollState>,
+) {
+    {
+        let mut s = session.lock().await;
+        s.logout();
+    }
+    reset_poll_and_thread_caches(poll_state, ctrl_poll_state).await;
+}
+
+/// Clear active account identity and in-memory session before wiping disk credentials, then
+/// reconcile background listeners and reset poll/thread caches.
+///
+/// `session.lock().await.logout()` must run before `wipe_all_saved_session_credentials()` so
+/// `background_accounts::supervise` observes `login == None` and cannot re-snapshot
+/// `accounts/<uin>.json` while or after credential files are removed.
+async fn forget_lock_and_sign_out_all(
+    current_qr_task: &mut Option<tokio::task::JoinHandle<()>>,
+    current_password_task: &mut Option<tokio::task::JoinHandle<()>>,
+    session: &tokio::sync::Mutex<Session>,
+    poll_state: &tokio::sync::Mutex<crate::chat::PollState>,
+    ctrl_poll_state: &tokio::sync::Mutex<crate::call::CtrlPollState>,
+    gui_tx: &GuiTx,
+    egui_ctx: &egui::Context,
+) {
+    QR_LOGIN_ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
+    abort_pending_login_tasks(current_qr_task, current_password_task);
+    crate::account_manager::set_active_uin("");
+    {
+        let mut s = session.lock().await;
+        s.logout();
+    }
+    let _ = crate::account_manager::wipe_all_saved_session_credentials();
+    crate::background_accounts::request_reconcile();
+    reset_poll_and_thread_caches(poll_state, ctrl_poll_state).await;
+    let _ = gui_tx.send(GuiEvent::ForgotLockSignedOut);
+    egui_ctx.request_repaint();
 }
 
 pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: egui::Context) {
@@ -1744,18 +1781,16 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             egui_ctx.request_repaint();
                         }
                         WorkerCmd::ForgetLockAndSignOutAll => {
-                            QR_LOGIN_ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
-                            abort_pending_login_tasks(
+                            forget_lock_and_sign_out_all(
                                 &mut current_qr_task,
                                 &mut current_password_task,
-                            );
-                            crate::account_manager::set_active_uin("");
-                            crate::background_accounts::request_reconcile();
-                            let _ = crate::account_manager::wipe_all_saved_session_credentials();
-                            reset_worker_session_state(&session, &poll_state, &ctrl_poll_state)
-                                .await;
-                            let _ = gui_tx.send(GuiEvent::ForgotLockSignedOut);
-                            egui_ctx.request_repaint();
+                                &session,
+                                &poll_state,
+                                &ctrl_poll_state,
+                                &gui_tx,
+                                &egui_ctx,
+                            )
+                            .await;
                         }
                         WorkerCmd::SwitchAccount { target_uin } => {
                             // A login left pending by "add account" must not sign in
