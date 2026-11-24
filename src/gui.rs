@@ -1558,6 +1558,71 @@ impl IncomingPopupState {
 /// Message search hits for the sidebar: (thread_idx, msg_id, sender, text, is_outgoing).
 pub(crate) type MsgHits = Vec<(usize, String, String, String, bool)>;
 
+/// Active passcode management workflow inside the Settings -> Security panel.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(super) enum AppLockSettingsAction {
+    #[default]
+    Idle,
+    Enabling,
+    Changing,
+    Disabling,
+}
+
+/// Ephemeral UI state for the passcode lock screen, activity tracking, and settings drafts.
+#[allow(dead_code)]
+pub(super) struct AppLockUiState {
+    pub(super) unlock_input: String,
+    pub(super) unlock_error: Option<String>,
+    pub(super) focus_requested: bool,
+    pub(super) confirm_forgot_open: bool,
+    pub(super) corrupted_config: bool,
+    pub(super) settings_action: AppLockSettingsAction,
+    pub(super) draft_mode: crate::app_lock::PasscodeMode,
+    pub(super) draft_current: String,
+    pub(super) draft_new: String,
+    pub(super) draft_confirm: String,
+    pub(super) settings_error: Option<String>,
+    pub(super) last_activity_ui_time: f64,
+    pub(super) last_frame_wall_unix: i64,
+    pub(super) last_frame_ui_time: f64,
+}
+
+impl Default for AppLockUiState {
+    fn default() -> Self {
+        Self {
+            unlock_input: String::new(),
+            unlock_error: None,
+            focus_requested: false,
+            confirm_forgot_open: false,
+            corrupted_config: false,
+            settings_action: AppLockSettingsAction::Idle,
+            draft_mode: crate::app_lock::PasscodeMode::Pin4,
+            draft_current: String::new(),
+            draft_new: String::new(),
+            draft_confirm: String::new(),
+            settings_error: None,
+            last_activity_ui_time: 0.0,
+            last_frame_wall_unix: crate::login::unix_now(),
+            last_frame_ui_time: 0.0,
+        }
+    }
+}
+
+/// Compute effective window focus, always treating a locked window as unfocused.
+fn combine_effective_focus(os_focused: bool, app_locked: bool) -> bool {
+    os_focused && !app_locked
+}
+
+/// Decide whether a lock trigger may lock the app given persisted config, lock state, and credentials.
+fn should_trigger_lock_with_creds(
+    cfg: &crate::app_lock::AppLockConfig,
+    app_locked: bool,
+    has_creds: bool,
+) -> bool {
+    !app_locked && cfg.enabled && has_creds
+}
+
 pub struct ZaloGuiApp {
     // Theme state
     dark_mode: bool,
@@ -1854,6 +1919,12 @@ pub struct ZaloGuiApp {
     win_restore_rect: Option<WinRect>,
     #[cfg(target_os = "windows")]
     win_resize_drag: Option<WinResizeDrag>,
+    /// Persisted application lock configuration loaded from `app_lock.json`.
+    pub(super) app_lock_config: crate::app_lock::AppLockConfig,
+    /// Whether the lock screen gate currently hides workspace and login content.
+    pub(super) app_locked: bool,
+    /// Ephemeral UI state for passcode entry, activity tracking, and settings drafts.
+    pub(super) app_lock_ui: AppLockUiState,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1982,6 +2053,16 @@ impl ZaloGuiApp {
             .map(|(idx, _)| idx)
             .unwrap_or(0);
         let startup_sched_db = crate::store::db_path_for_account(&user_uin);
+        let cfg_res = crate::app_lock::AppLockConfig::load_default();
+        let has_creds = crate::account_manager::has_any_saved_credentials();
+        let (start_locked, corrupted) =
+            crate::app_lock::should_lock_on_startup(&cfg_res, has_creds);
+        let app_lock_config = cfg_res.ok().flatten().unwrap_or_default();
+        worker::set_idle_lock_timeout_secs(if app_lock_config.enabled {
+            app_lock_config.idle_timeout_secs
+        } else {
+            0
+        });
 
         let app = Self {
             dark_mode,
@@ -2215,6 +2296,13 @@ impl ZaloGuiApp {
             win_restore_rect: None,
             #[cfg(target_os = "windows")]
             win_resize_drag: None,
+            app_lock_config,
+            app_locked: start_locked,
+            app_lock_ui: AppLockUiState {
+                focus_requested: start_locked,
+                corrupted_config: corrupted,
+                ..Default::default()
+            },
         };
         let mut app = app;
         let _ = app.reload_custom_sticker_packs();
@@ -2969,6 +3057,129 @@ impl ZaloGuiApp {
         }
     }
 
+    /// Activate the application lock screen and close transient modals, popovers, and viewers.
+    pub(super) fn lock_now(&mut self, ctx: &egui::Context) {
+        self.app_locked = true;
+        self.incoming_popup = None;
+        self.toast_notice = None;
+        self.toast_reveal_path = None;
+        self.settings_modal_open = false;
+        self.contacts_view_open = false;
+        self.feed_modal_open = false;
+        self.saved_modal_open = false;
+        self.profile_menu_open = false;
+        self.wipe_confirm_open = false;
+        self.logout_confirm_open = false;
+        self.phone_modal_open = false;
+        self.schedule_modal_open = false;
+        self.reminder_modal_open = false;
+        self.remind_custom_open = false;
+        self.folder_modal_open = false;
+        self.update_modal_open = false;
+        self.dev_panel_open = false;
+        self.image_viewer = None;
+        self.video_player = None;
+        self.doc_viewer = None;
+        self.forward_msg = None;
+        self.reactions_dialog = None;
+        self.pending_delete_thread = None;
+        self.pending_leave_group = None;
+        self.editing_message = None;
+        self.edit_history_open = None;
+        self.remind_pick_msg = None;
+        self.vanish_picker_open = false;
+        self.sticker_picker_open = false;
+        self.in_chat_search_open = false;
+        self.app_lock_ui.unlock_input.clear();
+        self.app_lock_ui.unlock_error = None;
+        self.app_lock_ui.confirm_forgot_open = false;
+        self.app_lock_ui.focus_requested = true;
+        ctx.request_repaint();
+    }
+
+    /// Evaluate in-memory lock preconditions before checking saved credentials on disk.
+    fn try_trigger_lock(&mut self, ctx: &egui::Context) -> bool {
+        if self.app_locked || !self.app_lock_config.enabled {
+            return false;
+        }
+        let has_creds = crate::account_manager::has_any_saved_credentials();
+        if should_trigger_lock_with_creds(&self.app_lock_config, self.app_locked, has_creds) {
+            self.lock_now(ctx);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Return whether the window is effectively focused (always false while locked).
+    #[allow(dead_code)]
+    pub(super) fn effective_window_focused(&self, ctx: &egui::Context) -> bool {
+        combine_effective_focus(ctx.input(|i| i.focused), self.app_locked)
+    }
+
+    /// Return whether notification previews and toast text must be masked while locked.
+    #[allow(dead_code)]
+    pub(super) fn should_mask_notifications(&self) -> bool {
+        self.app_locked && self.app_lock_config.hide_notifications_when_locked
+    }
+
+    /// Render the temporary lock-screen panel placeholder until Task 5 builds `app_lock_ui`.
+    pub(in crate::gui) fn render_lock_screen(&mut self, ctx: &egui::Context, pal: &ThemePalette) {
+        egui::CentralPanel::default()
+            .frame(egui::Frame::none().fill(pal.bg_chat_canvas))
+            .show(ctx, |ui| {
+                ui.centered_and_justified(|ui| {
+                    ui.label(
+                        RichText::new("Ứng dụng đang bị khóa")
+                            .color(pal.text_primary)
+                            .size(16.0),
+                    );
+                });
+            });
+    }
+
+    /// Reset UI session state shared across normal logout and forgot-passcode sign-out.
+    fn reset_session_ui_after_logout(&mut self) {
+        self.is_logged_in = false;
+        self.user_name.clear();
+        self.user_uin.clear();
+        self.user_avatar = None;
+        crate::account_manager::set_active_uin("");
+        self.background_unread.clear();
+        self.threads.clear();
+        self.unread_counts.clear();
+        self.reaction_unread_counts.clear();
+        self.notified_msg_ids.clear();
+        if let Ok(mut watch) = VANISH_THREADS.lock() {
+            watch.clear();
+        }
+        self.selected_thread_index = 0;
+        self.qr_status = "Đang xin mã QR mới…".into();
+        self.status_msg = "Đã đăng xuất".into();
+        // Đăng xuất → cache nhóm không còn giá trị.
+        self.group_note_drafts.clear();
+        self.group_note_loaded.clear();
+        self.group_note_edited_at.clear();
+        self.group_note_save_retry_at.clear();
+        self.group_note_saved_label.clear();
+        self.group_watch_inputs.clear();
+        self.group_watch_cache.clear();
+        self.group_stats_cache.clear();
+        self.script_list_cache.clear();
+        self.script_editing_id = None;
+        self.script_output.clear();
+        self.group_note_loading.clear();
+        self.group_note_load_error.clear();
+        self.group_stats_loading.clear();
+        self.group_summary_pending = None;
+        self.group_jump_pending = None;
+        self.saved_items.clear();
+        self.scheduled_items.clear();
+        self.incoming_popup = None;
+        self.reaction_inbox = crate::reactions::ReactionInbox::default();
+        self.publish_known_threads();
+    }
+
     /// Clear active thread's unread badge and advance its read-point when focused (#146).
     fn mark_active_thread_read_if_focused(&mut self, ctx: &egui::Context) {
         if !ctx.input(|i| i.focused) {
@@ -3582,43 +3793,7 @@ impl ZaloGuiApp {
                     self.handle_background_account_activity(activity);
                 }
                 GuiEvent::LoggedOut => {
-                    self.is_logged_in = false;
-                    self.user_name.clear();
-                    self.user_uin.clear();
-                    crate::account_manager::set_active_uin("");
-                    self.background_unread.clear();
-                    self.threads.clear();
-                    self.unread_counts.clear();
-                    self.reaction_unread_counts.clear();
-                    self.notified_msg_ids.clear();
-                    if let Ok(mut watch) = VANISH_THREADS.lock() {
-                        watch.clear();
-                    }
-                    self.selected_thread_index = 0;
-                    self.qr_status = "Đang xin mã QR mới…".into();
-                    self.status_msg = "Đã đăng xuất".into();
-                    // Đăng xuất → cache nhóm không còn giá trị.
-                    self.group_note_drafts.clear();
-                    self.group_note_loaded.clear();
-                    self.group_note_edited_at.clear();
-                    self.group_note_save_retry_at.clear();
-                    self.group_note_saved_label.clear();
-                    self.group_watch_inputs.clear();
-                    self.group_watch_cache.clear();
-                    self.group_stats_cache.clear();
-                    self.script_list_cache.clear();
-                    self.script_editing_id = None;
-                    self.script_output.clear();
-                    self.group_note_loading.clear();
-                    self.group_note_load_error.clear();
-                    self.group_stats_loading.clear();
-                    self.group_summary_pending = None;
-                    self.group_jump_pending = None;
-                    self.saved_items.clear();
-                    self.scheduled_items.clear();
-                    self.incoming_popup = None;
-                    self.reaction_inbox = crate::reactions::ReactionInbox::default();
-                    self.publish_known_threads();
+                    self.reset_session_ui_after_logout();
                 }
                 GuiEvent::AccountSwitched {
                     uin,
@@ -5230,9 +5405,45 @@ impl ZaloGuiApp {
                     self.script_output = output;
                     self.script_logs_cache.insert(thread_id, logs);
                 }
-                GuiEvent::SystemWakeDetected { .. }
-                | GuiEvent::LockWatchdogTick
-                | GuiEvent::ForgotLockSignedOut => {}
+                GuiEvent::SystemWakeDetected { .. } => {
+                    if self.app_lock_config.lock_on_sleep {
+                        self.try_trigger_lock(ctx);
+                    }
+                }
+                GuiEvent::LockWatchdogTick => {
+                    let now_ui = ctx.input(|i| i.time);
+                    if !self.app_locked
+                        && self.app_lock_config.enabled
+                        && crate::app_lock::is_idle_expired(
+                            self.app_lock_ui.last_activity_ui_time,
+                            now_ui,
+                            self.app_lock_config.idle_timeout_secs,
+                            self.active_call.is_some(),
+                        )
+                    {
+                        self.try_trigger_lock(ctx);
+                    }
+                }
+                GuiEvent::ForgotLockSignedOut => {
+                    self.reset_session_ui_after_logout();
+                    self.pending_add_account_uin = None;
+                    self.qr_texture = None;
+                    self.login_in_progress = false;
+                    self.account_menu_accounts.clear();
+                    self.active_call = None;
+                    self.app_lock_config = crate::app_lock::AppLockConfig::default();
+                    self.app_locked = false;
+                    let now_ui = ctx.input(|i| i.time);
+                    self.app_lock_ui = AppLockUiState {
+                        last_activity_ui_time: now_ui,
+                        last_frame_ui_time: now_ui,
+                        ..Default::default()
+                    };
+                    worker::set_idle_lock_timeout_secs(0);
+                    if let Some(tx) = WORKER_TX.get() {
+                        let _ = tx.send(WorkerCmd::RequestQr);
+                    }
+                }
             }
         }
     }
@@ -5354,6 +5565,7 @@ impl ZaloGuiApp {
         }
         let close_requested = ctx.input(|i| i.viewport().close_requested());
         if close_requested && !self.allow_quit && self.hides_to_tray() {
+            self.try_trigger_lock(ctx);
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
         } else if quit_now || close_requested {
@@ -5367,9 +5579,24 @@ impl ZaloGuiApp {
         if let Some(tray) = self.tray.as_mut() {
             tray.set_unread(self.unread_counts.values().sum());
         }
-        if ctx.input(|i| {
-            (i.modifiers.ctrl || i.modifiers.command) && i.modifiers.shift && i.key_pressed(Key::P)
-        }) {
+        if !self.app_locked
+            && self.app_lock_config.enabled
+            && ctx.input(|i| {
+                (i.modifiers.ctrl || (cfg!(target_os = "macos") && i.modifiers.command))
+                    && !i.modifiers.shift
+                    && !i.modifiers.alt
+                    && i.key_pressed(Key::L)
+            })
+        {
+            self.try_trigger_lock(ctx);
+        }
+        if !self.app_locked
+            && ctx.input(|i| {
+                (i.modifiers.ctrl || i.modifiers.command)
+                    && i.modifiers.shift
+                    && i.key_pressed(Key::P)
+            })
+        {
             self.settings_modal_open = true;
             self.settings_tab = SettingsTab::Privacy;
         }
@@ -5401,6 +5628,37 @@ impl ZaloGuiApp {
         }
 
         self.check_events(ctx);
+
+        let (now_ui, has_user_input) = ctx.input(|i| {
+            let active = !i.events.is_empty()
+                || i.pointer.any_pressed()
+                || i.pointer.any_released()
+                || i.pointer.delta() != Vec2::ZERO;
+            (i.time, active)
+        });
+        if has_user_input {
+            self.app_lock_ui.last_activity_ui_time = now_ui;
+        }
+        let now_wall = crate::login::unix_now();
+        let wall_delta = now_wall.saturating_sub(self.app_lock_ui.last_frame_wall_unix);
+        let ui_delta = (now_ui - self.app_lock_ui.last_frame_ui_time).max(0.0);
+        self.app_lock_ui.last_frame_wall_unix = now_wall;
+        self.app_lock_ui.last_frame_ui_time = now_ui;
+
+        if !self.app_locked && self.app_lock_config.enabled {
+            let sleep_jumped = self.app_lock_config.lock_on_sleep
+                && wall_delta >= crate::app_lock::SLEEP_JUMP_THRESHOLD_SECS
+                && (wall_delta as f64 - ui_delta) >= 30.0;
+            let idle_expired = crate::app_lock::is_idle_expired(
+                self.app_lock_ui.last_activity_ui_time,
+                now_ui,
+                self.app_lock_config.idle_timeout_secs,
+                self.active_call.is_some(),
+            );
+            if sleep_jumped || idle_expired {
+                self.try_trigger_lock(ctx);
+            }
+        }
 
         let scr_check = ctx.screen_rect();
         if scr_check.width() < 64.0 || scr_check.height() < 64.0 {
@@ -5546,7 +5804,7 @@ impl ZaloGuiApp {
         self.handle_frameless_resize(ctx);
         self.render_custom_title_bar(ctx, &pal);
         // Dev Inspector Panel
-        if self.dev_mode && self.dev_panel_open {
+        if !self.app_locked && self.dev_mode && self.dev_panel_open {
             egui::TopBottomPanel::bottom("dev_inspector")
                 .resizable(true)
                 .default_height(250.0)
@@ -5590,7 +5848,12 @@ impl ZaloGuiApp {
         }
 
         // Main Workspace
-        if !self.is_logged_in {
+        if self.app_locked {
+            self.render_lock_screen(ctx, &pal);
+            if self.incoming_popup.is_some() && self.settings.enable_notifications {
+                self.render_toast_overlay(ctx, &pal);
+            }
+        } else if !self.is_logged_in {
             egui::CentralPanel::default()
                 .frame(egui::Frame::none().fill(pal.bg_chat_canvas))
                 .show(ctx, |ui| {
@@ -5602,7 +5865,9 @@ impl ZaloGuiApp {
         }
 
         // Auto-notification modal for new GitHub Releases (works on both Login & Chat screens)
-        self.render_update_notification_modal(ctx, &pal);
+        if !self.app_locked {
+            self.render_update_notification_modal(ctx, &pal);
+        }
 
         if !self.is_window_maximized(ctx) {
             let screen = ctx.screen_rect();
@@ -5976,7 +6241,11 @@ impl ZaloGuiApp {
                         );
                     }
 
-                    if !compact_title_bar && self.is_logged_in && !self.user_name.is_empty() {
+                    if !compact_title_bar
+                        && self.is_logged_in
+                        && !self.app_locked
+                        && !self.user_name.is_empty()
+                    {
                         ui.add_space(6.0);
                         ui.label(
                             RichText::new(format!("·  {}", truncate_chars(&self.user_name, 18)))
@@ -6022,6 +6291,7 @@ impl ZaloGuiApp {
                         });
                         if close_resp.clicked() {
                             if to_tray {
+                                self.try_trigger_lock(ctx);
                                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
                             } else {
                                 self.allow_quit = true;
@@ -7611,5 +7881,49 @@ impl ZaloGuiApp {
         {
             false
         }
+    }
+}
+
+#[cfg(test)]
+mod app_lock_state_tests {
+    use super::*;
+
+    #[test]
+    fn startup_lock_state_fails_closed_on_corrupted_config() {
+        let dir = std::env::temp_dir().join(format!("zalo_gui_lock_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg_path = dir.join(crate::app_lock::APP_LOCK_FILE);
+        std::fs::write(&cfg_path, "{not-valid-json").unwrap();
+        let loaded = crate::app_lock::AppLockConfig::load_from_path(&cfg_path);
+        assert_eq!(
+            crate::app_lock::should_lock_on_startup(&loaded, true),
+            (true, true)
+        );
+        assert_eq!(
+            crate::app_lock::should_lock_on_startup(&loaded, false),
+            (false, true)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn effective_window_focused_is_false_while_locked() {
+        assert!(!combine_effective_focus(true, true));
+        assert!(!combine_effective_focus(false, true));
+        assert!(combine_effective_focus(true, false));
+        assert!(!combine_effective_focus(false, false));
+    }
+
+    #[test]
+    fn normal_logout_keeps_app_lock_enabled_for_next_trigger() {
+        let cfg = crate::app_lock::AppLockConfig::create_enabled(
+            crate::app_lock::PasscodeMode::Pin4,
+            "4242",
+        )
+        .unwrap();
+        assert!(should_trigger_lock_with_creds(&cfg, false, true));
+        assert!(!should_trigger_lock_with_creds(&cfg, true, true));
+        assert!(!should_trigger_lock_with_creds(&cfg, false, false));
     }
 }
