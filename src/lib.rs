@@ -1,4 +1,6 @@
 pub mod account_manager;
+/// Application passcode lock config, PBKDF2-HMAC-SHA256 verification, and sleep/idle policy.
+pub mod app_lock;
 pub mod audio;
 pub mod background_accounts;
 pub mod call;

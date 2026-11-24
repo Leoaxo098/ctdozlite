@@ -221,11 +221,12 @@ fn legacy_candidates(target: &Path, cwd: &Path, home: Option<&Path>) -> Vec<Path
 
 /// Top-level entries that make up a data folder. Logs and crash dumps stay behind.
 fn is_data_entry(name: &str) -> bool {
-    const NAMES: [&str; 15] = [
+    const NAMES: [&str; 16] = [
         "zalo_history.db",
         "zalo_history.db-wal",
         "zalo_history.db-shm",
         "app_settings.json",
+        "app_lock.json",
         "theme.json",
         "custom_stickers.json",
         "autoreply_rules.json",
@@ -252,7 +253,13 @@ fn has_app_data(dir: &Path) -> bool {
 
 /// Newest modification time among the markers, used to pick between several legacy folders.
 fn data_mtime(dir: &Path) -> std::time::SystemTime {
-    ["session.json", "zalo_history.db", "accounts", "app_settings.json"]
+    [
+        "session.json",
+        "zalo_history.db",
+        "accounts",
+        "app_settings.json",
+        "app_lock.json",
+    ]
         .iter()
         .filter_map(|name| std::fs::metadata(dir.join(name)).ok()?.modified().ok())
         .max()
@@ -718,6 +725,48 @@ mod tests {
         let from = migrate_legacy_data(&target, &[older, newer.clone()]).unwrap();
         assert_eq!(from, Some(newer));
         assert_eq!(std::fs::read(target.join("session.json")).unwrap(), b"newer");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn migration_copies_app_lock_json_and_picks_newer_by_app_lock_mtime() {
+        let root = fixture();
+        let old = root.join("old");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join("session.json"), b"s").unwrap();
+        std::fs::write(old.join("app_lock.json"), b"{\"version\":1}").unwrap();
+        let target = root.join("share/ctdozlite");
+
+        let from = migrate_legacy_data(&target, std::slice::from_ref(&old)).unwrap();
+        assert_eq!(from, Some(old));
+        assert_eq!(
+            std::fs::read(target.join("app_lock.json")).unwrap(),
+            b"{\"version\":1}"
+        );
+
+        let older = root.join("older_lock");
+        let newer = root.join("newer_lock");
+        for dir in [&older, &newer] {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join("session.json"), b"same-session").unwrap();
+        }
+        let past = std::time::SystemTime::now() - std::time::Duration::from_secs(7200);
+        for file in [older.join("session.json"), newer.join("session.json")] {
+            std::fs::File::options()
+                .write(true)
+                .open(file)
+                .unwrap()
+                .set_modified(past)
+                .unwrap();
+        }
+        std::fs::write(newer.join("app_lock.json"), b"newer-lock").unwrap();
+        let target2 = root.join("share2/ctdozlite");
+        let from2 = migrate_legacy_data(&target2, &[older, newer.clone()]).unwrap();
+        assert_eq!(from2, Some(newer));
+        assert_eq!(
+            std::fs::read(target2.join("app_lock.json")).unwrap(),
+            b"newer-lock"
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 }

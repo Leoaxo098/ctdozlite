@@ -38,6 +38,7 @@ UI_THREAD_FILES = [
 STRICT_NON_GUI_MODULES = [
     ROOT / "src/account_manager.rs",
     ROOT / "src/api_mcp.rs",
+    ROOT / "src/app_lock.rs",
     ROOT / "src/chat.rs",
     ROOT / "src/crypto.rs",
     ROOT / "src/data_dir.rs",
@@ -323,7 +324,7 @@ def check_r5_data_hygiene() -> list[Violation]:
         )
         if res.returncode == 0:
             forbidden_re = re.compile(
-                r"(^|/)session\.json$|^accounts/|\.db$|\.db-(?:wal|shm)$|(^|/)crash\.log$"
+                r"(^|/)session\.json$|^accounts/|\.db$|\.db-(?:wal|shm)$|(^|/)crash\.log$|(^|/)app_lock\.json$"
             )
             for tracked in res.stdout.splitlines():
                 if forbidden_re.search(tracked.strip()):
