@@ -545,6 +545,9 @@ pub enum WorkerCmd {
         expected_sha256: Option<String>,
     },
     Logout,
+    /// Clear active credentials, `app_lock.json`, and all multi-account session snapshots,
+    /// then sign out without preserving credentials (`Forgot passcode` flow).
+    ForgetLockAndSignOutAll,
     /// Delete local message data (`zalo_history.db` + `threads_cache.json`) without
     /// touching credentials. Separate from [`WorkerCmd::Logout`] by design (#21).
     WipeLocalData,
@@ -666,6 +669,16 @@ pub(super) static WORKER_TX: std::sync::OnceLock<tokio::sync::mpsc::UnboundedSen
 
 static QR_LOGIN_ACTIVE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+
+/// Cached idle auto-lock timeout in seconds (`0` suppresses non-wake watchdog repaints).
+static IDLE_LOCK_TIMEOUT_SECS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Update the worker watchdog's cached idle auto-lock timeout (`0` disables idle ticks).
+#[allow(dead_code)]
+pub(super) fn set_idle_lock_timeout_secs(secs: u64) {
+    IDLE_LOCK_TIMEOUT_SECS.store(secs, std::sync::atomic::Ordering::Relaxed);
+}
 
 static QR_COOLDOWN_UNTIL: std::sync::OnceLock<std::sync::Mutex<Option<std::time::Instant>>> =
     std::sync::OnceLock::new();
@@ -862,6 +875,44 @@ async fn prefetch_missing_sticker_thumbnails(
         }
     });
     futures_util::future::join_all(futs).await;
+}
+
+/// Abort any in-flight QR or password login background task.
+fn abort_pending_login_tasks(
+    current_qr_task: &mut Option<tokio::task::JoinHandle<()>>,
+    current_password_task: &mut Option<tokio::task::JoinHandle<()>>,
+) {
+    if let Some(task) = current_qr_task.take() {
+        task.abort();
+    }
+    if let Some(task) = current_password_task.take() {
+        task.abort();
+    }
+}
+
+/// Reset worker session state, cached thread lists, legacy root caches, and poll cursors.
+async fn reset_worker_session_state(
+    session: &tokio::sync::Mutex<Session>,
+    poll_state: &tokio::sync::Mutex<crate::chat::PollState>,
+    ctrl_poll_state: &tokio::sync::Mutex<crate::call::CtrlPollState>,
+) {
+    if let Ok(mut kt) = KNOWN_THREADS.lock() {
+        kt.clear();
+    }
+    crate::history_sync::reset_for_account_switch();
+    crate::account_manager::remove_legacy_shared_caches();
+    {
+        let mut s = session.lock().await;
+        s.logout();
+    }
+    {
+        let mut ps = poll_state.lock().await;
+        *ps = crate::chat::PollState::default();
+    }
+    {
+        let mut cps = ctrl_poll_state.lock().await;
+        *cps = crate::call::CtrlPollState::default();
+    }
 }
 
 pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: egui::Context) {
@@ -1597,6 +1648,34 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                     tokio::spawn(crate::background_accounts::supervise(session.clone(), sink));
                 }
 
+                {
+                    let gui_tx_lock = gui_tx.clone();
+                    let ctx_lock = egui_ctx.clone();
+                    tokio::spawn(async move {
+                        let mut tick = tokio::time::interval(Duration::from_secs(5));
+                        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                        tick.tick().await;
+                        let mut last_wall = crate::login::unix_now();
+                        loop {
+                            tick.tick().await;
+                            let now_wall = crate::login::unix_now();
+                            if let Some(jump_secs) =
+                                crate::app_lock::classify_sleep_jump(last_wall, now_wall, true)
+                            {
+                                let _ = gui_tx_lock.send(GuiEvent::SystemWakeDetected { jump_secs });
+                                ctx_lock.request_repaint();
+                            } else if IDLE_LOCK_TIMEOUT_SECS
+                                .load(std::sync::atomic::Ordering::Relaxed)
+                                > 0
+                            {
+                                let _ = gui_tx_lock.send(GuiEvent::LockWatchdogTick);
+                                ctx_lock.request_repaint();
+                            }
+                            last_wall = now_wall;
+                        }
+                    });
+                }
+
                 let mut current_qr_task: Option<tokio::task::JoinHandle<()>> = None;
                 let mut current_password_task: Option<tokio::task::JoinHandle<()>> = None;
 
@@ -1653,32 +1732,29 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                 // Snapshot acc cũ vào accounts/ trước khi QR acc mới đè session.json (#1008).
                                 let _ = crate::account_manager::save_current_account_snapshot(&cur_uin);
                             }
-                            if let Some(task) = current_qr_task.take() {
-                                task.abort();
-                            }
-                            if let Some(task) = current_password_task.take() {
-                                task.abort();
-                            }
-                            if let Ok(mut kt) = KNOWN_THREADS.lock() {
-                                kt.clear();
-                            }
-                            crate::history_sync::reset_for_account_switch();
-                            crate::account_manager::remove_legacy_shared_caches();
+                            abort_pending_login_tasks(
+                                &mut current_qr_task,
+                                &mut current_password_task,
+                            );
                             let _ = std::fs::remove_file("session.json");
-                            {
-                                let mut s = session.lock().await;
-                                s.logout();
-                            }
-                            {
-                                let mut ps = poll_state.lock().await;
-                                *ps = crate::chat::PollState::default();
-                            }
-                            {
-                                let mut cps = ctrl_poll_state.lock().await;
-                                *cps = crate::call::CtrlPollState::default();
-                            }
+                            reset_worker_session_state(&session, &poll_state, &ctrl_poll_state)
+                                .await;
                             crate::account_manager::set_active_uin("");
                             let _ = gui_tx.send(GuiEvent::LoggedOut);
+                            egui_ctx.request_repaint();
+                        }
+                        WorkerCmd::ForgetLockAndSignOutAll => {
+                            QR_LOGIN_ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
+                            abort_pending_login_tasks(
+                                &mut current_qr_task,
+                                &mut current_password_task,
+                            );
+                            crate::account_manager::set_active_uin("");
+                            crate::background_accounts::request_reconcile();
+                            let _ = crate::account_manager::wipe_all_saved_session_credentials();
+                            reset_worker_session_state(&session, &poll_state, &ctrl_poll_state)
+                                .await;
+                            let _ = gui_tx.send(GuiEvent::ForgotLockSignedOut);
                             egui_ctx.request_repaint();
                         }
                         WorkerCmd::SwitchAccount { target_uin } => {

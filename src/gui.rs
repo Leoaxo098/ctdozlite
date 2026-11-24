@@ -1008,6 +1008,12 @@ pub enum GuiEvent {
         is_group: bool,
         logs: Vec<crate::thread_script::ScriptLog>,
     },
+    /// Worker detected an OS sleep/hibernate wall-clock jump exceeding the threshold.
+    SystemWakeDetected { jump_secs: i64 },
+    /// Periodic 5-second watchdog heartbeat emitted only when idle auto-lock is active.
+    LockWatchdogTick,
+    /// Worker completed credential wipe and session teardown after forgot-passcode sign-out.
+    ForgotLockSignedOut,
 }
 
 /// Summary shown when phone sync ends. `phone_error` explains why the phone step
@@ -5224,6 +5230,9 @@ impl ZaloGuiApp {
                     self.script_output = output;
                     self.script_logs_cache.insert(thread_id, logs);
                 }
+                GuiEvent::SystemWakeDetected { .. }
+                | GuiEvent::LockWatchdogTick
+                | GuiEvent::ForgotLockSignedOut => {}
             }
         }
     }

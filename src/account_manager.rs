@@ -258,6 +258,77 @@ pub fn account_download_dir(base: &Path, uin: &str) -> PathBuf {
     }
 }
 
+/// True when `path` is an isolated per-account session snapshot (`accounts/<uin>.json`),
+/// excluding thread cache snapshots (`*_threads.json`) and subdirectories.
+fn is_account_credential_snapshot_file(path: &Path) -> bool {
+    path.is_file()
+        && path.extension().and_then(|s| s.to_str()) == Some("json")
+        && path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .is_some_and(|stem| !stem.is_empty() && !stem.ends_with("_threads"))
+}
+
+/// Remove `path` if present, returning `Ok(true)` if removed and `Ok(false)` when absent.
+fn remove_file_if_exists(path: &Path) -> Result<bool> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// True when `data_dir` contains a root `session.json` or any `accounts/<uin>.json` snapshot.
+pub fn has_any_saved_credentials_in(data_dir: &Path) -> bool {
+    if data_dir.join("session.json").is_file() {
+        return true;
+    }
+    let Ok(entries) = std::fs::read_dir(data_dir.join("accounts")) else {
+        return false;
+    };
+    entries
+        .flatten()
+        .any(|entry| is_account_credential_snapshot_file(&entry.path()))
+}
+
+/// True when the active data directory contains any saved session or account snapshot.
+pub fn has_any_saved_credentials() -> bool {
+    has_any_saved_credentials_in(Path::new("."))
+}
+
+/// Delete `session.json`, `app_lock.json`, and all `accounts/<uin>.json` credential snapshots
+/// under `data_dir`, preserving `accounts/*_threads.json`, `accounts/*_history.db*`, and
+/// `accounts/<uin>/` subdirectories.
+pub fn wipe_all_saved_session_credentials_in(data_dir: &Path) -> Result<usize> {
+    let mut removed = 0usize;
+    for target in [
+        data_dir.join("session.json"),
+        data_dir.join(crate::app_lock::APP_LOCK_FILE),
+    ] {
+        if remove_file_if_exists(&target)? {
+            removed += 1;
+        }
+    }
+    let entries = match std::fs::read_dir(data_dir.join("accounts")) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(removed),
+        Err(e) => return Err(e.into()),
+    };
+    for entry_res in entries {
+        let entry = entry_res?;
+        let path = entry.path();
+        if is_account_credential_snapshot_file(&path) && remove_file_if_exists(&path)? {
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
+/// Wipe all saved session credentials and `app_lock.json` in the active data directory.
+pub fn wipe_all_saved_session_credentials() -> Result<usize> {
+    wipe_all_saved_session_credentials_in(Path::new("."))
+}
+
 /// List all saved accounts in the `accounts/` directory.
 pub fn list_saved_accounts(current_uin: &str) -> Vec<AccountProfile> {
     let dir = accounts_dir();
@@ -267,11 +338,7 @@ pub fn list_saved_accounts(current_uin: &str) -> Vec<AccountProfile> {
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.extension().and_then(|s| s.to_str()) == Some("json") {
-            let file_stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
-            if file_stem.ends_with("_threads") {
-                continue;
-            }
+        if is_account_credential_snapshot_file(&path) {
             if let Ok(text) = std::fs::read_to_string(&path) {
                 if let Ok(val) = serde_json::from_str::<serde_json::Value>(&text) {
                     if let Some(login) = val.get("login") {
@@ -547,5 +614,87 @@ mod tests {
             PathBuf::from("accounts").join(test_uin).join("sync_rsa_identity.json")
         );
         let _ = std::fs::remove_dir_all(account_dir(test_uin));
+    }
+
+    struct TempDir {
+        path: PathBuf,
+    }
+
+    impl TempDir {
+        fn new(prefix: &str) -> Self {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let seq = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "ctdozlite-{prefix}-{}-{seq}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).unwrap();
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    #[test]
+    fn has_any_saved_credentials_detects_session_or_account_snapshots_only() {
+        let dir = TempDir::new("has-creds");
+        let root = dir.path();
+        assert!(!has_any_saved_credentials_in(root));
+
+        let acc_dir = root.join("accounts");
+        std::fs::create_dir_all(acc_dir.join("123456")).unwrap();
+        std::fs::write(acc_dir.join("123456_threads.json"), b"[]").unwrap();
+        std::fs::write(acc_dir.join("123456_history.db"), b"sqlite").unwrap();
+        assert!(!has_any_saved_credentials_in(root));
+
+        let snap = acc_dir.join("123456.json");
+        std::fs::write(&snap, b"{}").unwrap();
+        assert!(has_any_saved_credentials_in(root));
+
+        std::fs::remove_file(&snap).unwrap();
+        assert!(!has_any_saved_credentials_in(root));
+
+        std::fs::write(root.join("session.json"), b"{}").unwrap();
+        assert!(has_any_saved_credentials_in(root));
+    }
+
+    #[test]
+    fn wipe_all_saved_session_credentials_preserves_history_and_threads() {
+        let dir = TempDir::new("wipe-creds");
+        let root = dir.path();
+        let acc_dir = root.join("accounts");
+        std::fs::create_dir_all(acc_dir.join("111")).unwrap();
+
+        std::fs::write(root.join("session.json"), b"{}").unwrap();
+        std::fs::write(root.join(crate::app_lock::APP_LOCK_FILE), b"{}").unwrap();
+        std::fs::write(acc_dir.join("111.json"), b"{}").unwrap();
+        std::fs::write(acc_dir.join("222.json"), b"{}").unwrap();
+
+        std::fs::write(acc_dir.join("111_threads.json"), b"[1]").unwrap();
+        std::fs::write(acc_dir.join("111_history.db"), b"db").unwrap();
+        std::fs::write(acc_dir.join("111_history.db-wal"), b"wal").unwrap();
+        std::fs::write(acc_dir.join("111").join("note.txt"), b"keep").unwrap();
+
+        let removed = wipe_all_saved_session_credentials_in(root).unwrap();
+        assert_eq!(removed, 4);
+
+        assert!(!root.join("session.json").exists());
+        assert!(!root.join(crate::app_lock::APP_LOCK_FILE).exists());
+        assert!(!acc_dir.join("111.json").exists());
+        assert!(!acc_dir.join("222.json").exists());
+
+        assert_eq!(std::fs::read(acc_dir.join("111_threads.json")).unwrap(), b"[1]");
+        assert_eq!(std::fs::read(acc_dir.join("111_history.db")).unwrap(), b"db");
+        assert_eq!(std::fs::read(acc_dir.join("111_history.db-wal")).unwrap(), b"wal");
+        assert_eq!(std::fs::read(acc_dir.join("111").join("note.txt")).unwrap(), b"keep");
     }
 }
