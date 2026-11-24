@@ -1574,6 +1574,7 @@ impl ZaloGuiApp {
         let mut reload_sticker_json = false;
         let mut export_autoreply_tpl = false;
         let mut do_logout = false;
+        let mut lock_now_requested = false;
         let mut switch_to_uin: Option<String> = None;
         let mut add_new_account = false;
         egui::Window::new("settings_window_modal")
@@ -2428,6 +2429,7 @@ impl ZaloGuiApp {
                                                     ui.checkbox(&mut self.settings.friend_src_group, "Nhóm chung");
                                                     ui.checkbox(&mut self.settings.friend_src_card, "Danh thiếp Zalo");
                                                 });
+                                            lock_now_requested |= self.render_privacy_app_lock_section(ui, ctx, pal);
                                         }
                                         SettingsTab::Sync => {
                                             ui.label(RichText::new("Đồng bộ tin nhắn từ điện thoại").color(pal.text_primary).size(13.5).strong());
@@ -4212,6 +4214,13 @@ impl ZaloGuiApp {
             // Issue #130: Ask for confirmation before logging out.
             self.settings_modal_open = false;
             self.logout_confirm_open = true;
+        }
+        if lock_now_requested
+            && self.app_lock_config.enabled
+            && (self.is_logged_in || crate::account_manager::has_any_saved_credentials())
+        {
+            self.settings_modal_open = false;
+            self.lock_now(ctx);
         }
         if let Some(target) = switch_to_uin {
             self.settings_modal_open = false;

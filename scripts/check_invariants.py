@@ -18,6 +18,7 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 
 GUI_FILES = [
     ROOT / "src/gui.rs",
+    ROOT / "src/gui/app_lock_ui.rs",
     ROOT / "src/gui/attachments.rs",
     ROOT / "src/gui/messages.rs",
     ROOT / "src/gui/modals.rs",
@@ -28,6 +29,7 @@ GUI_FILES = [
 
 UI_THREAD_FILES = [
     ROOT / "src/gui.rs",
+    ROOT / "src/gui/app_lock_ui.rs",
     ROOT / "src/gui/attachments.rs",
     ROOT / "src/gui/messages.rs",
     ROOT / "src/gui/modals.rs",

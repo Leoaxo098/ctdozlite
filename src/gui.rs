@@ -21,6 +21,7 @@ use crate::logger::{self, FindingLevel, LogEntry, ScanFinding};
 use crate::qr::QrLogin;
 use crate::session::Session;
 
+mod app_lock_ui;
 pub(crate) mod attachments;
 mod color_emoji;
 pub(crate) mod messages;
@@ -1559,7 +1560,6 @@ impl IncomingPopupState {
 pub(crate) type MsgHits = Vec<(usize, String, String, String, bool)>;
 
 /// Active passcode management workflow inside the Settings -> Security panel.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(super) enum AppLockSettingsAction {
     #[default]
@@ -1570,7 +1570,6 @@ pub(super) enum AppLockSettingsAction {
 }
 
 /// Ephemeral UI state for the passcode lock screen, activity tracking, and settings drafts.
-#[allow(dead_code)]
 pub(super) struct AppLockUiState {
     pub(super) unlock_input: String,
     pub(super) unlock_error: Option<String>,
@@ -1610,17 +1609,22 @@ impl Default for AppLockUiState {
 }
 
 impl AppLockUiState {
+    /// Reset Settings -> Privacy passcode form drafts and inline validation error.
+    pub(super) fn reset_settings_drafts(&mut self) {
+        self.settings_action = AppLockSettingsAction::Idle;
+        self.draft_current.clear();
+        self.draft_new.clear();
+        self.draft_confirm.clear();
+        self.settings_error = None;
+    }
+
     /// Scrub ephemeral unlock inputs, forgot-passcode confirmation, and plaintext settings drafts on lock.
     pub(super) fn clear_sensitive_on_lock(&mut self) {
         self.unlock_input.clear();
         self.unlock_error = None;
         self.confirm_forgot_open = false;
         self.focus_requested = true;
-        self.settings_action = AppLockSettingsAction::Idle;
-        self.draft_current.clear();
-        self.draft_new.clear();
-        self.draft_confirm.clear();
-        self.settings_error = None;
+        self.reset_settings_drafts();
     }
 }
 
@@ -3293,21 +3297,6 @@ impl ZaloGuiApp {
             fallback,
             text,
         )
-    }
-
-    /// Render the temporary lock-screen panel placeholder until Task 5 builds `app_lock_ui`.
-    pub(in crate::gui) fn render_lock_screen(&mut self, ctx: &egui::Context, pal: &ThemePalette) {
-        egui::CentralPanel::default()
-            .frame(egui::Frame::none().fill(pal.bg_chat_canvas))
-            .show(ctx, |ui| {
-                ui.centered_and_justified(|ui| {
-                    ui.label(
-                        RichText::new("Ứng dụng đang bị khóa")
-                            .color(pal.text_primary)
-                            .size(16.0),
-                    );
-                });
-            });
     }
 
     /// Reset UI session state shared across normal logout and forgot-passcode sign-out.
@@ -6544,6 +6533,62 @@ impl ZaloGuiApp {
                         }
 
                         buttons_left_x = th_rect.left();
+
+                        if !self.app_locked && (self.is_logged_in || self.app_lock_config.enabled) {
+                            let (lock_rect, lock_resp) =
+                                ui.allocate_exact_size(Vec2::new(36.0, 32.0), Sense::click());
+                            if lock_resp.hovered() {
+                                ui.painter()
+                                    .rect_filled(lock_rect, Rounding::ZERO, pal.bg_hover);
+                            }
+                            let (lock_color, lock_tip) = if self.app_lock_config.enabled {
+                                (
+                                    if lock_resp.hovered() {
+                                        pal.primary_hover
+                                    } else {
+                                        pal.primary
+                                    },
+                                    if cfg!(target_os = "macos") {
+                                        "Khoá ứng dụng (Cmd+L)"
+                                    } else {
+                                        "Khoá ứng dụng (Ctrl+L)"
+                                    },
+                                )
+                            } else {
+                                (
+                                    if lock_resp.hovered() {
+                                        pal.text_primary
+                                    } else {
+                                        pal.text_muted
+                                    },
+                                    "Thiết lập khoá ứng dụng (App Lock)",
+                                )
+                            };
+                            ui.painter().text(
+                                lock_rect.center(),
+                                egui::Align2::CENTER_CENTER,
+                                lucide::LOCK,
+                                FontId::proportional(13.5),
+                                lock_color,
+                            );
+                            if lock_resp
+                                .on_hover_cursor(CursorIcon::PointingHand)
+                                .on_hover_text(lock_tip)
+                                .clicked()
+                            {
+                                if self.app_lock_config.enabled {
+                                    if self.is_logged_in
+                                        || crate::account_manager::has_any_saved_credentials()
+                                    {
+                                        self.lock_now(ctx);
+                                    }
+                                } else {
+                                    self.settings_modal_open = true;
+                                    self.settings_tab = SettingsTab::Privacy;
+                                }
+                            }
+                            buttons_left_x = lock_rect.left();
+                        }
 
                         if !self.app_locked {
                             if let Some(ref upd) = self.update_info {
