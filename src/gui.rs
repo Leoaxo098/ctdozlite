@@ -1609,6 +1609,21 @@ impl Default for AppLockUiState {
     }
 }
 
+impl AppLockUiState {
+    /// Scrub ephemeral unlock inputs, forgot-passcode confirmation, and plaintext settings drafts on lock.
+    pub(super) fn clear_sensitive_on_lock(&mut self) {
+        self.unlock_input.clear();
+        self.unlock_error = None;
+        self.confirm_forgot_open = false;
+        self.focus_requested = true;
+        self.settings_action = AppLockSettingsAction::Idle;
+        self.draft_current.clear();
+        self.draft_new.clear();
+        self.draft_confirm.clear();
+        self.settings_error = None;
+    }
+}
+
 /// Compute effective window focus, always treating a locked window as unfocused.
 fn combine_effective_focus(os_focused: bool, app_locked: bool) -> bool {
     os_focused && !app_locked
@@ -1621,6 +1636,41 @@ fn should_trigger_lock_with_creds(
     has_creds: bool,
 ) -> bool {
     !app_locked && cfg.enabled && has_creds
+}
+
+/// Refresh `last_activity_ui_time` when user input is observed in the current frame.
+fn record_activity_if_input(last_activity_ui_time: &mut f64, now_ui: f64, has_user_input: bool) {
+    if has_user_input {
+        *last_activity_ui_time = now_ui;
+    }
+}
+
+/// Decide whether the signed-in display name may appear in the custom title bar.
+fn title_bar_shows_user_name(
+    compact_title_bar: bool,
+    is_logged_in: bool,
+    app_locked: bool,
+    user_name: &str,
+) -> bool {
+    !compact_title_bar && is_logged_in && !app_locked && !user_name.is_empty()
+}
+
+/// Decide whether the "Xem lịch sử đã lưu" button may appear in the custom title bar.
+fn title_bar_shows_saved_history_btn(
+    app_locked: bool,
+    is_logged_in: bool,
+    has_threads: bool,
+) -> bool {
+    !app_locked && !is_logged_in && has_threads
+}
+
+/// Decide whether the update status pill may appear in the custom title bar.
+fn title_bar_shows_update_pill(
+    app_locked: bool,
+    has_update: bool,
+    compact_title_bar: bool,
+) -> bool {
+    !app_locked && has_update && !compact_title_bar
 }
 
 pub struct ZaloGuiApp {
@@ -3090,10 +3140,7 @@ impl ZaloGuiApp {
         self.vanish_picker_open = false;
         self.sticker_picker_open = false;
         self.in_chat_search_open = false;
-        self.app_lock_ui.unlock_input.clear();
-        self.app_lock_ui.unlock_error = None;
-        self.app_lock_ui.confirm_forgot_open = false;
-        self.app_lock_ui.focus_requested = true;
+        self.app_lock_ui.clear_sensitive_on_lock();
         ctx.request_repaint();
     }
 
@@ -3288,6 +3335,9 @@ impl ZaloGuiApp {
                     self.login_in_progress = false;
                     self.composer_sticker_cache.retain(|_, v| !v.is_empty());
                     self.status_msg = "Trực tuyến · Đồng bộ thời gian thực".into();
+                    if !self.app_locked {
+                        self.app_lock_ui.last_activity_ui_time = ctx.input(|i| i.time);
+                    }
                 }
                 GuiEvent::LoginFailed(err) => {
                     self.login_in_progress = false;
@@ -3859,6 +3909,9 @@ impl ZaloGuiApp {
                     self.publish_known_threads();
                     if let Some(tx) = WORKER_TX.get() {
                         let _ = tx.send(WorkerCmd::RefreshThreads);
+                    }
+                    if !self.app_locked {
+                        self.app_lock_ui.last_activity_ui_time = ctx.input(|i| i.time);
                     }
                 }
                 GuiEvent::MessageSent {
@@ -5627,8 +5680,6 @@ impl ZaloGuiApp {
             self.theme_dirty = false;
         }
 
-        self.check_events(ctx);
-
         let (now_ui, has_user_input) = ctx.input(|i| {
             let active = !i.events.is_empty()
                 || i.pointer.any_pressed()
@@ -5636,9 +5687,14 @@ impl ZaloGuiApp {
                 || i.pointer.delta() != Vec2::ZERO;
             (i.time, active)
         });
-        if has_user_input {
-            self.app_lock_ui.last_activity_ui_time = now_ui;
-        }
+        record_activity_if_input(
+            &mut self.app_lock_ui.last_activity_ui_time,
+            now_ui,
+            has_user_input,
+        );
+
+        self.check_events(ctx);
+
         let now_wall = crate::login::unix_now();
         let wall_delta = now_wall.saturating_sub(self.app_lock_ui.last_frame_wall_unix);
         let ui_delta = (now_ui - self.app_lock_ui.last_frame_ui_time).max(0.0);
@@ -6241,11 +6297,12 @@ impl ZaloGuiApp {
                         );
                     }
 
-                    if !compact_title_bar
-                        && self.is_logged_in
-                        && !self.app_locked
-                        && !self.user_name.is_empty()
-                    {
+                    if title_bar_shows_user_name(
+                        compact_title_bar,
+                        self.is_logged_in,
+                        self.app_locked,
+                        &self.user_name,
+                    ) {
                         ui.add_space(6.0);
                         ui.label(
                             RichText::new(format!("·  {}", truncate_chars(&self.user_name, 18)))
@@ -6414,44 +6471,54 @@ impl ZaloGuiApp {
 
                         buttons_left_x = th_rect.left();
 
-                        if let Some(ref upd) = self.update_info {
-                            if upd.has_update && !compact_title_bar {
-                                ui.add_space(6.0);
-                                let badge_txt = if self.update_downloading {
-                                    let (dl, tot) = self.update_progress.unwrap_or((0, 0));
-                                    if tot > 0 {
-                                        let pct = ((dl as f64 / tot as f64) * 100.0).clamp(0.0, 100.0);
-                                        format!("{} Đang cập nhật {pct:.0}%", lucide::REFRESH)
+                        if !self.app_locked {
+                            if let Some(ref upd) = self.update_info {
+                                if title_bar_shows_update_pill(
+                                    self.app_locked,
+                                    upd.has_update,
+                                    compact_title_bar,
+                                ) {
+                                    ui.add_space(6.0);
+                                    let badge_txt = if self.update_downloading {
+                                        let (dl, tot) = self.update_progress.unwrap_or((0, 0));
+                                        if tot > 0 {
+                                            let pct = ((dl as f64 / tot as f64) * 100.0).clamp(0.0, 100.0);
+                                            format!("{} Đang cập nhật {pct:.0}%", lucide::REFRESH)
+                                        } else {
+                                            format!("{} Đang tải cập nhật…", lucide::REFRESH)
+                                        }
                                     } else {
-                                        format!("{} Đang tải cập nhật…", lucide::REFRESH)
+                                        format!("{} Cập nhật mới v{}", lucide::SPARKLES, upd.latest_version)
+                                    };
+                                    let upd_pill = egui::Button::new(
+                                        RichText::new(badge_txt)
+                                            .size(11.2)
+                                            .color(pal.primary_fg)
+                                            .strong(),
+                                    )
+                                    .fill(pal.primary)
+                                    .rounding(Rounding::same(5.0));
+                                    let r = ui
+                                        .add(upd_pill)
+                                        .on_hover_cursor(CursorIcon::PointingHand)
+                                        .on_hover_text(format!(
+                                            "Đã có phiên bản v{} trên GitHub Releases — Bấm để xem chi tiết & cập nhật tự động",
+                                            upd.latest_version
+                                        ));
+                                    buttons_left_x = r.rect.left() - 8.0;
+                                    if r.clicked() {
+                                        self.update_modal_open = true;
+                                        self.update_banner_dismissed = false;
                                     }
-                                } else {
-                                    format!("{} Cập nhật mới v{}", lucide::SPARKLES, upd.latest_version)
-                                };
-                                let upd_pill = egui::Button::new(
-                                    RichText::new(badge_txt)
-                                        .size(11.2)
-                                        .color(pal.primary_fg)
-                                        .strong(),
-                                )
-                                .fill(pal.primary)
-                                .rounding(Rounding::same(5.0));
-                                let r = ui
-                                    .add(upd_pill)
-                                    .on_hover_cursor(CursorIcon::PointingHand)
-                                    .on_hover_text(format!(
-                                        "Đã có phiên bản v{} trên GitHub Releases — Bấm để xem chi tiết & cập nhật tự động",
-                                        upd.latest_version
-                                    ));
-                                buttons_left_x = r.rect.left() - 8.0;
-                                if r.clicked() {
-                                    self.update_modal_open = true;
-                                    self.update_banner_dismissed = false;
                                 }
                             }
                         }
 
-                        if !self.is_logged_in && !self.threads.is_empty() {
+                        if title_bar_shows_saved_history_btn(
+                            self.app_locked,
+                            self.is_logged_in,
+                            !self.threads.is_empty(),
+                        ) {
                             ui.add_space(8.0);
                             let hist_btn = egui::Button::new(
                                 RichText::new("Xem lịch sử đã lưu")
@@ -7925,5 +7992,61 @@ mod app_lock_state_tests {
         assert!(should_trigger_lock_with_creds(&cfg, false, true));
         assert!(!should_trigger_lock_with_creds(&cfg, true, true));
         assert!(!should_trigger_lock_with_creds(&cfg, false, false));
+    }
+
+    #[test]
+    fn title_bar_hides_sensitive_widgets_while_locked() {
+        assert!(!title_bar_shows_user_name(false, true, true, "Alice"));
+        assert!(title_bar_shows_user_name(false, true, false, "Alice"));
+        assert!(!title_bar_shows_saved_history_btn(true, false, true));
+        assert!(title_bar_shows_saved_history_btn(false, false, true));
+        assert!(!title_bar_shows_update_pill(true, true, false));
+        assert!(title_bar_shows_update_pill(false, true, false));
+    }
+
+    #[test]
+    fn lock_scrubs_ephemeral_inputs_and_settings_drafts() {
+        let mut ui = AppLockUiState {
+            unlock_input: "1234".into(),
+            unlock_error: Some("Sai".into()),
+            focus_requested: false,
+            confirm_forgot_open: true,
+            corrupted_config: true,
+            settings_action: AppLockSettingsAction::Changing,
+            draft_mode: crate::app_lock::PasscodeMode::Custom,
+            draft_current: "old-pass".into(),
+            draft_new: "new-pass".into(),
+            draft_confirm: "new-pass".into(),
+            settings_error: Some("Mismatch".into()),
+            last_activity_ui_time: 42.0,
+            last_frame_wall_unix: 100,
+            last_frame_ui_time: 42.0,
+        };
+        ui.clear_sensitive_on_lock();
+        assert!(ui.unlock_input.is_empty());
+        assert_eq!(ui.unlock_error, None);
+        assert!(!ui.confirm_forgot_open);
+        assert!(ui.focus_requested);
+        assert_eq!(ui.settings_action, AppLockSettingsAction::Idle);
+        assert!(ui.draft_current.is_empty());
+        assert!(ui.draft_new.is_empty());
+        assert!(ui.draft_confirm.is_empty());
+        assert_eq!(ui.settings_error, None);
+        assert!(ui.corrupted_config);
+        assert_eq!(ui.last_activity_ui_time, 42.0);
+    }
+
+    #[test]
+    fn user_input_refreshes_activity_before_watchdog_tick() {
+        let mut last_activity = 10.0;
+        let now_ui = 320.0;
+        record_activity_if_input(&mut last_activity, now_ui, true);
+        assert_eq!(last_activity, 320.0);
+        assert!(!crate::app_lock::is_idle_expired(
+            last_activity,
+            now_ui,
+            300,
+            false
+        ));
     }
 }
