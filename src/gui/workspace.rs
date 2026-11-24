@@ -1520,14 +1520,11 @@ impl ZaloGuiApp {
                                 );
                             let is_pinned_cloud =
                                 t.name.contains("Cloud của tôi") || is_user_pinned;
-                            let is_muted = self
-                                .settings
-                                .muted_threads
-                                .get(&t.id)
-                                .map(|&until| until == -1 || until > now_unix)
-                                .unwrap_or(false)
-                                || t.presentation.muted
-                                || t.unread.is_muted();
+                            let is_muted = crate::unread::is_thread_muted(
+                                &self.settings.muted_threads,
+                                t,
+                                now_unix,
+                            );
                             let is_hidden = self.settings.hidden_threads.contains(&t.id)
                                 || t.presentation.hidden;
                             let cur_label = self.settings.thread_labels.get(&t.id).cloned();
@@ -2564,21 +2561,36 @@ impl ZaloGuiApp {
                         ThreadCtxAction::SetMute(tid, is_group, dur_opt, toast_txt) => {
                             let (dur_sec, mute) = match dur_opt {
                                 Some(-1) => {
-                                    self.settings.muted_threads.insert(tid.clone(), -1);
+                                    crate::unread::set_muted_thread(
+                                        &mut self.settings.muted_threads,
+                                        &tid,
+                                        is_group,
+                                        -1,
+                                    );
                                     (-1, true)
                                 }
                                 Some(d) => {
-                                    self.settings
-                                        .muted_threads
-                                        .insert(tid.clone(), now_unix + d);
+                                    crate::unread::set_muted_thread(
+                                        &mut self.settings.muted_threads,
+                                        &tid,
+                                        is_group,
+                                        now_unix + d,
+                                    );
                                     (d, true)
                                 }
                                 None => {
-                                    self.settings.muted_threads.remove(&tid);
+                                    crate::unread::clear_muted_thread(
+                                        &mut self.settings.muted_threads,
+                                        &tid,
+                                        is_group,
+                                    );
                                     (-1, false)
                                 }
                             };
-                            if let Some(th) = self.threads.iter_mut().find(|t| t.id == tid) {
+                            for th in self.threads.iter_mut().filter(|t| {
+                                t.is_group == is_group
+                                    && crate::unread::mute_key_matches(&tid, &t.id, is_group)
+                            }) {
                                 th.presentation.muted = mute;
                                 th.unread.muted = mute;
                                 th.unread.muted_until = if mute && dur_sec > 0 {
@@ -2954,6 +2966,14 @@ impl ZaloGuiApp {
                     })
                     .unwrap_or_default();
 
+                let drawer_thread_muted = self.threads.get(self.selected_thread_index).map(|t| {
+                    (
+                        t.presentation.muted,
+                        t.unread.muted,
+                        t.unread.muted_until,
+                    )
+                });
+
                 let mut close_drawer_requested = false;
                 let mut render_drawer_inner = |ui: &mut egui::Ui, close_req: &mut bool| {
                         let drawer_rect = ui.max_rect();
@@ -3185,7 +3205,18 @@ impl ZaloGuiApp {
                                     ui.add_space(14.0);
 
                                     // 4 Circular Icon Action Buttons (matching native Zalo Desktop)
-                                    let is_muted = self.settings.muted_threads.contains_key(d_id);
+                                    let now_unix_drawer = crate::login::unix_now() as i64;
+                                    let (d_pres_muted, d_unread_muted, d_unread_until) =
+                                        drawer_thread_muted.unwrap_or((false, false, None));
+                                    let is_muted = crate::unread::is_muted_state(
+                                        &self.settings.muted_threads,
+                                        d_id,
+                                        d_is_group,
+                                        d_pres_muted,
+                                        d_unread_muted,
+                                        d_unread_until,
+                                        now_unix_drawer,
+                                    );
                                     let is_pinned = self.settings.pinned_threads.contains(d_id);
                                     let col_w = ((drawer_w - 24.0) / 4.0).max(58.0);
 
@@ -3256,13 +3287,27 @@ impl ZaloGuiApp {
                                             let new_mute = !is_muted;
                                             let dur_sec = if new_mute { -1 } else { 0 };
                                             if new_mute {
-                                                self.settings.muted_threads.insert(d_id.clone(), -1);
+                                                crate::unread::set_muted_thread(
+                                                    &mut self.settings.muted_threads,
+                                                    d_id,
+                                                    d_is_group,
+                                                    -1,
+                                                );
                                             } else {
-                                                self.settings.muted_threads.remove(d_id);
+                                                crate::unread::clear_muted_thread(
+                                                    &mut self.settings.muted_threads,
+                                                    d_id,
+                                                    d_is_group,
+                                                );
                                             }
-                                            if let Some(th) =
-                                                self.threads.iter_mut().find(|t| &t.id == d_id)
-                                            {
+                                            for th in self.threads.iter_mut().filter(|t| {
+                                                t.is_group == d_is_group
+                                                    && crate::unread::mute_key_matches(
+                                                        d_id,
+                                                        &t.id,
+                                                        d_is_group,
+                                                    )
+                                            }) {
                                                 th.presentation.muted = new_mute;
                                                 th.unread.muted = new_mute;
                                                 th.unread.muted_until = None;

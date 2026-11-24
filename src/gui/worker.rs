@@ -749,8 +749,33 @@ pub(super) fn extract_msg_id(resp: &serde_json::Value) -> String {
 
 pub(super) fn resp_error_code(resp: &serde_json::Value) -> Option<i64> {
     resp.get("error_code")
-        .and_then(serde_json::Value::as_i64)
+        .and_then(|v| {
+            v.as_i64()
+                .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
+        })
         .filter(|c| *c != 0)
+}
+
+/// Fetch `/api/social/profile/getmute`, merge into `threads`, and emit `MuteSnapshotSynced`
+/// only when `getmute` succeeds (`error_code == 0`) for the currently active account.
+pub(super) async fn sync_mute_snapshot_for_session(
+    s: &Session,
+    threads: &mut [crate::chat::Thread],
+    gui_tx: &GuiTx,
+) {
+    if let Ok(mute_resp) = crate::chat::get_mute_conversations(s).await {
+        if resp_error_code(&mute_resp).is_none() {
+            crate::unread::merge_mute_metadata(threads, &mute_resp);
+            if session_matches_active(s) {
+                if let Some(mute_map) = crate::unread::extract_mute_map(
+                    &mute_resp,
+                    crate::login::unix_now() as i64,
+                ) {
+                    let _ = gui_tx.send(GuiEvent::MuteSnapshotSynced(mute_map));
+                }
+            }
+        }
+    }
 }
 
 /// Immediately decode any disk-cached sticker thumbnails (`<media cache>/stk_{cid}_{sid}.png`)
@@ -1902,7 +1927,8 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             let ctx_clone = egui_ctx.clone();
                             tokio::spawn(async move {
                                 let s = session_clone.lock().await.clone();
-                                match crate::chat::set_mute_conversation(
+                                let action_now = crate::login::unix_now() as i64;
+                                let set_ok = match crate::chat::set_mute_conversation(
                                     &s,
                                     &thread_id,
                                     is_group,
@@ -1920,6 +1946,9 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                             let _ = gui_tx_clone
                                                 .send(GuiEvent::StatusUpdate(msg));
                                             ctx_clone.request_repaint();
+                                            false
+                                        } else {
+                                            true
                                         }
                                     }
                                     Err(err) => {
@@ -1927,17 +1956,31 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                         crate::logger::log_error("gui::mute", &msg);
                                         let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(msg));
                                         ctx_clone.request_repaint();
+                                        false
                                     }
-                                }
+                                };
                                 if let Ok(mute_resp) = crate::chat::get_mute_conversations(&s).await
                                 {
-                                    if let Some(mute_map) = crate::unread::extract_mute_map(
-                                        &mute_resp,
-                                        crate::login::unix_now() as i64,
-                                    ) {
-                                        let _ = gui_tx_clone
-                                            .send(GuiEvent::MuteSnapshotSynced(mute_map));
-                                        ctx_clone.request_repaint();
+                                    if resp_error_code(&mute_resp).is_none() && session_matches_active(&s) {
+                                        let sync_now = crate::login::unix_now() as i64;
+                                        if let Some(mut mute_map) = crate::unread::extract_mute_map(
+                                            &mute_resp,
+                                            sync_now,
+                                        ) {
+                                            if set_ok {
+                                                crate::unread::reconcile_post_setmute_snapshot(
+                                                    &mut mute_map,
+                                                    &thread_id,
+                                                    is_group,
+                                                    mute,
+                                                    duration_sec,
+                                                    action_now,
+                                                );
+                                            }
+                                            let _ = gui_tx_clone
+                                                .send(GuiEvent::MuteSnapshotSynced(mute_map));
+                                            ctx_clone.request_repaint();
+                                        }
                                     }
                                 }
                             });
@@ -2260,26 +2303,12 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                                             )
                                                             .await;
                                                         }
-                                                        if let Ok(mute_resp) =
-                                                            crate::chat::get_mute_conversations(&s)
-                                                                .await
-                                                        {
-                                                            crate::unread::merge_mute_metadata(
-                                                                &mut list, &mute_resp,
-                                                            );
-                                                            if let Some(mute_map) =
-                                                                crate::unread::extract_mute_map(
-                                                                    &mute_resp,
-                                                                    crate::login::unix_now() as i64,
-                                                                )
-                                                            {
-                                                                let _ = gui_tx_clone.send(
-                                                                    GuiEvent::MuteSnapshotSynced(
-                                                                        mute_map,
-                                                                    ),
-                                                                );
-                                                            }
-                                                        }
+                                                        sync_mute_snapshot_for_session(
+                                                            &s,
+                                                            &mut list,
+                                                            &gui_tx_clone,
+                                                        )
+                                                        .await;
                                                         if let Ok(pinned_resp) = crate::chat::get_pinned(&s).await {
                                                             let pids = crate::chat::parse_pinned_conversations(&pinned_resp);
                                                             crate::chat::apply_pinned_threads(&mut list, &pids);
@@ -2537,18 +2566,12 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                         let mut ps = poll_clone.lock().await;
                                         *ps = fresh_ps;
                                     }
-                                    if let Ok(mute_resp) =
-                                        crate::chat::get_mute_conversations(&s).await
-                                    {
-                                        crate::unread::merge_mute_metadata(&mut list, &mute_resp);
-                                        if let Some(mute_map) = crate::unread::extract_mute_map(
-                                            &mute_resp,
-                                            crate::login::unix_now() as i64,
-                                        ) {
-                                            let _ = gui_tx_clone
-                                                .send(GuiEvent::MuteSnapshotSynced(mute_map));
-                                        }
-                                    }
+                                    sync_mute_snapshot_for_session(
+                                        &s,
+                                        &mut list,
+                                        &gui_tx_clone,
+                                    )
+                                    .await;
                                     if let Ok(pinned_resp) = crate::chat::get_pinned(&s).await {
                                         let pids = crate::chat::parse_pinned_conversations(&pinned_resp);
                                         crate::chat::apply_pinned_threads(&mut list, &pids);
@@ -4642,23 +4665,12 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                                     )
                                                     .await;
                                                 }
-                                                if let Ok(mute_resp) =
-                                                    crate::chat::get_mute_conversations(&s).await
-                                                {
-                                                    crate::unread::merge_mute_metadata(
-                                                        &mut list, &mute_resp,
-                                                    );
-                                                    if let Some(mute_map) =
-                                                        crate::unread::extract_mute_map(
-                                                            &mute_resp,
-                                                            crate::login::unix_now() as i64,
-                                                        )
-                                                    {
-                                                        let _ = gui_tx_clone.send(
-                                                            GuiEvent::MuteSnapshotSynced(mute_map),
-                                                        );
-                                                    }
-                                                }
+                                                sync_mute_snapshot_for_session(
+                                                    &s,
+                                                    &mut list,
+                                                    &gui_tx_clone,
+                                                )
+                                                .await;
                                                 let sync_snapshot = list.clone();
                                                 if session_matches_active(&s) {
                                                     let _ = gui_tx_clone

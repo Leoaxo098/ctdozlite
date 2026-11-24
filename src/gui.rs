@@ -1453,11 +1453,17 @@ impl AppSettings {
         }
     }
 
+    pub(crate) fn normalize_muted_threads_at(&mut self, now_unix: i64) {
+        crate::unread::normalize_muted_threads(&mut self.muted_threads, now_unix);
+    }
+
     fn load() -> Self {
-        std::fs::read_to_string("app_settings.json")
+        let mut settings = std::fs::read_to_string("app_settings.json")
             .ok()
             .and_then(|s| serde_json::from_str::<Self>(&s).ok())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        settings.normalize_muted_threads_at(crate::login::unix_now() as i64);
+        settings
     }
 
     fn save(&self) {
@@ -1941,16 +1947,17 @@ impl ZaloGuiApp {
             }
         }
         let now_ts = crate::login::unix_now() as i64;
+        crate::unread::reconcile_muted_threads_with_threads(
+            &mut loaded_settings.muted_threads,
+            &threads,
+            now_ts,
+        );
         for t in threads.iter_mut() {
-            if let Some(&until) = loaded_settings.muted_threads.get(&t.id) {
-                if until == -1 || until > now_ts {
-                    t.presentation.muted = true;
-                    t.unread.muted = true;
-                    t.unread.muted_until = (until > 0).then_some(until);
-                }
-            } else if t.unread.is_muted() {
-                t.presentation.muted = true;
-            }
+            crate::unread::apply_muted_settings_to_thread(
+                &loaded_settings.muted_threads,
+                t,
+                now_ts,
+            );
         }
         crate::chat::deduplicate_threads(&mut threads, None);
         if let Ok(mut watch) = VANISH_THREADS.lock() {
@@ -2235,6 +2242,64 @@ impl ZaloGuiApp {
         }
         app
     }
+}
+
+/// Apply an authoritative server mute snapshot to `muted_threads` and all open threads,
+/// matching group and DM ID prefixes consistently.
+pub(crate) fn apply_mute_snapshot_to_state(
+    muted_threads: &mut HashMap<String, i64>,
+    threads: &mut [Thread],
+    mut mute_map: HashMap<String, i64>,
+    now_ts: i64,
+) {
+    crate::unread::normalize_muted_threads(&mut mute_map, now_ts);
+    *muted_threads = mute_map;
+    for t in threads {
+        if let Some(until) =
+            crate::unread::active_mute_until(muted_threads, &t.id, t.is_group, now_ts)
+        {
+            t.presentation.muted = true;
+            t.unread.muted = true;
+            t.unread.muted_until = (until > 0).then_some(until);
+        } else {
+            t.presentation.muted = false;
+            t.unread.muted = false;
+            t.unread.muted_until = None;
+        }
+        t.unread.settings_fresh = true;
+        t.unread.fresh = true;
+    }
+}
+
+/// Apply real-time mute/unmute control events to `muted_threads` and matching threads.
+pub(crate) fn apply_mute_events_to_state(
+    muted_threads: &mut HashMap<String, i64>,
+    threads: &mut [Thread],
+    events: Vec<crate::chat::MuteControlEvent>,
+) -> bool {
+    let mut changed = false;
+    for ev in events {
+        if ev.muted {
+            let until_val = ev
+                .settings_until
+                .unwrap_or_else(|| ev.muted_until.unwrap_or(-1));
+            crate::unread::set_muted_thread(muted_threads, &ev.thread_id, ev.is_group, until_val);
+        } else {
+            crate::unread::clear_muted_thread(muted_threads, &ev.thread_id, ev.is_group);
+        }
+        for t in threads.iter_mut().filter(|t| {
+            t.is_group == ev.is_group
+                && crate::unread::mute_key_matches(&ev.thread_id, &t.id, t.is_group)
+        }) {
+            t.presentation.muted = ev.muted;
+            t.unread.muted = ev.muted;
+            t.unread.muted_until = ev.muted_until;
+            t.unread.settings_fresh = true;
+            t.unread.fresh = true;
+        }
+        changed = true;
+    }
+    changed
 }
 
 /// Maximum retries after an initial sticker/image download failure (1 initial + 2 retries = 3 attempts).
@@ -3046,26 +3111,29 @@ impl ZaloGuiApp {
                         let mut script_msg_pending: Vec<(String, Vec<ChatMessage>)> = Vec::new();
                         let now_ts = crate::login::unix_now() as i64;
                         for mut nt in updates {
-                            let settings_muted_until = self
-                                .settings
-                                .muted_threads
-                                .get(&nt.id)
-                                .copied()
-                                .filter(|&u| u == -1 || u > now_ts);
-                            if let Some(until) = settings_muted_until {
-                                nt.presentation.muted = true;
-                                nt.unread.muted = true;
-                                nt.unread.muted_until = (until > 0).then_some(until);
-                            } else if nt.unread.is_muted() {
-                                nt.presentation.muted = true;
-                            }
+                            let settings_muted_until = crate::unread::active_mute_until(
+                                &self.settings.muted_threads,
+                                &nt.id,
+                                nt.is_group,
+                                now_ts,
+                            );
+                            let incoming_settings_fresh = nt.unread.settings_fresh;
+                            crate::unread::apply_muted_settings_to_thread(
+                                &self.settings.muted_threads,
+                                &mut nt,
+                                now_ts,
+                            );
                             if let Some(existing) = self.threads.iter_mut().find(|t| t.id == nt.id)
                             {
-                                let is_thread_muted = settings_muted_until.is_some()
-                                    || existing.presentation.muted
-                                    || existing.unread.is_muted()
-                                    || nt.presentation.muted
-                                    || nt.unread.is_muted();
+                                let is_thread_muted = crate::unread::is_thread_muted(
+                                    &self.settings.muted_threads,
+                                    existing,
+                                    now_ts,
+                                ) || crate::unread::is_thread_muted(
+                                    &self.settings.muted_threads,
+                                    &nt,
+                                    now_ts,
+                                );
                                 let was_empty = existing.messages.is_empty();
                                 let old_len = existing.messages.len();
                                 let old_max_ts = existing
@@ -3081,6 +3149,17 @@ impl ZaloGuiApp {
                                     .map(|m| m.id.clone())
                                     .collect();
                                 crate::chat::merge_thread_into(existing, nt, true);
+                                if let Some(until) = settings_muted_until {
+                                    existing.presentation.muted = true;
+                                    existing.unread.muted = true;
+                                    existing.unread.muted_until = (until > 0).then_some(until);
+                                } else if incoming_settings_fresh {
+                                    existing.presentation.muted = existing.unread.is_muted_at(now_ts);
+                                } else if existing.unread.muted_until.is_some_and(|u| u <= now_ts) {
+                                    existing.presentation.muted = false;
+                                    existing.unread.muted = false;
+                                    existing.unread.muted_until = None;
+                                }
                                 if was_empty && existing.unread.last_seen_id.is_none() {
                                     // Empty thread receiving its initial history snapshot must not fire alerts.
                                     let _ = advance_thread_read_point(existing);
@@ -3263,6 +3342,17 @@ impl ZaloGuiApp {
                                     && crate::chat::threads_represent_same_contact(t, &nt)
                             }) {
                                 crate::chat::merge_thread_into(existing, nt, true);
+                                if let Some(until) = settings_muted_until {
+                                    existing.presentation.muted = true;
+                                    existing.unread.muted = true;
+                                    existing.unread.muted_until = (until > 0).then_some(until);
+                                } else if incoming_settings_fresh {
+                                    existing.presentation.muted = existing.unread.is_muted_at(now_ts);
+                                } else if existing.unread.muted_until.is_some_and(|u| u <= now_ts) {
+                                    existing.presentation.muted = false;
+                                    existing.unread.muted = false;
+                                    existing.unread.muted_until = None;
+                                }
                             } else if !nt.id.is_empty() && nt.id != "0" {
                                 // Brand-new thread chưa có read-point (#1445): đây là lần
                                 // đầu thấy thread (history load hoặc poll đầu), KHÔNG
@@ -3272,9 +3362,11 @@ impl ZaloGuiApp {
                                 // event / poll batch tiếp theo) mới đếm qua nhánh
                                 // merge ở trên. Đơn giản và đúng vì mọi tin trong
                                 // batch đầu đều là history, không phải tin mới.
-                                let is_thread_muted = settings_muted_until.is_some()
-                                    || nt.presentation.muted
-                                    || nt.unread.is_muted();
+                                let is_thread_muted = crate::unread::is_thread_muted(
+                                    &self.settings.muted_threads,
+                                    &nt,
+                                    now_ts,
+                                );
                                 let seen = nt.unread.last_seen_id.as_deref().unwrap_or("");
                                 if seen.is_empty() {
                                     let _ = advance_thread_read_point(&mut nt);
@@ -3833,15 +3925,11 @@ impl ZaloGuiApp {
                             continue;
                         }
                         for t in &self.threads {
-                            let muted = self
-                                .settings
-                                .muted_threads
-                                .get(&t.id)
-                                .copied()
-                                .filter(|&u| u == -1 || u > now_ts_react)
-                                .is_some()
-                                || t.presentation.muted
-                                || t.unread.is_muted();
+                            let muted = crate::unread::is_thread_muted(
+                                &self.settings.muted_threads,
+                                t,
+                                now_ts_react,
+                            );
                             if muted || !reactions_notify_on {
                                 continue;
                             }
@@ -3882,7 +3970,7 @@ impl ZaloGuiApp {
                         if ev.sender_id.is_empty() || ev.sender_id == my_uid_count {
                             continue;
                         }
-                        let mut hit_tid: Option<String> = None;
+                        let mut hit_target: Option<(String, bool, bool)> = None;
                         for t in &self.threads {
                             let Some(m) = find_reaction_target(&t.messages, ev) else {
                                 continue;
@@ -3890,28 +3978,30 @@ impl ZaloGuiApp {
                             if !m.is_outgoing {
                                 continue;
                             }
-                            if !ev.thread_id.is_empty() {
-                                hit_tid = Some(ev.thread_id.clone());
-                                break;
+                            let tid_val = if !ev.thread_id.is_empty() {
+                                ev.thread_id.clone()
                             } else {
-                                hit_tid = Some(t.id.clone());
-                                break;
-                            }
+                                t.id.clone()
+                            };
+                            let t_muted = crate::unread::is_thread_muted(
+                                &self.settings.muted_threads,
+                                t,
+                                now_ts_react,
+                            );
+                            hit_target = Some((tid_val, t.is_group, t_muted));
+                            break;
                         }
-                        let Some(tid) = hit_tid else { continue };
-                        let is_muted = self
-                            .settings
-                            .muted_threads
-                            .get(&tid)
-                            .copied()
-                            .filter(|&u| u == -1 || u > now_ts_react)
-                            .is_some()
-                            || self
-                                .threads
-                                .iter()
-                                .find(|t| t.id == tid)
-                                .map(|t| t.presentation.muted || t.unread.is_muted())
-                                .unwrap_or(false);
+                        let Some((tid, hit_is_group, hit_thread_muted)) = hit_target else {
+                            continue;
+                        };
+                        let is_muted = hit_thread_muted
+                            || crate::unread::active_mute_until(
+                                &self.settings.muted_threads,
+                                &tid,
+                                hit_is_group,
+                                now_ts_react,
+                            )
+                            .is_some();
                         if is_muted {
                             continue;
                         }
@@ -4809,25 +4899,14 @@ impl ZaloGuiApp {
                     }
                 }
                 GuiEvent::MuteSnapshotSynced(mute_map) => {
-                    self.settings.muted_threads = mute_map.clone();
-                    self.settings.save();
                     let now_ts = crate::login::unix_now() as i64;
-                    for t in &mut self.threads {
-                        if let Some(&until) = mute_map.get(&t.id) {
-                            let active = until == -1 || until > now_ts;
-                            t.presentation.muted = active;
-                            t.unread.muted = active;
-                            t.unread.muted_until = (until > 0).then_some(until);
-                            t.unread.settings_fresh = true;
-                            t.unread.fresh = true;
-                        } else {
-                            t.presentation.muted = false;
-                            t.unread.muted = false;
-                            t.unread.muted_until = None;
-                            t.unread.settings_fresh = true;
-                            t.unread.fresh = true;
-                        }
-                    }
+                    apply_mute_snapshot_to_state(
+                        &mut self.settings.muted_threads,
+                        &mut self.threads,
+                        mute_map,
+                        now_ts,
+                    );
+                    self.settings.save();
                     self.persist_threads_async();
                 }
                 GuiEvent::PinnedSnapshotSynced(pinned_ids) => {
@@ -4849,26 +4928,11 @@ impl ZaloGuiApp {
                     self.persist_threads_async();
                 }
                 GuiEvent::MuteEventsReceived(events) => {
-                    let mut changed = false;
-                    for ev in events {
-                        if ev.muted {
-                            let until_val = ev.muted_until.unwrap_or(-1);
-                            self.settings
-                                .muted_threads
-                                .insert(ev.thread_id.clone(), until_val);
-                        } else {
-                            self.settings.muted_threads.remove(&ev.thread_id);
-                        }
-                        if let Some(t) = self.threads.iter_mut().find(|t| t.id == ev.thread_id) {
-                            t.presentation.muted = ev.muted;
-                            t.unread.muted = ev.muted;
-                            t.unread.muted_until = ev.muted_until;
-                            t.unread.settings_fresh = true;
-                            t.unread.fresh = true;
-                        }
-                        changed = true;
-                    }
-                    if changed {
+                    if apply_mute_events_to_state(
+                        &mut self.settings.muted_threads,
+                        &mut self.threads,
+                        events,
+                    ) {
                         self.settings.save();
                         self.persist_threads_async();
                     }
@@ -7387,6 +7451,131 @@ mod tests {
             super::format_call_camera_label("USB Cam", &cams, false),
             "USB Cam"
         );
+    }
+
+    fn mute_test_thread(id: &str, is_group: bool) -> crate::chat::Thread {
+        crate::chat::Thread {
+            presentation: Default::default(),
+            unread: Default::default(),
+            id: id.into(),
+            name: String::new(),
+            preview: String::new(),
+            time: String::new(),
+            avatar: None,
+            is_group,
+            messages: Vec::new(),
+            vanish: None,
+        }
+    }
+
+    #[test]
+    fn mute_snapshot_synced_preserves_all_muted_groups_across_id_formats() {
+        let now = 1_700_000_100_i64;
+        let mut settings_muted = std::collections::HashMap::from([
+            ("20002".to_string(), -1),
+            ("group_30003".to_string(), -1),
+        ]);
+        let mut threads = vec![
+            mute_test_thread("20002", true),
+            mute_test_thread("group_30003", true),
+            mute_test_thread("g40004", true),
+            mute_test_thread("20002", false),
+            mute_test_thread("10001", false),
+        ];
+        let server_snapshot = std::collections::HashMap::from([
+            ("g20002".to_string(), -1),
+            ("g30003".to_string(), -1),
+            ("g40004".to_string(), now + 3600),
+            ("10001".to_string(), -1),
+        ]);
+
+        super::apply_mute_snapshot_to_state(&mut settings_muted, &mut threads, server_snapshot, now);
+
+        assert!(threads[0].presentation.muted);
+        assert!(threads[0].unread.is_muted_at(now));
+        assert!(threads[1].presentation.muted);
+        assert!(threads[1].unread.is_muted_at(now));
+        assert!(threads[2].presentation.muted);
+        assert!(threads[2].unread.is_muted_at(now));
+        assert!(!threads[3].presentation.muted);
+        assert!(!threads[3].unread.is_muted_at(now));
+        assert!(threads[4].presentation.muted);
+        assert!(threads[4].unread.is_muted_at(now));
+        assert!(crate::unread::is_thread_muted(
+            &settings_muted,
+            &threads[0],
+            now
+        ));
+        assert!(!crate::unread::is_thread_muted(
+            &settings_muted,
+            &threads[3],
+            now
+        ));
+    }
+
+    #[test]
+    fn mute_events_received_updates_canonical_settings_and_unadorned_groups() {
+        let now = 1_700_000_100_i64;
+        let mut settings_muted = std::collections::HashMap::from([
+            ("20002".to_string(), -1),
+            ("g30003".to_string(), -1),
+        ]);
+        let mut threads = vec![
+            mute_test_thread("20002", true),
+            mute_test_thread("30003", true),
+        ];
+
+        assert!(super::apply_mute_events_to_state(
+            &mut settings_muted,
+            &mut threads,
+            vec![crate::chat::MuteControlEvent {
+                thread_id: "g20002".into(),
+                is_group: true,
+                muted: true,
+                muted_until: Some(now + 3600),
+                settings_until: Some(now + 3600),
+            }],
+        ));
+        assert!(threads[0].presentation.muted);
+        assert_eq!(threads[0].unread.muted_until, Some(now + 3600));
+        assert_eq!(settings_muted.get("g20002"), Some(&(now + 3600)));
+        assert!(!settings_muted.contains_key("20002"));
+
+        assert!(super::apply_mute_events_to_state(
+            &mut settings_muted,
+            &mut threads,
+            vec![crate::chat::MuteControlEvent {
+                thread_id: "g20002".into(),
+                is_group: true,
+                muted: false,
+                muted_until: None,
+                settings_until: None,
+            }],
+        ));
+        assert!(!threads[0].presentation.muted);
+        assert!(!threads[0].unread.muted);
+        assert!(crate::unread::active_mute_until(&settings_muted, "20002", true, now).is_none());
+        assert_eq!(settings_muted.get("g30003"), Some(&-1));
+    }
+
+    #[test]
+    fn app_settings_normalize_muted_threads_preserves_legacy_entries() {
+        let json = r#"{
+            "muted_threads": {
+                "group_20002": -1,
+                "G30003": 4000000000,
+                "u10001": -1,
+                "99999": -1,
+                "stale_timed": 100
+            }
+        }"#;
+        let mut settings: super::AppSettings = serde_json::from_str(json).unwrap();
+        settings.normalize_muted_threads_at(1_700_000_000);
+        assert_eq!(settings.muted_threads.get("g20002"), Some(&-1));
+        assert_eq!(settings.muted_threads.get("g30003"), Some(&4_000_000_000));
+        assert_eq!(settings.muted_threads.get("10001"), Some(&-1));
+        assert_eq!(settings.muted_threads.get("99999"), Some(&-1));
+        assert!(!settings.muted_threads.contains_key("stale_timed"));
     }
 }
 

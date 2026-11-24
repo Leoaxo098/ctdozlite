@@ -2,7 +2,7 @@
 use crate::chat::{ChatMessage, Thread};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UnreadState {
@@ -46,10 +46,12 @@ impl UnreadState {
         self.unread_ids.len()
     }
     pub fn is_muted(&self) -> bool {
-        self.muted
-            && self
-                .muted_until
-                .is_none_or(|until| until > crate::login::unix_now())
+        self.is_muted_at(crate::login::unix_now() as i64)
+    }
+
+    /// Returns whether this thread is muted at `now_unix` seconds.
+    pub fn is_muted_at(&self, now_unix: i64) -> bool {
+        self.muted && self.muted_until.is_none_or(|until| until > now_unix)
     }
     pub fn has_badge(&self) -> bool {
         self.count() > 0 || self.marked_unread
@@ -220,123 +222,485 @@ pub fn merge_read_points(threads: &mut [Thread], data: &Value) {
     }
 }
 
-fn unwrap_mute_payload<'a>(data: &'a Value, decoded: &'a mut Option<Value>) -> &'a Value {
-    let raw = data.get("data").unwrap_or(data);
-    if let Some(text) = raw.as_str() {
-        if let Ok(parsed) = serde_json::from_str::<Value>(text) {
-            *decoded = Some(parsed);
-            if let Some(ref d) = *decoded {
-                return d.get("data").unwrap_or(d);
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MuteKeyKind {
+    Group,
+    User,
+    Bare,
+}
+
+fn classify_mute_key(raw: &str) -> (MuteKeyKind, &str) {
+    let s = raw.trim();
+    if let Some(rest) = s
+        .strip_prefix("group_")
+        .or_else(|| s.strip_prefix("group/"))
+    {
+        let rest = rest.trim();
+        let trimmed = rest.trim_start_matches(['g', 'G']);
+        if !trimmed.is_empty() && trimmed.bytes().all(|b| b.is_ascii_digit()) {
+            return (MuteKeyKind::Group, trimmed);
+        }
+        return (MuteKeyKind::Group, rest);
+    }
+    if s.starts_with(['g', 'G']) {
+        let rest = s.trim_start_matches(['g', 'G']);
+        if !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()) {
+            return (MuteKeyKind::Group, rest);
+        }
+    }
+    if s.starts_with(['u', 'U']) {
+        let rest = s.trim_start_matches(['u', 'U']);
+        if !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()) {
+            return (MuteKeyKind::User, rest);
+        }
+    }
+    (MuteKeyKind::Bare, s)
+}
+
+/// Canonical `muted_threads` map key (`g<id>` for groups, `<id>` for 1-1 peers).
+pub fn canonical_mute_key(thread_id: &str, is_group: bool) -> String {
+    let (_, clean) = classify_mute_key(thread_id);
+    if clean.is_empty() || clean == "0" {
+        return String::new();
+    }
+    if is_group {
+        format!("g{clean}")
+    } else {
+        clean.to_string()
+    }
+}
+
+/// Match a `muted_threads` key or control event ID against `(thread_id, is_group)`.
+/// Group threads match `group_<id>`, `g<id>`, `G<id>`, and unadorned `<id>` (never `u<id>`);
+/// 1-1 DM threads match `u<id>`, `U<id>`, and unadorned `<id>` (never `g`/`G`/`group_`).
+pub fn mute_key_matches(key: &str, thread_id: &str, is_group: bool) -> bool {
+    let (k_kind, k_clean) = classify_mute_key(key);
+    let (t_kind, t_clean) = classify_mute_key(thread_id);
+    if k_clean.is_empty()
+        || k_clean == "0"
+        || t_clean.is_empty()
+        || t_clean == "0"
+        || k_clean != t_clean
+    {
+        return false;
+    }
+    if is_group {
+        k_kind != MuteKeyKind::User && t_kind != MuteKeyKind::User
+    } else {
+        k_kind != MuteKeyKind::Group && t_kind != MuteKeyKind::Group
+    }
+}
+
+/// True when `until` represents an active mute at `now_unix` (`-1` indefinite or future timestamp).
+pub fn is_mute_until_active(until: i64, now_unix: i64) -> bool {
+    until == -1 || (until > 0 && until > now_unix)
+}
+
+fn stronger_mute_until(a: i64, b: i64) -> i64 {
+    if a == -1 || b == -1 {
+        -1
+    } else {
+        a.max(b)
+    }
+}
+
+/// Look up an active mute entry for `(thread_id, is_group)` across all valid alias keys.
+pub fn active_mute_until(
+    muted_threads: &HashMap<String, i64>,
+    thread_id: &str,
+    is_group: bool,
+    now_unix: i64,
+) -> Option<i64> {
+    if muted_threads.is_empty() {
+        return None;
+    }
+    let mut best: Option<i64> = None;
+    for (k, &until) in muted_threads {
+        if is_mute_until_active(until, now_unix) && mute_key_matches(k, thread_id, is_group) {
+            best = Some(match best {
+                Some(prev) => stronger_mute_until(prev, until),
+                None => until,
+            });
+        }
+    }
+    best
+}
+
+/// Unified mute check across `settings.muted_threads`, `presentation.muted`, and `unread.muted`.
+pub fn is_muted_state(
+    muted_threads: &HashMap<String, i64>,
+    thread_id: &str,
+    is_group: bool,
+    presentation_muted: bool,
+    unread_muted: bool,
+    unread_muted_until: Option<i64>,
+    now_unix: i64,
+) -> bool {
+    if active_mute_until(muted_threads, thread_id, is_group, now_unix).is_some() {
+        return true;
+    }
+    if unread_muted && unread_muted_until.is_none_or(|until| until > now_unix) {
+        return true;
+    }
+    if !presentation_muted {
+        return false;
+    }
+    if unread_muted_until.is_some_and(|until| until <= now_unix) {
+        return false;
+    }
+    let has_expired_settings = !muted_threads.is_empty()
+        && muted_threads
+            .iter()
+            .any(|(k, &u)| !is_mute_until_active(u, now_unix) && mute_key_matches(k, thread_id, is_group));
+    !has_expired_settings
+}
+
+/// Convenience wrapper for `is_muted_state` taking a `&Thread`.
+pub fn is_thread_muted(
+    muted_threads: &HashMap<String, i64>,
+    thread: &Thread,
+    now_unix: i64,
+) -> bool {
+    is_muted_state(
+        muted_threads,
+        &thread.id,
+        thread.is_group,
+        thread.presentation.muted,
+        thread.unread.muted,
+        thread.unread.muted_until,
+        now_unix,
+    )
+}
+
+/// Insert or update a mute entry under the canonical key while removing stale alias duplicates.
+pub fn set_muted_thread(
+    muted_threads: &mut HashMap<String, i64>,
+    thread_id: &str,
+    is_group: bool,
+    until: i64,
+) {
+    clear_muted_thread(muted_threads, thread_id, is_group);
+    if until != -1 && until <= 0 {
+        return;
+    }
+    let key = canonical_mute_key(thread_id, is_group);
+    if !key.is_empty() {
+        muted_threads.insert(key, until);
+    }
+}
+
+/// Remove all alias keys matching `(thread_id, is_group)` from `muted_threads`.
+pub fn clear_muted_thread(
+    muted_threads: &mut HashMap<String, i64>,
+    thread_id: &str,
+    is_group: bool,
+) {
+    muted_threads.retain(|k, _| !mute_key_matches(k, thread_id, is_group));
+}
+
+/// Normalize and deduplicate `muted_threads` keys (`group_`/`G` -> `g`, `u`/`U` -> bare) and
+/// prune expired entries without guessing whether ambiguous bare IDs belong to a group or DM.
+pub fn normalize_muted_threads(muted_threads: &mut HashMap<String, i64>, now_unix: i64) {
+    if muted_threads.is_empty() {
+        return;
+    }
+    let entries: Vec<(String, i64)> = muted_threads.drain().collect();
+    for (raw_key, until) in entries {
+        if !is_mute_until_active(until, now_unix) {
+            continue;
+        }
+        let (kind, clean) = classify_mute_key(&raw_key);
+        if clean.is_empty() || clean == "0" {
+            continue;
+        }
+        let canonical = match kind {
+            MuteKeyKind::Group => format!("g{clean}"),
+            MuteKeyKind::User | MuteKeyKind::Bare => clean.to_string(),
+        };
+        muted_threads
+            .entry(canonical)
+            .and_modify(|prev| *prev = stronger_mute_until(*prev, until))
+            .or_insert(until);
+    }
+}
+
+/// Normalize `muted_threads` and promote bare keys that uniquely identify a group thread to `g<id>`.
+pub fn reconcile_muted_threads_with_threads(
+    muted_threads: &mut HashMap<String, i64>,
+    threads: &[Thread],
+    now_unix: i64,
+) {
+    normalize_muted_threads(muted_threads, now_unix);
+    if muted_threads.is_empty() || threads.is_empty() {
+        return;
+    }
+    let bare_keys: Vec<String> = muted_threads
+        .keys()
+        .filter(|k| classify_mute_key(k).0 == MuteKeyKind::Bare)
+        .cloned()
+        .collect();
+    for key in bare_keys {
+        let (_, clean) = classify_mute_key(&key);
+        let has_group = threads
+            .iter()
+            .any(|t| t.is_group && classify_mute_key(&t.id).1 == clean);
+        let has_dm = threads
+            .iter()
+            .any(|t| !t.is_group && classify_mute_key(&t.id).1 == clean);
+        if has_group && !has_dm {
+            if let Some(until) = muted_threads.remove(&key) {
+                let g_key = format!("g{clean}");
+                muted_threads
+                    .entry(g_key)
+                    .and_modify(|prev| *prev = stronger_mute_until(*prev, until))
+                    .or_insert(until);
             }
         }
     }
-    raw
+}
+
+/// Hydrate a thread's mute state from `muted_threads` while clearing expired timed mutes.
+pub fn apply_muted_settings_to_thread(
+    muted_threads: &HashMap<String, i64>,
+    thread: &mut Thread,
+    now_unix: i64,
+) {
+    if let Some(until) = active_mute_until(muted_threads, &thread.id, thread.is_group, now_unix) {
+        thread.presentation.muted = true;
+        thread.unread.muted = true;
+        thread.unread.muted_until = (until > 0).then_some(until);
+    } else if thread.unread.is_muted_at(now_unix) {
+        thread.presentation.muted = true;
+    } else if thread.unread.muted_until.is_some_and(|u| u <= now_unix) {
+        thread.presentation.muted = false;
+        thread.unread.muted = false;
+        thread.unread.muted_until = None;
+    }
+}
+
+/// Protect a just-succeeded `setmute` action against eventual-consistency lag in an immediate
+/// follow-up `getmute` snapshot.
+pub fn reconcile_post_setmute_snapshot(
+    mute_map: &mut HashMap<String, i64>,
+    thread_id: &str,
+    is_group: bool,
+    mute: bool,
+    duration_sec: i64,
+    action_now_unix: i64,
+) {
+    if mute {
+        if active_mute_until(mute_map, thread_id, is_group, action_now_unix).is_none() {
+            let expected_until = if duration_sec < 0 {
+                -1
+            } else {
+                action_now_unix.saturating_add(duration_sec)
+            };
+            set_muted_thread(mute_map, thread_id, is_group, expected_until);
+        }
+    } else {
+        clear_muted_thread(mute_map, thread_id, is_group);
+    }
+}
+
+fn payload_error_code(value: &Value) -> Option<i64> {
+    value
+        .get("error_code")
+        .and_then(|v| v.as_i64().or_else(|| v.as_str()?.trim().parse().ok()))
+        .filter(|c| *c != 0)
+}
+
+fn unwrap_mute_payload<'a>(data: &'a Value, decoded: &'a mut Option<Value>) -> Option<&'a Value> {
+    if payload_error_code(data).is_some() {
+        return None;
+    }
+    let raw = data.get("data").unwrap_or(data);
+    if let Some(text) = raw.as_str() {
+        let Ok(parsed) = serde_json::from_str::<Value>(text) else {
+            return None;
+        };
+        if payload_error_code(&parsed).is_some() {
+            return None;
+        }
+        *decoded = Some(parsed);
+        if let Some(ref d) = *decoded {
+            let inner = if d.get("chatEntries").is_none() && d.get("groupChatEntries").is_none() {
+                d.get("data").unwrap_or(d)
+            } else {
+                d
+            };
+            if payload_error_code(inner).is_some() {
+                return None;
+            }
+            return Some(inner);
+        }
+    }
+    if payload_error_code(raw).is_some() {
+        return None;
+    }
+    let inner = if raw.get("chatEntries").is_none() && raw.get("groupChatEntries").is_none() {
+        raw.get("data").unwrap_or(raw)
+    } else {
+        raw
+    };
+    if payload_error_code(inner).is_some() {
+        return None;
+    }
+    Some(inner)
+}
+
+fn extract_mute_entry_arrays(payload: &Value) -> Option<(&[Value], &[Value])> {
+    let peers_val = payload.get("chatEntries");
+    let groups_val = payload.get("groupChatEntries");
+    let peers = peers_val.and_then(Value::as_array);
+    let groups = groups_val.and_then(Value::as_array);
+    let both_explicit_null =
+        peers_val.is_some_and(Value::is_null) && groups_val.is_some_and(Value::is_null);
+    if peers.is_none() && groups.is_none() && !both_explicit_null {
+        return None;
+    }
+    Some((
+        peers.map(Vec::as_slice).unwrap_or(&[]),
+        groups.map(Vec::as_slice).unwrap_or(&[]),
+    ))
+}
+
+fn json_i64(value: &Value, key: &str) -> Option<i64> {
+    value
+        .get(key)
+        .and_then(|v| v.as_i64().or_else(|| v.as_str()?.trim().parse().ok()))
+}
+
+fn entry_thread_id(entry: &Value) -> Option<String> {
+    for key in ["id", "toId", "toid", "grid", "groupId"] {
+        if let Some(v) = entry.get(key) {
+            let s = v
+                .as_str()
+                .map(str::to_owned)
+                .or_else(|| v.as_u64().map(|n| n.to_string()))
+                .or_else(|| v.as_i64().filter(|&n| n > 0).map(|n| n.to_string()));
+            if let Some(val) = s {
+                let (_, clean) = classify_mute_key(&val);
+                if !clean.is_empty() && clean != "0" {
+                    return Some(clean.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn normalize_unix_sec(ts: i64) -> i64 {
+    if ts > 100_000_000_000 {
+        ts / 1000
+    } else {
+        ts
+    }
+}
+
+struct ParsedMuteEntry {
+    clean_id: String,
+    muted: bool,
+    until: Option<i64>,
+}
+
+fn parse_mute_entry(entry: &Value, now_unix: i64) -> Option<ParsedMuteEntry> {
+    let clean_id = entry_thread_id(entry)?;
+    let mode = json_i64(entry, "muteMode");
+    if mode.is_some_and(|m| m != 0 && m != 1) {
+        return None;
+    }
+    let duration = json_i64(entry, "duration");
+    let start = json_i64(entry, "startTime")
+        .or_else(|| json_i64(entry, "systemTime"))
+        .map(normalize_unix_sec);
+    let is_muted_mode = match mode {
+        Some(m) => m == 1 && duration != Some(0),
+        None => duration.unwrap_or(-1) != 0,
+    };
+    let until = if is_muted_mode {
+        let dur = duration.unwrap_or(-1);
+        if dur >= 0 {
+            Some(start.unwrap_or(now_unix).saturating_add(dur))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    Some(ParsedMuteEntry {
+        clean_id,
+        muted: is_muted_mode,
+        until,
+    })
 }
 
 /// Complete read-only mute snapshots use mode 1 and duration -1 for indefinite mute.
 pub fn merge_mute_metadata(threads: &mut [Thread], data: &Value) {
+    merge_mute_metadata_at(threads, data, crate::login::unix_now() as i64);
+}
+
+/// Deterministic `merge_mute_metadata` at an explicit `now_unix` timestamp.
+pub fn merge_mute_metadata_at(threads: &mut [Thread], data: &Value, now_unix: i64) {
     let mut decoded = None;
-    let payload = unwrap_mute_payload(data, &mut decoded);
-    let (Some(peers), Some(groups)) = (
-        payload.get("chatEntries").and_then(Value::as_array),
-        payload.get("groupChatEntries").and_then(Value::as_array),
-    ) else {
+    let Some(payload) = unwrap_mute_payload(data, &mut decoded) else {
+        return;
+    };
+    let Some((peers, groups)) = extract_mute_entry_arrays(payload) else {
         return;
     };
     for thread in threads {
         let entries = if thread.is_group { groups } else { peers };
-        let clean_tid = thread
-            .id
-            .trim_start_matches("group_")
-            .trim_start_matches('g')
-            .trim_start_matches('G');
-        let entry = entries
+        let (_, clean_tid) = classify_mute_key(&thread.id);
+        let parsed = entries
             .iter()
-            .find(|e| string(e, "id").is_some_and(|id| id.trim_start_matches('g') == clean_tid));
-        let mode = entry
-            .and_then(|e| e.get("muteMode"))
-            .and_then(Value::as_i64);
-        if mode.is_some_and(|m| m != 0 && m != 1) {
-            continue;
-        }
-        let duration = entry
-            .and_then(|e| e.get("duration"))
-            .and_then(Value::as_i64);
-        let start = entry.and_then(|e| {
-            e.get("startTime")
-                .or_else(|| e.get("systemTime"))
-                .and_then(Value::as_i64)
-        });
-        let until = start.zip(duration).and_then(|(start, duration)| {
-            if duration >= 0 {
-                start.checked_add(duration)
-            } else {
-                None
+            .filter_map(|e| parse_mute_entry(e, now_unix))
+            .find(|p| p.clean_id == clean_tid);
+        if let Some(p) = parsed {
+            thread.unread.muted = p.muted;
+            thread.unread.muted_until = p.until;
+        } else {
+            let has_unknown_mode_match = entries.iter().any(|e| {
+                entry_thread_id(e).is_some_and(|cid| cid == clean_tid)
+                    && json_i64(e, "muteMode").is_some_and(|m| m != 0 && m != 1)
+            });
+            if has_unknown_mode_match {
+                continue;
             }
-        });
-        let is_muted_mode = match mode {
-            Some(m) => m == 1,
-            None => entry.is_some() && duration.is_some_and(|d| d != 0),
-        };
-        thread.unread.muted = is_muted_mode;
-        thread.unread.muted_until = until;
+            thread.unread.muted = false;
+            thread.unread.muted_until = None;
+        }
         thread.unread.settings_fresh = true;
         thread.unread.fresh = true;
-        thread.presentation.muted = thread.unread.is_muted();
+        thread.presentation.muted = thread.unread.is_muted_at(now_unix);
     }
 }
 
 /// Extract an authoritative `thread_id -> until_unix` map (`-1` for indefinite mute) from a
 /// `/api/social/profile/getmute` payload so `AppSettings::muted_threads` stays synchronized
 /// with Official Zalo PC (#67).
-pub fn extract_mute_map(
-    data: &Value,
-    now_unix: i64,
-) -> Option<std::collections::HashMap<String, i64>> {
+pub fn extract_mute_map(data: &Value, now_unix: i64) -> Option<HashMap<String, i64>> {
     let mut decoded = None;
-    let payload = unwrap_mute_payload(data, &mut decoded);
-    let (Some(peers), Some(groups)) = (
-        payload.get("chatEntries").and_then(Value::as_array),
-        payload.get("groupChatEntries").and_then(Value::as_array),
-    ) else {
-        return None;
-    };
-    let mut map = std::collections::HashMap::new();
+    let payload = unwrap_mute_payload(data, &mut decoded)?;
+    let (peers, groups) = extract_mute_entry_arrays(payload)?;
+    let mut map = HashMap::new();
     for (entries, is_group) in [(peers, false), (groups, true)] {
         for entry in entries {
-            let Some(raw_id) = string(entry, "id").filter(|s| !s.is_empty() && s != "0") else {
+            let Some(p) = parse_mute_entry(entry, now_unix) else {
                 continue;
             };
-            let mode = entry.get("muteMode").and_then(Value::as_i64).unwrap_or(1);
-            if mode != 1 {
+            if !p.muted {
                 continue;
             }
-            let duration = entry.get("duration").and_then(Value::as_i64).unwrap_or(-1);
-            if duration == 0 {
-                continue;
-            }
-            let start = entry
-                .get("startTime")
-                .or_else(|| entry.get("systemTime"))
-                .and_then(Value::as_i64)
-                .unwrap_or(now_unix);
-            let until = if duration < 0 {
-                -1
-            } else {
-                let exp = start.saturating_add(duration);
-                if exp <= now_unix {
-                    continue;
-                }
-                exp
+            let until = match p.until {
+                None => -1,
+                Some(exp) if exp > now_unix => exp,
+                Some(_) => continue,
             };
-            let clean = raw_id
-                .trim_start_matches("group_")
-                .trim_start_matches('g')
-                .trim_start_matches('G');
-            if is_group {
-                map.insert(format!("g{clean}"), until);
-            } else {
-                map.insert(clean.to_string(), until);
+            let key = canonical_mute_key(&p.clean_id, is_group);
+            if !key.is_empty() {
+                map.entry(key)
+                    .and_modify(|prev| *prev = stronger_mute_until(*prev, until))
+                    .or_insert(until);
             }
         }
     }
@@ -485,6 +849,209 @@ mod tests {
         assert_eq!(state.count(), 1);
         state.read_visible(&[message("11", false)]);
         assert!(!state.has_badge());
+    }
+
+    fn thread_stub(id: &str, is_group: bool) -> Thread {
+        Thread {
+            presentation: Default::default(),
+            id: id.into(),
+            name: String::new(),
+            preview: String::new(),
+            time: String::new(),
+            avatar: None,
+            is_group,
+            messages: vec![],
+            vanish: None,
+            unread: Default::default(),
+        }
+    }
+
+    #[test]
+    fn mute_key_matches_distinguishes_group_and_dm_prefixes() {
+        for group_tid in ["20002", "g20002", "G20002", "group_20002"] {
+            assert!(mute_key_matches("g20002", group_tid, true));
+            assert!(mute_key_matches("G20002", group_tid, true));
+            assert!(mute_key_matches("group_20002", group_tid, true));
+            assert!(mute_key_matches("20002", group_tid, true));
+            assert!(!mute_key_matches("u20002", group_tid, true));
+            assert!(!mute_key_matches("20003", group_tid, true));
+        }
+
+        for dm_tid in ["10001", "u10001", "U10001"] {
+            assert!(mute_key_matches("10001", dm_tid, false));
+            assert!(mute_key_matches("u10001", dm_tid, false));
+            assert!(mute_key_matches("U10001", dm_tid, false));
+            assert!(!mute_key_matches("g10001", dm_tid, false));
+            assert!(!mute_key_matches("G10001", dm_tid, false));
+            assert!(!mute_key_matches("group_10001", dm_tid, false));
+        }
+    }
+
+    #[test]
+    fn extract_mute_map_parses_group_entry_shapes_and_rejects_errors() {
+        let now = 1_700_000_100_i64;
+        assert!(extract_mute_map(
+            &serde_json::json!({"error_code": 200, "data": {"chatEntries": [], "groupChatEntries": []}}),
+            now
+        )
+        .is_none());
+        assert!(extract_mute_map(
+            &serde_json::json!({"error_code": "102", "chatEntries": [], "groupChatEntries": []}),
+            now
+        )
+        .is_none());
+        assert!(extract_mute_map(
+            &serde_json::json!({"error_code": 0, "data": "{\"error_code\":-1,\"groupChatEntries\":[]}"}),
+            now
+        )
+        .is_none());
+        assert!(extract_mute_map(&serde_json::json!({"error_code": 0, "data": {}}), now).is_none());
+
+        let payload = serde_json::json!({
+            "error_code": 0,
+            "data": {
+                "chatEntries": null,
+                "groupChatEntries": [
+                    {"id": "group_111", "muteMode": "1", "duration": "-1"},
+                    {"toId": "G222", "muteMode": 1, "duration": "3600", "startTime": 1_700_000_000_000_i64},
+                    {"toid": "g333"},
+                    {"grid": 444_u64, "muteMode": 1, "duration": 1800, "systemTime": 1_700_000_000_i64},
+                    {"groupId": "555", "muteMode": 0, "duration": -1},
+                    {"id": "666", "muteMode": 1, "duration": 0},
+                    {"id": "777", "muteMode": 1, "duration": 60, "startTime": 1_700_000_000_i64}
+                ]
+            }
+        });
+        let map = extract_mute_map(&payload, now).expect("partial group-only payload should parse");
+        assert_eq!(map.get("g111"), Some(&-1));
+        assert_eq!(map.get("g222"), Some(&(1_700_000_000 + 3600)));
+        assert_eq!(map.get("g333"), Some(&-1));
+        assert_eq!(map.get("g444"), Some(&(1_700_000_000 + 1800)));
+        assert!(!map.contains_key("g555"));
+        assert!(!map.contains_key("g666"));
+        assert!(!map.contains_key("g777"));
+
+        let stringified = serde_json::json!({
+            "error_code": 0,
+            "data": "{\"groupChatEntries\":[{\"id\":\"888\",\"muteMode\":1,\"duration\":-1}]}"
+        });
+        let str_map = extract_mute_map(&stringified, now).expect("stringified data should parse");
+        assert_eq!(str_map.get("g888"), Some(&-1));
+    }
+
+    #[test]
+    fn merge_mute_metadata_handles_prefixes_and_rejects_errors() {
+        let now = 1_700_000_100_i64;
+        let mut threads = vec![
+            thread_stub("111", true),
+            thread_stub("g222", true),
+            thread_stub("group_333", true),
+            thread_stub("444", false),
+        ];
+        merge_mute_metadata_at(
+            &mut threads,
+            &serde_json::json!({
+                "error_code": 0,
+                "data": {
+                    "chatEntries": [{"id": "u444", "muteMode": 1, "duration": -1}],
+                    "groupChatEntries": [
+                        {"id": "group_111", "muteMode": 1, "duration": -1},
+                        {"id": "G222", "muteMode": 1, "duration": 3600, "startTime": 1_700_000_000_i64},
+                        {"id": "333", "muteMode": 1, "duration": -1}
+                    ]
+                }
+            }),
+            now,
+        );
+        assert!(threads[0].presentation.muted);
+        assert!(threads[1].presentation.muted);
+        assert!(threads[2].presentation.muted);
+        assert!(threads[3].presentation.muted);
+
+        merge_mute_metadata_at(
+            &mut threads,
+            &serde_json::json!({"error_code": 500, "data": {"chatEntries": [], "groupChatEntries": []}}),
+            now,
+        );
+        assert!(threads.iter().all(|t| t.presentation.muted));
+    }
+
+    #[test]
+    fn muted_threads_normalization_dedupes_aliases_and_preserves_legacy_settings() {
+        let now = 1_700_000_100_i64;
+        let mut map = HashMap::from([
+            ("group_111".to_string(), 1_700_005_000),
+            ("G111".to_string(), -1),
+            ("g111".to_string(), 1_700_001_000),
+            ("u444".to_string(), -1),
+            ("222".to_string(), -1),
+            ("555".to_string(), -1),
+            ("expired_dm".to_string(), 1_699_999_000),
+        ]);
+        let threads = vec![
+            thread_stub("222", true),
+            thread_stub("555", false),
+        ];
+        reconcile_muted_threads_with_threads(&mut map, &threads, now);
+        assert_eq!(map.get("g111"), Some(&-1));
+        assert!(!map.contains_key("group_111"));
+        assert!(!map.contains_key("G111"));
+        assert_eq!(map.get("444"), Some(&-1));
+        assert!(!map.contains_key("u444"));
+        assert_eq!(map.get("g222"), Some(&-1));
+        assert!(!map.contains_key("222"));
+        assert_eq!(map.get("555"), Some(&-1));
+        assert!(!map.contains_key("expired_dm"));
+
+        clear_muted_thread(&mut map, "222", true);
+        assert!(!map.contains_key("g222"));
+        assert_eq!(map.get("g111"), Some(&-1));
+    }
+
+    #[test]
+    fn info_drawer_is_muted_state_honors_all_id_forms_thread_flags_and_expiry() {
+        let now = 1_700_000_100_i64;
+        let settings_g = HashMap::from([("g20002".to_string(), -1)]);
+        assert!(is_muted_state(&settings_g, "20002", true, false, false, None, now));
+        assert!(is_muted_state(&settings_g, "group_20002", true, false, false, None, now));
+        assert!(!is_muted_state(&settings_g, "20002", false, false, false, None, now));
+
+        let empty = HashMap::new();
+        assert!(is_muted_state(&empty, "20002", true, true, false, None, now));
+        assert!(is_muted_state(&empty, "20002", true, false, true, None, now));
+        assert!(is_muted_state(
+            &empty,
+            "20002",
+            true,
+            false,
+            true,
+            Some(now + 60),
+            now
+        ));
+        assert!(!is_muted_state(
+            &empty,
+            "20002",
+            true,
+            true,
+            true,
+            Some(now - 1),
+            now
+        ));
+    }
+
+    #[test]
+    fn post_setmute_reconcile_guards_against_stale_getmute_snapshot() {
+        let now = 1_700_000_100_i64;
+        let mut stale_missing_new = HashMap::from([("g30003".to_string(), -1)]);
+        reconcile_post_setmute_snapshot(&mut stale_missing_new, "20002", true, true, 3600, now);
+        assert_eq!(stale_missing_new.get("g20002"), Some(&(now + 3600)));
+        assert_eq!(stale_missing_new.get("g30003"), Some(&-1));
+
+        let mut stale_still_present =
+            HashMap::from([("g20002".to_string(), -1), ("20002".to_string(), -1), ("g30003".to_string(), -1)]);
+        reconcile_post_setmute_snapshot(&mut stale_still_present, "group_20002", true, false, 0, now);
+        assert!(active_mute_until(&stale_still_present, "20002", true, now).is_none());
+        assert_eq!(stale_still_present.get("g30003"), Some(&-1));
     }
 }
 
