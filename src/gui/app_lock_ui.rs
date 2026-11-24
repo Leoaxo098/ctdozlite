@@ -40,6 +40,25 @@ fn sanitize_passcode_draft(mode: PasscodeMode, raw: &str) -> String {
     }
 }
 
+/// Submission decision for a 4-digit PIN entry frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pin4SubmitAction {
+    None,
+    Incomplete,
+    Submit,
+}
+
+/// Classify a `PasscodeMode::Pin4` unlock field frame without calling `verify_attempt` on short input.
+fn classify_pin4_submit(input: &str, enter_pressed: bool) -> Pin4SubmitAction {
+    if input.len() == 4 {
+        Pin4SubmitAction::Submit
+    } else if enter_pressed && !input.is_empty() {
+        Pin4SubmitAction::Incomplete
+    } else {
+        Pin4SubmitAction::None
+    }
+}
+
 /// Persist `app_lock.json` atomically and log any storage failure without panicking.
 fn persist_app_lock_config(cfg: &AppLockConfig) -> Result<(), String> {
     cfg.save_default().map_err(|err| {
@@ -277,16 +296,31 @@ impl ZaloGuiApp {
                                                         "Nhập 4 chữ số PIN",
                                                         req_focus,
                                                     );
-                                                    if self.app_lock_ui.unlock_input.len() == 4
-                                                        || (enter_pressed
-                                                            && !self
-                                                                .app_lock_ui
-                                                                .unlock_input
-                                                                .is_empty())
-                                                    {
-                                                        submit_candidate = Some(
-                                                            self.app_lock_ui.unlock_input.clone(),
-                                                        );
+                                                    match classify_pin4_submit(
+                                                        &self.app_lock_ui.unlock_input,
+                                                        enter_pressed,
+                                                    ) {
+                                                        Pin4SubmitAction::Submit => {
+                                                            submit_candidate = Some(
+                                                                self.app_lock_ui
+                                                                    .unlock_input
+                                                                    .clone(),
+                                                            );
+                                                        }
+                                                        Pin4SubmitAction::Incomplete => {
+                                                            self.app_lock_ui.unlock_error = Some(
+                                                                "Vui lòng nhập đủ 4 chữ số PIN"
+                                                                    .to_string(),
+                                                            );
+                                                            self.app_lock_ui.focus_requested = true;
+                                                            ctx.request_repaint();
+                                                        }
+                                                        Pin4SubmitAction::None => {
+                                                            if enter_pressed {
+                                                                self.app_lock_ui.focus_requested =
+                                                                    true;
+                                                            }
+                                                        }
                                                     }
                                                 }
                                                 PasscodeMode::Custom => {
@@ -322,6 +356,8 @@ impl ZaloGuiApp {
                                                         submit_candidate = Some(
                                                             self.app_lock_ui.unlock_input.clone(),
                                                         );
+                                                    } else if enter_pressed {
+                                                        self.app_lock_ui.focus_requested = true;
                                                     }
                                                 }
                                             }
@@ -355,48 +391,88 @@ impl ZaloGuiApp {
                                                 .rounding(Rounding::same(8.0))
                                                 .inner_margin(Margin::symmetric(12.0, 9.0))
                                                 .show(ui, |ui| {
-                                                    ui.horizontal(|ui| {
-                                                        ui.label(
-                                                            RichText::new(strip_txt)
-                                                                .color(pal.text_primary)
-                                                                .size(12.2),
-                                                        );
+                                                    ui.set_min_width(ui.available_width());
+                                                    let mut call_action_clicked = false;
+                                                    let make_call_btn = || {
+                                                        egui::Button::new(
+                                                            RichText::new(action_txt)
+                                                                .color(pal.primary_fg)
+                                                                .size(12.0)
+                                                                .strong(),
+                                                        )
+                                                        .fill(pal.danger)
+                                                        .rounding(Rounding::same(6.0))
+                                                    };
+                                                    if ui.available_width() < 320.0 {
+                                                        ui.vertical(|ui| {
+                                                            ui.add(
+                                                                egui::Label::new(
+                                                                    RichText::new(strip_txt)
+                                                                        .color(pal.text_primary)
+                                                                        .size(12.2),
+                                                                )
+                                                                .wrap(),
+                                                            );
+                                                            ui.add_space(6.0);
+                                                            if ui
+                                                                .add(make_call_btn())
+                                                                .on_hover_cursor(
+                                                                    CursorIcon::PointingHand,
+                                                                )
+                                                                .clicked()
+                                                            {
+                                                                call_action_clicked = true;
+                                                            }
+                                                        });
+                                                    } else {
                                                         ui.with_layout(
                                                             Layout::right_to_left(Align::Center),
                                                             |ui| {
-                                                                let btn = egui::Button::new(
-                                                                    RichText::new(action_txt)
-                                                                        .color(pal.primary_fg)
-                                                                        .size(12.0)
-                                                                        .strong(),
-                                                                )
-                                                                .fill(pal.danger)
-                                                                .rounding(Rounding::same(6.0));
                                                                 if ui
-                                                                    .add(btn)
+                                                                    .add(make_call_btn())
                                                                     .on_hover_cursor(
                                                                         CursorIcon::PointingHand,
                                                                     )
                                                                     .clicked()
                                                                 {
-                                                                    if let Some(tx) =
-                                                                        WORKER_TX.get()
-                                                                    {
-                                                                        let cmd = if is_ringing {
-                                                                            WorkerCmd::AnswerCall {
-                                                                                accept: false,
-                                                                                cam_start_off: false,
-                                                                            }
-                                                                        } else {
-                                                                            WorkerCmd::EndCall
-                                                                        };
-                                                                        let _ = tx.send(cmd);
-                                                                    }
-                                                                    self.active_call = None;
+                                                                    call_action_clicked = true;
                                                                 }
+                                                                ui.with_layout(
+                                                                    Layout::left_to_right(
+                                                                        Align::Center,
+                                                                    ),
+                                                                    |ui| {
+                                                                        ui.add(
+                                                                            egui::Label::new(
+                                                                                RichText::new(
+                                                                                    strip_txt,
+                                                                                )
+                                                                                .color(
+                                                                                    pal.text_primary,
+                                                                                )
+                                                                                .size(12.2),
+                                                                            )
+                                                                            .wrap(),
+                                                                        );
+                                                                    },
+                                                                );
                                                             },
                                                         );
-                                                    });
+                                                    }
+                                                    if call_action_clicked {
+                                                        if let Some(tx) = WORKER_TX.get() {
+                                                            let cmd = if is_ringing {
+                                                                WorkerCmd::AnswerCall {
+                                                                    accept: false,
+                                                                    cam_start_off: false,
+                                                                }
+                                                            } else {
+                                                                WorkerCmd::EndCall
+                                                            };
+                                                            let _ = tx.send(cmd);
+                                                        }
+                                                        self.active_call = None;
+                                                    }
                                                 });
                                             ui.add_space(10.0);
                                         }
@@ -500,10 +576,12 @@ impl ZaloGuiApp {
                 VerifyOutcome::Wrong { .. } => {
                     self.app_lock_ui.unlock_error = Some(format_verify_error(outcome));
                     self.app_lock_ui.focus_requested = true;
+                    ctx.request_repaint();
                 }
                 VerifyOutcome::LockedOut { .. } => {
                     self.app_lock_ui.unlock_error = Some(format_verify_error(outcome));
                     self.app_lock_ui.focus_requested = true;
+                    ctx.request_repaint();
                 }
             }
         }
@@ -513,7 +591,7 @@ impl ZaloGuiApp {
     pub(super) fn render_privacy_app_lock_section(
         &mut self,
         ui: &mut egui::Ui,
-        _ctx: &egui::Context,
+        ctx: &egui::Context,
         pal: &ThemePalette,
     ) -> bool {
         let mut lock_now_requested = false;
@@ -678,40 +756,41 @@ impl ZaloGuiApp {
                                 .size(12.8)
                                 .strong(),
                         );
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            let lock_btn = egui::Button::new(
-                                RichText::new(format!("Khoá ngay ({quick_lock_shortcut})"))
-                                    .color(pal.primary_fg)
-                                    .size(12.2)
-                                    .strong(),
-                            )
-                            .fill(pal.primary)
-                            .rounding(Rounding::same(6.0));
-                            if ui
-                                .add(lock_btn)
-                                .on_hover_cursor(CursorIcon::PointingHand)
-                                .clicked()
-                            {
-                                lock_now_requested = true;
-                            }
-                            if ui
-                                .button("Tắt khoá bảo mật")
-                                .on_hover_cursor(CursorIcon::PointingHand)
-                                .clicked()
-                            {
-                                self.app_lock_ui.reset_settings_drafts();
-                                self.app_lock_ui.settings_action = AppLockSettingsAction::Disabling;
-                            }
-                            if ui
-                                .button("Đổi mã khoá")
-                                .on_hover_cursor(CursorIcon::PointingHand)
-                                .clicked()
-                            {
-                                self.app_lock_ui.reset_settings_drafts();
-                                self.app_lock_ui.draft_mode = self.app_lock_config.mode;
-                                self.app_lock_ui.settings_action = AppLockSettingsAction::Changing;
-                            }
-                        });
+                    });
+                    ui.add_space(6.0);
+                    ui.horizontal_wrapped(|ui| {
+                        let lock_btn = egui::Button::new(
+                            RichText::new(format!("Khoá ngay ({quick_lock_shortcut})"))
+                                .color(pal.primary_fg)
+                                .size(12.2)
+                                .strong(),
+                        )
+                        .fill(pal.primary)
+                        .rounding(Rounding::same(6.0));
+                        if ui
+                            .add(lock_btn)
+                            .on_hover_cursor(CursorIcon::PointingHand)
+                            .clicked()
+                        {
+                            lock_now_requested = true;
+                        }
+                        if ui
+                            .button("Đổi mã khoá")
+                            .on_hover_cursor(CursorIcon::PointingHand)
+                            .clicked()
+                        {
+                            self.app_lock_ui.reset_settings_drafts();
+                            self.app_lock_ui.draft_mode = self.app_lock_config.mode;
+                            self.app_lock_ui.settings_action = AppLockSettingsAction::Changing;
+                        }
+                        if ui
+                            .button("Tắt khoá bảo mật")
+                            .on_hover_cursor(CursorIcon::PointingHand)
+                            .clicked()
+                        {
+                            self.app_lock_ui.reset_settings_drafts();
+                            self.app_lock_ui.settings_action = AppLockSettingsAction::Disabling;
+                        }
                     });
 
                     if self.app_lock_ui.settings_action == AppLockSettingsAction::Changing {
@@ -780,12 +859,20 @@ impl ZaloGuiApp {
                                 .on_hover_cursor(CursorIcon::PointingHand)
                                 .clicked();
                             if clicked || confirm_enter {
-                                if self.app_lock_ui.draft_new != self.app_lock_ui.draft_confirm {
+                                if let Err(msg) = validate_passcode(
+                                    self.app_lock_ui.draft_mode,
+                                    &self.app_lock_ui.draft_new,
+                                ) {
+                                    self.app_lock_ui.settings_error = Some(msg.to_string());
+                                } else if self.app_lock_ui.draft_new
+                                    != self.app_lock_ui.draft_confirm
+                                {
                                     self.app_lock_ui.settings_error =
                                         Some("Mã xác nhận không khớp".to_string());
                                 } else {
                                     let now = crate::login::unix_now();
-                                    let res = self.app_lock_config.change_passcode(
+                                    let mut next_cfg = self.app_lock_config.clone();
+                                    let res = next_cfg.change_passcode(
                                         &self.app_lock_ui.draft_current,
                                         self.app_lock_ui.draft_mode,
                                         &self.app_lock_ui.draft_new,
@@ -793,13 +880,12 @@ impl ZaloGuiApp {
                                     );
                                     match res {
                                         Ok(ChangePasscodeOutcome::Changed) => {
-                                            if let Err(err) =
-                                                persist_app_lock_config(&self.app_lock_config)
-                                            {
+                                            if let Err(err) = persist_app_lock_config(&next_cfg) {
                                                 self.app_lock_ui.settings_error = Some(format!(
                                                     "Không thể lưu app_lock.json: {err}"
                                                 ));
                                             } else {
+                                                self.app_lock_config = next_cfg;
                                                 self.app_lock_ui.reset_settings_drafts();
                                                 self.show_toast("Đã đổi mã khoá ứng dụng");
                                             }
@@ -809,10 +895,12 @@ impl ZaloGuiApp {
                                                 Some(msg.to_string());
                                         }
                                         Ok(ChangePasscodeOutcome::VerifyFailed(outcome)) => {
+                                            self.app_lock_config = next_cfg;
                                             let _ = persist_app_lock_config(&self.app_lock_config);
                                             self.app_lock_ui.draft_current.clear();
                                             self.app_lock_ui.settings_error =
                                                 Some(format_verify_error(outcome));
+                                            ctx.request_repaint();
                                         }
                                         Err(err) => {
                                             self.app_lock_ui.settings_error =
@@ -873,9 +961,9 @@ impl ZaloGuiApp {
                                 .clicked();
                             if clicked || enter_pressed {
                                 let now = crate::login::unix_now();
-                                let outcome = self
-                                    .app_lock_config
-                                    .verify_attempt(&self.app_lock_ui.draft_current, now);
+                                let mut next_cfg = self.app_lock_config.clone();
+                                let outcome =
+                                    next_cfg.verify_attempt(&self.app_lock_ui.draft_current, now);
                                 self.app_lock_ui.draft_current.clear();
                                 match outcome {
                                     VerifyOutcome::Unlocked => {
@@ -897,9 +985,11 @@ impl ZaloGuiApp {
                                     }
                                     VerifyOutcome::Wrong { .. }
                                     | VerifyOutcome::LockedOut { .. } => {
+                                        self.app_lock_config = next_cfg;
                                         let _ = persist_app_lock_config(&self.app_lock_config);
                                         self.app_lock_ui.settings_error =
                                             Some(format_verify_error(outcome));
+                                        ctx.request_repaint();
                                     }
                                 }
                             }
@@ -1000,7 +1090,8 @@ impl ZaloGuiApp {
 #[cfg(test)]
 mod tests {
     use super::{
-        format_verify_error, idle_timeout_label, sanitize_passcode_draft, sanitize_pin4_input,
+        classify_pin4_submit, format_verify_error, idle_timeout_label, sanitize_passcode_draft,
+        sanitize_pin4_input, Pin4SubmitAction,
     };
     use crate::app_lock::{PasscodeMode, VerifyOutcome, IDLE_PRESETS_SECS};
 
@@ -1029,5 +1120,18 @@ mod tests {
         })
         .contains("3"));
         assert!(format_verify_error(VerifyOutcome::LockedOut { remaining_secs: 25 }).contains("25"));
+    }
+
+    #[test]
+    fn incomplete_pin4_enter_never_triggers_submit() {
+        assert_eq!(classify_pin4_submit("", false), Pin4SubmitAction::None);
+        assert_eq!(classify_pin4_submit("", true), Pin4SubmitAction::None);
+        assert_eq!(classify_pin4_submit("12", false), Pin4SubmitAction::None);
+        assert_eq!(
+            classify_pin4_submit("123", true),
+            Pin4SubmitAction::Incomplete
+        );
+        assert_eq!(classify_pin4_submit("1234", false), Pin4SubmitAction::Submit);
+        assert_eq!(classify_pin4_submit("1234", true), Pin4SubmitAction::Submit);
     }
 }

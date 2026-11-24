@@ -1732,6 +1732,20 @@ fn title_bar_shows_update_pill(
     !app_locked && has_update && !compact_title_bar
 }
 
+/// Decide whether the Quick-Lock button appears in the custom title bar.
+fn title_bar_shows_lock_button(app_locked: bool, is_logged_in: bool, enabled: bool) -> bool {
+    !app_locked && (is_logged_in || enabled)
+}
+
+/// Right-side top-edge width reserved for title-bar control buttons in frameless resize hit-testing.
+fn title_bar_controls_reserve_width(shows_lock_btn: bool) -> f32 {
+    if shows_lock_btn {
+        216.0
+    } else {
+        180.0
+    }
+}
+
 pub struct ZaloGuiApp {
     // Theme state
     dark_mode: bool,
@@ -6230,9 +6244,14 @@ impl ZaloGuiApp {
         let Some(pos) = ctx.input(|i| i.pointer.hover_pos()) else {
             return;
         };
-        // Keep the top-right window control buttons (Close / Max / Min / Theme) clickable
-        // even right up to the top-right corner of the frameless window.
-        if pos.y < screen.top() + 34.0 && pos.x >= screen.right() - 180.0 {
+        // Keep the top-right window control buttons (Close / Max / Min / Theme / Lock)
+        // clickable even right up to the top-right corner of the frameless window.
+        let reserve_w = title_bar_controls_reserve_width(title_bar_shows_lock_button(
+            self.app_locked,
+            self.is_logged_in,
+            self.app_lock_config.enabled,
+        ));
+        if pos.y < screen.top() + 34.0 && pos.x >= screen.right() - reserve_w {
             return;
         }
         let border = 5.0_f32;
@@ -6534,7 +6553,11 @@ impl ZaloGuiApp {
 
                         buttons_left_x = th_rect.left();
 
-                        if !self.app_locked && (self.is_logged_in || self.app_lock_config.enabled) {
+                        if title_bar_shows_lock_button(
+                            self.app_locked,
+                            self.is_logged_in,
+                            self.app_lock_config.enabled,
+                        ) {
                             let (lock_rect, lock_resp) =
                                 ui.allocate_exact_size(Vec2::new(36.0, 32.0), Sense::click());
                             if lock_resp.hovered() {
@@ -8122,6 +8145,17 @@ mod app_lock_state_tests {
         assert!(title_bar_shows_saved_history_btn(false, false, true));
         assert!(!title_bar_shows_update_pill(true, true, false));
         assert!(title_bar_shows_update_pill(false, true, false));
+    }
+
+    #[test]
+    fn title_bar_lock_button_and_resize_reserve_track_lock_visibility() {
+        assert!(!title_bar_shows_lock_button(true, true, true));
+        assert!(!title_bar_shows_lock_button(false, false, false));
+        assert!(title_bar_shows_lock_button(false, true, false));
+        assert!(title_bar_shows_lock_button(false, false, true));
+
+        assert_eq!(title_bar_controls_reserve_width(false), 180.0);
+        assert_eq!(title_bar_controls_reserve_width(true), 216.0);
     }
 
     #[test]

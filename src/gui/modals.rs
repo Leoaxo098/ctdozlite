@@ -1513,10 +1513,12 @@ impl ZaloGuiApp {
     }
     pub(super) fn render_settings_modal(&mut self, ctx: &egui::Context, pal: &ThemePalette) {
         if !self.settings_modal_open {
+            self.app_lock_ui.reset_settings_drafts();
             return;
         }
         if ctx.input(|i| i.key_pressed(Key::Escape)) {
             self.settings_modal_open = false;
+            self.app_lock_ui.reset_settings_drafts();
             self.settings.save();
             return;
         }
@@ -4428,6 +4430,9 @@ impl ZaloGuiApp {
         if !open {
             self.settings_modal_open = false;
             self.settings.save();
+        }
+        if !self.settings_modal_open || self.settings_tab != SettingsTab::Privacy {
+            self.app_lock_ui.reset_settings_drafts();
         }
     }
 
