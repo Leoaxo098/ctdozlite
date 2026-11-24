@@ -2635,8 +2635,8 @@ fn decode_sync_v2_proto_message(
         if !q.from_d.is_empty() {
             raw_meta.insert("reply_to_sender".into(), serde_json::json!(q.from_d));
         }
-        if !q.msg.is_empty() {
-            raw_meta.insert("reply_to_text".into(), serde_json::json!(q.msg));
+        if let Some(clean_q) = crate::chat::normalize_quote_raw_msg(&q.msg) {
+            raw_meta.insert("reply_to_text".into(), serde_json::json!(clean_q));
         }
     }
 
@@ -2656,6 +2656,67 @@ fn decode_sync_v2_proto_message(
         ts: m.timestamp as i64,
         is_outgoing,
         raw_json,
+    }
+}
+
+/// Resolve empty/missing `reply_to_text` on Sync V2 rows using target messages in the same partition or cached thread.
+pub(crate) fn backfill_sync_v2_partition_quotes(
+    decoded: &mut [(crate::store::StoredMessage, u64)],
+    cached_thread: Option<&Thread>,
+) {
+    let mut id_to_text: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    if let Some(th) = cached_thread {
+        for m in &th.messages {
+            let preview = crate::chat::quote_preview_text(m);
+            let trimmed = preview.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if !m.id.is_empty() && m.id != "0" {
+                id_to_text.insert(m.id.clone(), preview.clone());
+            }
+            if !m.client_message_id.is_empty() && m.client_message_id != "0" {
+                id_to_text.insert(m.client_message_id.clone(), preview.clone());
+            }
+        }
+    }
+    for (sm, cli_id) in decoded.iter() {
+        let trimmed = sm.text.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if !sm.msg_id.is_empty() && sm.msg_id != "0" {
+            id_to_text.insert(sm.msg_id.clone(), sm.text.clone());
+        }
+        if *cli_id > 0 {
+            id_to_text.insert(cli_id.to_string(), sm.text.clone());
+        }
+    }
+    for (sm, _) in decoded.iter_mut() {
+        if !sm.raw_json.contains("reply_to_id") {
+            continue;
+        }
+        let Ok(mut val) = serde_json::from_str::<serde_json::Value>(&sm.raw_json) else {
+            continue;
+        };
+        let Some(obj) = val.as_object_mut() else {
+            continue;
+        };
+        let existing_rtext = obj.get("reply_to_text").and_then(|v| v.as_str());
+        if !crate::chat::is_missing_or_raw_quote_text(existing_rtext) {
+            continue;
+        }
+        let Some(rid) = obj
+            .get("reply_to_id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty() && !s.bytes().all(|b| b == b'0'))
+        else {
+            continue;
+        };
+        if let Some(resolved) = id_to_text.get(rid) {
+            obj.insert("reply_to_text".into(), serde_json::json!(resolved));
+            sm.raw_json = val.to_string();
+        }
     }
 }
 
@@ -2747,7 +2808,10 @@ pub(crate) async fn import_sync_v2_messages_inner(
             .find(|t| t.id == thread_id && !t.is_group)
             .map(|t| t.name.clone())
             .unwrap_or_default();
+        let mut decoded_batch: Vec<(crate::store::StoredMessage, u64)> =
+            Vec::with_capacity(part.messages.len());
         for m in part.messages {
+            let cli_id = m.client_id;
             let mt_num = m.msg_type;
             let att_len = m.attaches.len();
             let content_len = m.content.len();
@@ -2780,7 +2844,11 @@ pub(crate) async fn import_sync_v2_messages_inner(
                     thread_id, sm.msg_id, mt_num, content_len, att_len, att0_diag
                 ));
             }
-
+            decoded_batch.push((sm, cli_id));
+        }
+        let cached_ref = cached_threads.iter().find(|t| t.id == thread_id);
+        backfill_sync_v2_partition_quotes(&mut decoded_batch, cached_ref);
+        for (sm, _) in decoded_batch {
             if store.upsert_message(&sm).unwrap_or(false) {
                 imported += 1;
             }
@@ -3219,5 +3287,92 @@ mod tests {
         reset_sync_v2_imported_count();
         assert!(!is_sync_v2_last_seen());
         assert_eq!(sync_v2_inflight_count(), 0);
+    }
+
+    #[test]
+    fn sync_v2_quote_normalizes_raw_msg_and_backfills_photo_label() {
+        let photo_sm = decode_sync_v2_proto_message(
+            ParsedProtoMsg {
+                sender_id: "peer_1".into(),
+                client_id: 9001,
+                global_id: "g_photo_1".into(),
+                msg_type: 3,
+                timestamp: 1_730_450_100_000,
+                content: String::new(),
+                attaches: vec![ParsedProtoAttach {
+                    href: Some("https://photo-stal-27.zdn.vn/no/p.jpg".into()),
+                    thumb: Some("https://photo-stal-27.zdn.vn/no/pt.jpg".into()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            "peer_1",
+            "me_99",
+            "Tôi",
+            "Anh Khoa",
+        );
+        assert_eq!(photo_sm.text, "[Hình ảnh]");
+
+        let reply_blank_quote = decode_sync_v2_proto_message(
+            ParsedProtoMsg {
+                sender_id: "peer_1".into(),
+                client_id: 9002,
+                global_id: "g_reply_1".into(),
+                msg_type: 0,
+                timestamp: 1_730_450_105_000,
+                content: "Mọi người hoàn thành nha".into(),
+                quote: Some(ParsedProtoQuote {
+                    owner_id: "peer_1".into(),
+                    from_d: "Anh Khoa".into(),
+                    cli_msg_id: 9001,
+                    global_msg_id: "g_photo_1".into(),
+                    msg: "   ".into(),
+                }),
+                ..Default::default()
+            },
+            "peer_1",
+            "me_99",
+            "Tôi",
+            "Anh Khoa",
+        );
+        assert!(!reply_blank_quote.raw_json.contains("\"reply_to_text\":\"   \""));
+
+        let reply_raw_json_quote = decode_sync_v2_proto_message(
+            ParsedProtoMsg {
+                sender_id: "peer_1".into(),
+                client_id: 9003,
+                global_id: "g_reply_2".into(),
+                msg_type: 0,
+                timestamp: 1_730_450_106_000,
+                content: "Ok".into(),
+                quote: Some(ParsedProtoQuote {
+                    owner_id: "peer_1".into(),
+                    from_d: "Anh Khoa".into(),
+                    cli_msg_id: 9001,
+                    global_msg_id: "g_photo_1".into(),
+                    msg: r#"{"href":"https://photo-stal-27.zdn.vn/no/p.jpg"}"#.into(),
+                }),
+                ..Default::default()
+            },
+            "peer_1",
+            "me_99",
+            "Tôi",
+            "Anh Khoa",
+        );
+        let raw_val: serde_json::Value =
+            serde_json::from_str(&reply_raw_json_quote.raw_json).expect("valid raw_json");
+        assert_eq!(
+            raw_val.get("reply_to_text").and_then(|v| v.as_str()),
+            Some("[Hình ảnh]")
+        );
+
+        let mut batch = vec![(photo_sm, 9001u64), (reply_blank_quote, 9002u64)];
+        backfill_sync_v2_partition_quotes(&mut batch, None);
+        let repaired_val: serde_json::Value =
+            serde_json::from_str(&batch[1].0.raw_json).expect("valid raw_json after backfill");
+        assert_eq!(
+            repaired_val.get("reply_to_text").and_then(|v| v.as_str()),
+            Some("[Hình ảnh]")
+        );
     }
 }

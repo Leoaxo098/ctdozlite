@@ -1577,6 +1577,7 @@ pub fn merge_thread_into(
             identities.remove(existing_msg, idx);
             existing_msg.merge_reaction_metadata(&msg);
             merge_delivery_state(&mut existing_msg.delivery, msg.delivery);
+            merge_reply_metadata(existing_msg, &msg);
             if existing_msg.id.starts_with("out_")
                 && !msg.id.is_empty()
                 && !msg.id.starts_with("out_")
@@ -1594,11 +1595,6 @@ pub fn merge_thread_into(
                 existing_msg.sticker_id = msg.sticker_id;
                 existing_msg.sticker_cate_id = msg.sticker_cate_id;
                 existing_msg.sticker_type = msg.sticker_type;
-            }
-            if existing_msg.reply_to_text.is_none() && msg.reply_to_text.is_some() {
-                existing_msg.reply_to_id = msg.reply_to_id;
-                existing_msg.reply_to_sender = msg.reply_to_sender;
-                existing_msg.reply_to_text = msg.reply_to_text;
             }
             if existing_msg.link_url.is_none() && msg.link_url.is_some() {
                 existing_msg.link_url = msg.link_url;
@@ -1652,6 +1648,7 @@ pub fn merge_thread_into(
         }
     }
 
+    repair_thread_quote_replies(&mut target.messages);
     if let Some(newest) = target.messages.last() {
         if !newest.text.is_empty() {
             target.preview = newest.text.replace('\n', " ");
@@ -1742,6 +1739,9 @@ pub fn deduplicate_threads(
                 }
             }
         }
+    }
+    for t in merged.iter_mut() {
+        repair_thread_quote_replies(&mut t.messages);
     }
     *threads = merged;
 }
@@ -5006,6 +5006,739 @@ pub(crate) fn quote_target(
     }
 }
 
+fn is_video_url_like(url: &str) -> bool {
+    let l = url.trim().to_ascii_lowercase();
+    (l.starts_with("http://") || l.starts_with("https://"))
+        && (l.ends_with(".mp4")
+            || l.ends_with(".mov")
+            || l.ends_with(".webm")
+            || l.ends_with(".mkv")
+            || l.ends_with(".avi")
+            || l.contains("/video/")
+            || l.contains("videomedia")
+            || l.contains("video-")
+            || l.contains("video.")
+            || l.contains(".dlmd.me"))
+}
+
+fn is_image_filename_only(s: &str) -> bool {
+    let l = s.trim().to_ascii_lowercase();
+    [
+        ".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".jfif", ".tiff", ".heic", ".avif",
+    ]
+    .iter()
+    .any(|ext| l.ends_with(ext))
+}
+
+fn is_raw_json_literal(s: &str) -> bool {
+    let t = s.trim();
+    ((t.starts_with('{') && t.ends_with('}')) || (t.starts_with('[') && t.ends_with(']')))
+        && serde_json::from_str::<Value>(t).is_ok()
+}
+
+fn clean_quote_text_candidate(raw: &str) -> Option<String> {
+    let t = raw.trim();
+    if t.is_empty() || t == "sendBubbleMessage" || is_raw_json_literal(t) {
+        return None;
+    }
+    Some(t.to_string())
+}
+
+fn clean_media_quote_caption(
+    raw: Option<&str>,
+    reject_image_filenames: bool,
+    extra_skip: &[&str],
+) -> Option<String> {
+    let t = clean_quote_text_candidate(raw?)?;
+    if t.starts_with("http://") || t.starts_with("https://") {
+        return None;
+    }
+    if t.len() > 20 && !t.contains(' ') && !t.contains('.') {
+        return None;
+    }
+    if extra_skip.iter().any(|s| t.eq_ignore_ascii_case(s)) {
+        return None;
+    }
+    if reject_image_filenames && is_image_filename_only(&t) {
+        return None;
+    }
+    Some(t)
+}
+
+fn format_media_quote_label(
+    prefix: &str,
+    alt_prefix: Option<&str>,
+    caption: Option<String>,
+) -> String {
+    let Some(cap) = caption else {
+        return prefix.to_string();
+    };
+    let c = cap.trim();
+    if c.is_empty() || c == prefix || alt_prefix.is_some_and(|a| c == a) {
+        return prefix.to_string();
+    }
+    if c.starts_with(prefix) && c[prefix.len()..].starts_with(char::is_whitespace) {
+        let rest = c[prefix.len()..].trim();
+        return if rest.is_empty() {
+            prefix.to_string()
+        } else {
+            format!("{prefix} {rest}")
+        };
+    }
+    if let Some(alt) = alt_prefix {
+        if c.starts_with(alt) && c[alt.len()..].starts_with(char::is_whitespace) {
+            let rest = c[alt.len()..].trim();
+            return if rest.is_empty() {
+                prefix.to_string()
+            } else {
+                format!("{prefix} {rest}")
+            };
+        }
+    }
+    format!("{prefix} {c}")
+}
+
+/// Returns `true` when `reply_to_text` is absent, blank, or carries unparsed wire JSON / CDN URLs.
+pub(crate) fn is_missing_or_raw_quote_text(text: Option<&str>) -> bool {
+    match text.map(str::trim) {
+        None | Some("") => true,
+        Some(t) => {
+            is_raw_json_literal(t)
+                || t == "sendBubbleMessage"
+                || is_zalo_photo_cdn_url(t)
+                || is_video_url_like(t)
+        }
+    }
+}
+
+/// Canonical display summary for a `ChatMessage` when it is quoted in a reply.
+pub(crate) fn quote_preview_text(quoted: &ChatMessage) -> String {
+    let raw_text = quoted
+        .text
+        .strip_prefix("[Đã thu hồi] ")
+        .unwrap_or(&quoted.text)
+        .trim();
+
+    if quoted.sticker_id.is_some()
+        || quoted.kind == crate::message_model::MessageKind::Sticker
+        || raw_text == "[Nhãn dán]"
+    {
+        return "[Nhãn dán]".to_string();
+    }
+    if quoted.kind == crate::message_model::MessageKind::Voice
+        || quoted.link_src.as_deref() == Some("Thoại Zalo")
+        || raw_text == "[Tin nhắn thoại]"
+    {
+        return "[Tin nhắn thoại]".to_string();
+    }
+    if quoted.kind == crate::message_model::MessageKind::Video
+        || quoted.link_src.as_deref() == Some("Video Zalo")
+        || raw_text == "[Video]"
+        || raw_text.starts_with("[Video] ")
+        || quoted.link_url.as_deref().is_some_and(is_video_url_like)
+    {
+        let cap = clean_media_quote_caption(Some(raw_text), false, &["Video", "[Tập tin]"])
+            .filter(|s| !s.starts_with("[Tập tin]"))
+            .or_else(|| clean_media_quote_caption(quoted.link_desc.as_deref(), false, &["Video"]));
+        return format_media_quote_label("[Video]", None, cap);
+    }
+    let is_photo_like = quoted.kind == crate::message_model::MessageKind::Photo
+        || quoted.kind == crate::message_model::MessageKind::Gif
+        || quoted.link_src.as_deref() == Some("Hình ảnh Zalo")
+        || raw_text == "[Hình ảnh]"
+        || raw_text.starts_with("[Hình ảnh] ")
+        || raw_text == "[Photo]"
+        || raw_text.starts_with("[Photo] ")
+        || (!matches!(
+            quoted.kind,
+            crate::message_model::MessageKind::Link
+                | crate::message_model::MessageKind::File
+                | crate::message_model::MessageKind::Action
+                | crate::message_model::MessageKind::WebContent
+        ) && (quoted
+            .link_url
+            .as_deref()
+            .is_some_and(is_zalo_photo_cdn_url)
+            || quoted
+                .link_thumb
+                .as_deref()
+                .is_some_and(is_zalo_photo_cdn_url)));
+    if is_photo_like {
+        let cap = clean_media_quote_caption(Some(raw_text), false, &["Hình ảnh", "Photo"])
+            .or_else(|| {
+                clean_media_quote_caption(
+                    quoted.link_desc.as_deref(),
+                    true,
+                    &["Hình ảnh", "Photo"],
+                )
+            });
+        return format_media_quote_label("[Hình ảnh]", Some("[Photo]"), cap);
+    }
+    if quoted.kind == crate::message_model::MessageKind::File
+        || quoted.link_src.as_deref() == Some("Tập tin Zalo")
+        || raw_text == "[Tập tin]"
+        || raw_text.starts_with("[Tập tin] ")
+    {
+        if raw_text.starts_with("[Tập tin] ") && !raw_text.to_ascii_lowercase().contains("renewmedia")
+        {
+            return raw_text.to_string();
+        }
+        let has_file_meta = quoted.link_title.is_some() || quoted.link_url.is_some();
+        if has_file_meta {
+            let resolved = resolve_attachment_file_name(
+                quoted.link_title.as_deref(),
+                raw_text,
+                quoted.link_url.as_deref().unwrap_or_default(),
+            );
+            if resolved != "tap_tin_zalo" {
+                return format!("[Tập tin] {resolved}");
+            }
+        }
+        return "[Tập tin]".to_string();
+    }
+    if is_raw_json_literal(raw_text) {
+        return normalize_quote_raw_msg(raw_text).unwrap_or_default();
+    }
+    quoted.text.clone()
+}
+
+fn normalize_quote_type(q: &Value) -> String {
+    let raw = q
+        .get("cliMsgType")
+        .or_else(|| q.get("msgType"))
+        .or_else(|| q.get("type"));
+    let numeric = raw.and_then(|v| match v {
+        Value::Number(n) => n.as_i64(),
+        Value::String(s) => s.trim().parse::<i64>().ok(),
+        _ => None,
+    });
+    if let Some(code) = numeric {
+        return match code {
+            1 => "chat.text",
+            2 | 11 | 32 => "chat.photo",
+            3 | 31 => "chat.voice",
+            4 | 13 | 36 | 401..=404 => "chat.sticker",
+            5 | 37 => "chat.doodle",
+            6 | 38 => "chat.contact",
+            7 | 23 | 49 => "chat.gif",
+            17 | 24 | 43 => "chat.location",
+            18 | 44 => "chat.video",
+            19 | 46 => "chat.file",
+            20 | 45 => "chat.undo",
+            -27 => "chat.deleted",
+            -28 => "chat.vanish",
+            21 | 52 | 53 => "chat.webcontent",
+            25 => "chat.ecard",
+            26 => "group.poll",
+            40 => "chat.link",
+            _ => "",
+        }
+        .to_string();
+    }
+    raw.and_then(Value::as_str)
+        .map(|s| s.trim().to_ascii_lowercase())
+        .unwrap_or_default()
+}
+
+fn quote_attach_str<'a>(obj: &'a serde_json::Map<String, Value>, keys: &[&str]) -> Option<&'a str> {
+    keys.iter()
+        .filter_map(|k| obj.get(*k).and_then(Value::as_str))
+        .map(str::trim)
+        .find(|s| !s.is_empty())
+}
+
+fn quote_has_voice_params(v: &Value) -> bool {
+    let Some(obj) = v.as_object() else {
+        return false;
+    };
+    if obj.get("m4a").is_some() || obj.get("voice").is_some() || obj.get("waveform").is_some() {
+        return true;
+    }
+    obj.get("params")
+        .and_then(parse_embedded_json)
+        .and_then(|p| p.as_object().cloned())
+        .is_some_and(|p| {
+            p.get("m4a").is_some() || p.get("voice").is_some() || p.get("waveform").is_some()
+        })
+}
+
+fn quote_has_file_params(v: &Value, link_url: Option<&str>) -> bool {
+    let Some(obj) = v.as_object() else {
+        return false;
+    };
+    if obj.get("fileName").is_some()
+        || obj.get("fileExt").is_some()
+        || obj.get("fileSize").is_some()
+        || link_url.is_some_and(|u| u.to_ascii_lowercase().contains("/renewmedia"))
+    {
+        return true;
+    }
+    obj.get("params")
+        .and_then(parse_embedded_json)
+        .and_then(|p| p.as_object().cloned())
+        .is_some_and(|p| {
+            p.get("fileName").is_some() || p.get("fileExt").is_some() || p.get("fileSize").is_some()
+        })
+}
+
+/// Normalize a raw quote text field (`q.msg`) when it may hold empty whitespace, JSON, or CDN URLs.
+pub(crate) fn normalize_quote_raw_msg(raw: &str) -> Option<String> {
+    let t = raw.trim();
+    if t.is_empty() || t == "sendBubbleMessage" {
+        return None;
+    }
+    if is_raw_json_literal(t) {
+        let parsed = serde_json::from_str::<Value>(t).ok()?;
+        let synthetic = json!({ "attach": parsed });
+        return resolve_quote_text(&synthetic);
+    }
+    if is_zalo_photo_cdn_url(t) {
+        return Some("[Hình ảnh]".to_string());
+    }
+    if is_video_url_like(t) {
+        return Some("[Video]".to_string());
+    }
+    Some(t.to_string())
+}
+
+fn resolve_quote_text(q: &Value) -> Option<String> {
+    let q_type = normalize_quote_type(q);
+    let attach_val = q.get("attach").and_then(parse_embedded_json);
+    let raw_msg_val = q
+        .get("msg")
+        .or_else(|| q.get("message"))
+        .or_else(|| q.get("content"));
+    let raw_msg_json = raw_msg_val.and_then(|v| {
+        if v.is_object() || v.is_array() {
+            Some(v.clone())
+        } else {
+            parse_embedded_json(v)
+        }
+    });
+    let raw_msg_str = raw_msg_val
+        .and_then(Value::as_str)
+        .and_then(clean_quote_text_candidate);
+
+    let meta_val = attach_val.as_ref().or(raw_msg_json.as_ref());
+    let meta_obj = meta_val.and_then(Value::as_object);
+    let (link_url, _link_title, link_desc, link_thumb, link_src) = meta_val
+        .map(extract_link_info)
+        .unwrap_or((None, None, None, None, None));
+
+    let attach_action = meta_obj
+        .and_then(|o| quote_attach_str(o, &["action"]))
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let attach_title_raw = meta_obj.and_then(|o| quote_attach_str(o, &["fileName", "name", "title"]));
+    let attach_desc_raw = link_desc
+        .as_deref()
+        .or_else(|| meta_obj.and_then(|o| quote_attach_str(o, &["description", "caption", "desc"])));
+
+    if matches!(q_type.as_str(), "chat.undo" | "undo") {
+        return Some("[Tin nhắn đã thu hồi]".to_string());
+    }
+    if q_type == "chat.deleted" {
+        return Some("[Tin nhắn đã bị xóa]".to_string());
+    }
+    if q_type == "chat.vanish" {
+        return Some("[Tin nhắn đã tự xóa]".to_string());
+    }
+
+    let is_sticker_quote = matches!(q_type.as_str(), "chat.sticker" | "sticker")
+        || meta_val.and_then(extract_sticker_info).is_some()
+        || attach_action == "recommened.stickerset"
+        || raw_msg_str
+            .as_deref()
+            .is_some_and(|s| s.contains("ami_fat_cat_"))
+        || (q_type == "chat.doodle"
+            && link_url.is_none()
+            && link_thumb.is_none()
+            && raw_msg_str.is_none());
+    if is_sticker_quote {
+        return Some("[Nhãn dán]".to_string());
+    }
+
+    let is_voice_quote = matches!(q_type.as_str(), "chat.voice" | "voice")
+        || link_src.as_deref() == Some("Thoại Zalo")
+        || meta_val.is_some_and(quote_has_voice_params);
+    if is_voice_quote {
+        return Some("[Tin nhắn thoại]".to_string());
+    }
+
+    let is_video_quote = matches!(
+        q_type.as_str(),
+        "chat.video" | "video" | "chat.video.msg" | "chat.video.live.msg"
+    ) || link_src.as_deref() == Some("Video Zalo")
+        || meta_obj.is_some_and(|o| {
+            o.get("videoUrl").is_some()
+                || o.get("video_width").is_some()
+                || o.get("video_height").is_some()
+        })
+        || link_url.as_deref().is_some_and(is_video_url_like)
+        || raw_msg_str.as_deref().is_some_and(is_video_url_like);
+    if is_video_quote {
+        let cap = clean_media_quote_caption(raw_msg_str.as_deref(), false, &["Video"])
+            .or_else(|| clean_media_quote_caption(attach_desc_raw, false, &["Video"]))
+            .or_else(|| clean_media_quote_caption(attach_title_raw, true, &["Video"]));
+        return Some(format_media_quote_label("[Video]", None, cap));
+    }
+
+    let is_contact_or_call = matches!(q_type.as_str(), "chat.contact" | "contact");
+    if is_contact_or_call {
+        if attach_action == "recommened.link" {
+            let fallback = clean_quote_text_candidate(
+                raw_msg_str
+                    .as_deref()
+                    .or(attach_title_raw)
+                    .or(attach_desc_raw)
+                    .or(link_url.as_deref())
+                    .unwrap_or_default(),
+            );
+            return Some(fallback.unwrap_or_else(|| "[Liên kết]".to_string()));
+        }
+        if attach_action == "recommened.misscall" {
+            return Some("[Cuộc gọi nhỡ]".to_string());
+        }
+        if attach_action.starts_with("recommened.calling")
+            || attach_action.starts_with("recommened.receivecall")
+            || attach_action.starts_with("recommened.calltime")
+        {
+            return Some("[Cuộc gọi]".to_string());
+        }
+        let detail = clean_media_quote_caption(raw_msg_str.as_deref(), false, &["Danh thiếp"])
+            .or_else(|| clean_media_quote_caption(attach_title_raw, false, &["Danh thiếp"]))
+            .or_else(|| clean_media_quote_caption(attach_desc_raw, false, &["Danh thiếp"]));
+        return Some(format_media_quote_label("[Danh thiếp]", None, detail));
+    }
+
+    let is_location_quote = matches!(
+        q_type.as_str(),
+        "chat.location" | "chat.location.new" | "location"
+    );
+    if is_location_quote {
+        let detail = clean_media_quote_caption(raw_msg_str.as_deref(), false, &["Vị trí"])
+            .or_else(|| clean_media_quote_caption(attach_title_raw, false, &["Vị trí"]))
+            .or_else(|| clean_media_quote_caption(attach_desc_raw, false, &["Vị trí"]));
+        return Some(format_media_quote_label("[Vị trí]", None, detail));
+    }
+
+    let is_file_quote = matches!(q_type.as_str(), "chat.file" | "file" | "share.file")
+        || link_src.as_deref() == Some("Tập tin Zalo")
+        || (!matches!(
+            q_type.as_str(),
+            "chat.photo" | "photo" | "chat.doodle" | "doodle" | "chat.gif" | "gif"
+        ) && meta_val.is_some_and(|v| quote_has_file_params(v, link_url.as_deref())));
+    if is_file_quote {
+        if let Some(msg) = raw_msg_str.as_deref() {
+            if msg.starts_with("[Tập tin]") && !msg.to_ascii_lowercase().contains("renewmedia") {
+                return Some(msg.to_string());
+            }
+        }
+        let title_for_file = meta_obj.and_then(|o| quote_attach_str(o, &["fileName", "name", "title"]));
+        let owned_param_name = meta_obj
+            .and_then(|o| o.get("params"))
+            .and_then(parse_embedded_json)
+            .and_then(|p| {
+                p.get("fileName")
+                    .or_else(|| p.get("mediaTitle"))
+                    .and_then(Value::as_str)
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+            });
+        let effective_title = title_for_file.or(owned_param_name.as_deref());
+        if effective_title.is_some() || link_url.is_some() {
+            let resolved = resolve_attachment_file_name(
+                effective_title,
+                raw_msg_str.as_deref().unwrap_or_default(),
+                link_url.as_deref().unwrap_or_default(),
+            );
+            if resolved != "tap_tin_zalo" {
+                return Some(format!("[Tập tin] {resolved}"));
+            }
+        }
+        if let Some(msg) = raw_msg_str.as_deref().filter(|m| {
+            !m.starts_with("http://")
+                && !m.starts_with("https://")
+                && !m.to_ascii_lowercase().contains("renewmedia")
+        }) {
+            return Some(format!("[Tập tin] {msg}"));
+        }
+        return Some("[Tập tin]".to_string());
+    }
+
+    let is_link_quote = matches!(
+        q_type.as_str(),
+        "chat.link" | "link" | "chat.recommended" | "share.link"
+    ) || attach_action == "recommened.link";
+    if is_link_quote {
+        return raw_msg_str
+            .or_else(|| attach_title_raw.map(str::to_string))
+            .or_else(|| attach_desc_raw.map(str::to_string))
+            .or(link_url)
+            .or_else(|| Some("[Liên kết]".to_string()));
+    }
+
+    let is_oa_or_poll = matches!(
+        q_type.as_str(),
+        "chat.webcontent"
+            | "chat.webcontent.v2"
+            | "chat.ecard"
+            | "chat.list.action"
+            | "group.poll"
+    );
+    if is_oa_or_poll {
+        if let Some(msg) = raw_msg_str {
+            return Some(msg);
+        }
+        if let Some(card) = extract_oa_rich_card(&q_type, meta_val) {
+            if let Some(t) = card
+                .title
+                .or(card.description)
+                .or_else(|| card.items.into_iter().find(|it| !it.title.is_empty()).map(|it| it.title))
+            {
+                return Some(t);
+            }
+        }
+        if let Some(extracted) = meta_val.and_then(extract_content_text) {
+            if let Some(clean) = clean_quote_text_candidate(&extracted) {
+                return Some(clean);
+            }
+        }
+        return Some(if q_type == "group.poll" {
+            "[Bình chọn]".to_string()
+        } else {
+            "[Tin nhắn]".to_string()
+        });
+    }
+
+    let has_photo_media_url = link_src.as_deref() == Some("Hình ảnh Zalo")
+        || link_url.as_deref().is_some_and(is_zalo_photo_cdn_url)
+        || link_thumb.as_deref().is_some_and(is_zalo_photo_cdn_url)
+        || raw_msg_str.as_deref().is_some_and(is_zalo_photo_cdn_url)
+        || (q_type.is_empty()
+            && raw_msg_str.is_none()
+            && attach_title_raw.is_none()
+            && (link_url.is_some() || link_thumb.is_some()));
+    let is_photo_quote = matches!(
+        q_type.as_str(),
+        "chat.photo" | "photo" | "chat.doodle" | "doodle" | "chat.gif" | "gif"
+    ) || has_photo_media_url;
+    if is_photo_quote {
+        let cap = clean_media_quote_caption(raw_msg_str.as_deref(), false, &["Hình ảnh", "Photo"])
+            .or_else(|| {
+                clean_media_quote_caption(attach_desc_raw, true, &["Hình ảnh", "Photo"])
+            })
+            .or_else(|| {
+                clean_media_quote_caption(attach_title_raw, true, &["Hình ảnh", "Photo"])
+            });
+        return Some(format_media_quote_label("[Hình ảnh]", Some("[Photo]"), cap));
+    }
+
+    if let Some(o) = meta_obj {
+        if o.get("action").and_then(Value::as_str) == Some("rtf") {
+            if let Some(title) = o.get("title").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()) {
+                if let Some(params_s) = o.get("params").and_then(Value::as_str) {
+                    let formatted = format_incoming_zalo_rtf(title, params_s);
+                    if !formatted.trim().is_empty() {
+                        return Some(formatted);
+                    }
+                }
+                return Some(title.to_string());
+            }
+        }
+    }
+
+    if let Some(msg) = raw_msg_str {
+        return Some(msg);
+    }
+
+    if let Some(mv) = meta_val {
+        if let Some(extracted) = extract_content_text(mv) {
+            return normalize_quote_raw_msg(&extracted);
+        }
+    }
+
+    None
+}
+
+/// Extract `(reply_to_id, reply_to_sender, reply_to_text)` from a Zalo `quote` payload.
+pub(crate) fn extract_quote_reply_fields(
+    q: &Value,
+) -> (Option<String>, Option<String>, Option<String>) {
+    let parsed = if q.is_object() {
+        None
+    } else {
+        parse_embedded_json(q)
+    };
+    let q_obj = parsed.as_ref().unwrap_or(q);
+    if !q_obj.is_object() {
+        return (None, None, None);
+    }
+    let q_id = ["cliMsgId", "globalMsgId", "msgId"]
+        .iter()
+        .find_map(|key| wire_identity(q_obj.get(*key)))
+        .or_else(|| pick_str(q_obj, &["cliMsgId", "globalMsgId", "msgId"]));
+    let q_sender = pick_str(q_obj, &["fromD", "dName", "ownerId", "fromUid", "uidFrom"]);
+    let q_text = resolve_quote_text(q_obj);
+    (q_id, q_sender, q_text)
+}
+
+/// Extract an optional thumbnail image URL and `is_video` flag from a Zalo `quote` payload.
+pub(crate) fn extract_quote_thumb_url(q: &Value) -> Option<(String, bool)> {
+    let parsed = if q.is_object() {
+        None
+    } else {
+        parse_embedded_json(q)
+    };
+    let q_obj = parsed.as_ref().unwrap_or(q);
+    if !q_obj.is_object() {
+        return None;
+    }
+    let q_type = normalize_quote_type(q_obj);
+    if matches!(
+        q_type.as_str(),
+        "chat.undo" | "undo" | "chat.deleted" | "chat.vanish" | "chat.sticker" | "sticker"
+            | "chat.voice" | "voice" | "chat.file" | "file" | "share.file"
+    ) {
+        return None;
+    }
+    let attach_val = q_obj.get("attach").and_then(parse_embedded_json).or_else(|| {
+        q_obj
+            .get("msg")
+            .or_else(|| q_obj.get("content"))
+            .and_then(|v| {
+                if v.is_object() || v.is_array() {
+                    Some(v.clone())
+                } else {
+                    parse_embedded_json(v)
+                }
+            })
+    })?;
+    if extract_sticker_info(&attach_val).is_some() || quote_has_voice_params(&attach_val) {
+        return None;
+    }
+    let (link_url, _title, _desc, link_thumb, link_src) = extract_link_info(&attach_val);
+    let is_video = matches!(
+        q_type.as_str(),
+        "chat.video" | "video" | "chat.video.msg" | "chat.video.live.msg"
+    ) || link_src.as_deref() == Some("Video Zalo")
+        || attach_val.as_object().is_some_and(|o| {
+            o.get("videoUrl").is_some()
+                || o.get("video_width").is_some()
+                || o.get("video_height").is_some()
+        })
+        || link_url.as_deref().is_some_and(is_video_url_like);
+    let is_link_like = matches!(
+        q_type.as_str(),
+        "chat.link" | "link" | "chat.recommended" | "share.link" | "chat.contact" | "contact"
+    );
+    let candidate = if is_video || is_link_like {
+        link_thumb
+    } else {
+        link_thumb.or_else(|| {
+            link_url.filter(|u| {
+                !is_video_url_like(u)
+                    && (matches!(
+                        q_type.as_str(),
+                        "chat.photo" | "photo" | "chat.doodle" | "doodle" | "chat.gif" | "gif"
+                    ) || is_zalo_photo_cdn_url(u))
+            })
+        })
+    }?;
+    if !is_safe_external_image_url(&candidate)
+        || candidate.to_ascii_lowercase().contains("/renewmedia")
+        || is_video_url_like(&candidate)
+    {
+        return None;
+    }
+    Some((candidate, is_video))
+}
+
+fn merge_reply_metadata(existing: &mut ChatMessage, incoming: &ChatMessage) {
+    if existing.reply_to_id.is_none() && incoming.reply_to_id.is_some() {
+        existing.reply_to_id = incoming.reply_to_id.clone();
+    }
+    if existing.reply_to_sender.is_none() && incoming.reply_to_sender.is_some() {
+        existing.reply_to_sender = incoming.reply_to_sender.clone();
+    }
+    if is_missing_or_raw_quote_text(existing.reply_to_text.as_deref())
+        && !is_missing_or_raw_quote_text(incoming.reply_to_text.as_deref())
+    {
+        if existing.reply_to_id.is_none() || incoming.reply_to_id.is_some() {
+            existing.reply_to_id = incoming.reply_to_id.clone().or_else(|| existing.reply_to_id.clone());
+        }
+        if existing.reply_to_sender.is_none() || incoming.reply_to_sender.is_some() {
+            existing.reply_to_sender = incoming
+                .reply_to_sender
+                .clone()
+                .or_else(|| existing.reply_to_sender.clone());
+        }
+        existing.reply_to_text = incoming.reply_to_text.clone();
+    }
+    if existing.wire_ref.fields.get("quote").is_none() {
+        if let Some(q) = incoming.wire_ref.fields.get("quote") {
+            existing.wire_ref.fields.insert("quote".into(), q.clone());
+        }
+    }
+}
+
+/// Repair missing, blank, or unparsed quote previews on loaded thread messages from wire metadata
+/// and from matching target messages within the loaded conversation.
+pub(crate) fn repair_thread_quote_replies(messages: &mut [ChatMessage]) {
+    for msg in messages.iter_mut() {
+        if msg
+            .reply_to_text
+            .as_deref()
+            .is_some_and(|t| t.trim().is_empty())
+        {
+            msg.reply_to_text = None;
+        }
+        if is_missing_or_raw_quote_text(msg.reply_to_text.as_deref()) {
+            let wire_q = msg
+                .wire_ref
+                .fields
+                .get("quote")
+                .or_else(|| msg.history_source.as_ref().and_then(|v| v.pointer("/meta/quote")));
+            if let Some(q) = wire_q {
+                let (q_id, q_sender, q_text) = extract_quote_reply_fields(q);
+                if msg.reply_to_id.is_none() {
+                    msg.reply_to_id = q_id;
+                }
+                if msg.reply_to_sender.is_none() {
+                    msg.reply_to_sender = q_sender;
+                }
+                if let Some(txt) = q_text {
+                    msg.reply_to_text = Some(txt);
+                }
+            } else if let Some(raw) = msg.reply_to_text.as_deref() {
+                msg.reply_to_text = normalize_quote_raw_msg(raw);
+            }
+        }
+    }
+
+    let len = messages.len();
+    let mut backfills: Vec<(usize, String)> = Vec::new();
+    for idx in 0..len {
+        if !is_missing_or_raw_quote_text(messages[idx].reply_to_text.as_deref()) {
+            continue;
+        }
+        let Some(ref rid) = messages[idx].reply_to_id else {
+            continue;
+        };
+        if let Some(target_idx) = crate::message_navigation::unique_reference_index(messages, rid) {
+            if target_idx != idx {
+                let preview = quote_preview_text(&messages[target_idx]);
+                if !preview.trim().is_empty() {
+                    backfills.push((idx, preview));
+                }
+            }
+        }
+    }
+    for (idx, preview) in backfills {
+        messages[idx].reply_to_text = Some(preview);
+    }
+}
+
 /// Preserve the request client ID for reconciliation with a later server echo.
 pub(crate) async fn send_quote_message_with_client_id(
     s: &Session,
@@ -5043,6 +5776,8 @@ pub(crate) async fn send_quote_message_with_client_id(
         now.saturating_sub(1000)
     };
 
+    let qmsg_text = quote_preview_text(quoted);
+
     let quote_res: Result<Value> = async {
         if quoted.id.starts_with("local_") || qmsg_id_num == 0 {
             anyhow::bail!("quoted message has no server id");
@@ -5062,7 +5797,7 @@ pub(crate) async fn send_quote_message_with_client_id(
                 ("qmsgId", json!(qmsg_id_num)),
                 ("qmsgCliId", json!(qmsg_cli_id)),
                 ("qmsgType", json!(1)),
-                ("qmsg", json!(quoted.text)),
+                ("qmsg", json!(qmsg_text)),
                 ("qmsgTs", json!(qmsg_ts)),
                 ("visibility", json!(0)),
                 ("ttl", json!(0)),
@@ -5106,7 +5841,7 @@ pub(crate) async fn send_quote_message_with_client_id(
                 ("qmsgCliId", json!(qmsg_cli_id)),
                 ("qmsgType", json!(1)),
                 ("qmsgTs", json!(qmsg_ts)),
-                ("qmsg", json!(quoted.text)),
+                ("qmsg", json!(qmsg_text)),
                 ("imei", json!(s.imei)),
                 ("ttl", json!(0)),
                 ("zsource", json!(101)),
@@ -8211,19 +8946,12 @@ fn parse_chat_message(it: &Value) -> Option<ChatMessage> {
         crate::ui::clock()
     };
 
-    let (reply_to_id, reply_to_sender, reply_to_text) =
-        if let Some(q) = it.get("quote").filter(|v| v.is_object()) {
-            let q_id = pick_str(q, &["cliMsgId", "globalMsgId", "msgId"]);
-            let q_sender = pick_str(q, &["fromD", "dName", "ownerId", "fromUid", "uidFrom"]);
-            let q_text = pick_str(q, &["msg", "message", "content"]).or_else(|| {
-                q.get("msg")
-                    .or_else(|| q.get("content"))
-                    .and_then(extract_content_text)
-            });
-            (q_id, q_sender, q_text)
-        } else {
-            (None, None, None)
-        };
+    let (reply_to_id, reply_to_sender, reply_to_text) = it
+        .get("quote")
+        .and_then(parse_embedded_json)
+        .filter(Value::is_object)
+        .map(|q| extract_quote_reply_fields(&q))
+        .unwrap_or((None, None, None));
 
     let (reactions, reaction_summaries) = {
         let mut summaries = crate::reactions::parse_reactions(it);
@@ -8694,6 +9422,7 @@ pub fn merge_previews(threads: &mut Vec<Thread>, resp: &Value) {
                     identities.remove(existing, row);
                     existing.merge_reaction_metadata(&parsed);
                     merge_delivery_state(&mut existing.delivery, parsed.delivery);
+                    merge_reply_metadata(existing, &parsed);
                     if existing.id.starts_with("out_")
                         && !parsed.id.is_empty()
                         && !parsed.id.starts_with("out_")
@@ -8713,11 +9442,6 @@ pub fn merge_previews(threads: &mut Vec<Thread>, resp: &Value) {
                         existing.sticker_id = parsed.sticker_id;
                         existing.sticker_cate_id = parsed.sticker_cate_id;
                         existing.sticker_type = parsed.sticker_type;
-                    }
-                    if existing.reply_to_text.is_none() && parsed.reply_to_text.is_some() {
-                        existing.reply_to_id = parsed.reply_to_id;
-                        existing.reply_to_sender = parsed.reply_to_sender;
-                        existing.reply_to_text = parsed.reply_to_text;
                     }
                     if existing.link_url.is_none() && parsed.link_url.is_some() {
                         existing.link_url = parsed.link_url;
@@ -8795,6 +9519,7 @@ pub fn merge_previews(threads: &mut Vec<Thread>, resp: &Value) {
     for t in threads.iter_mut() {
         if !t.messages.is_empty() {
             t.messages.sort_by_key(|m| m.ts);
+            repair_thread_quote_replies(&mut t.messages);
             if let Some(newest) = t.messages.last() {
                 if !newest.text.is_empty() {
                     t.preview = newest.text.replace('\n', " ");
@@ -8862,6 +9587,7 @@ pub fn merge_group_history(thread: &mut Thread, resp: &Value) {
                 identities.remove(existing, row);
                 existing.merge_reaction_metadata(&m);
                 merge_delivery_state(&mut existing.delivery, m.delivery);
+                merge_reply_metadata(existing, &m);
                 if existing.id.starts_with("out_") && !m.id.is_empty() && !m.id.starts_with("out_")
                 {
                     existing.id = m.id.clone();
@@ -8872,6 +9598,11 @@ pub fn merge_group_history(thread: &mut Thread, resp: &Value) {
                     existing.time = m.time;
                 }
                 apply_recall_merge(existing, &m.text);
+                if existing.sticker_id.is_none() && m.sticker_id.is_some() {
+                    existing.sticker_id = m.sticker_id;
+                    existing.sticker_cate_id = m.sticker_cate_id;
+                    existing.sticker_type = m.sticker_type;
+                }
                 if existing.link_url.is_none() && m.link_url.is_some() {
                     existing.link_url = m.link_url;
                     existing.link_title = m.link_title;
@@ -8902,6 +9633,7 @@ pub fn merge_group_history(thread: &mut Thread, resp: &Value) {
     }
 
     thread.messages.sort_by_key(|m| m.ts);
+    repair_thread_quote_replies(&mut thread.messages);
 
     if let Some(newest) = thread.messages.last() {
         if !newest.text.is_empty() {
@@ -13783,5 +14515,451 @@ mod send_identity_tests {
             ..Default::default()
         };
         assert!(legacy_call.effective_oa_card().is_none());
+    }
+
+    #[test]
+    fn parse_chat_message_quoted_photo_without_caption_yields_hinh_anh() {
+        let item = json!({
+            "msgId": "5001",
+            "cliMsgId": "1795400001000",
+            "uidFrom": "111222",
+            "dName": "Anh Khoa",
+            "msgType": "webchat",
+            "ts": "1795400001000",
+            "content": "@All mọi người hoàn thành trong hnay nha",
+            "quote": {
+                "ownerId": "111222",
+                "cliMsgId": 0,
+                "globalMsgId": "4999",
+                "cliMsgType": 32,
+                "fromD": "Anh Khoa",
+                "msg": "",
+                "attach": "{\"href\":\"https://photo-stal-27.zdn.vn/no/img1.jpg\",\"thumb\":\"https://photo-stal-27.zdn.vn/no/img1_t.jpg\",\"title\":\"\"}"
+            }
+        });
+        let cm = parse_chat_message(&item).expect("quoted photo message should parse");
+        assert_eq!(cm.reply_to_id.as_deref(), Some("4999"));
+        assert_eq!(cm.reply_to_sender.as_deref(), Some("Anh Khoa"));
+        assert_eq!(cm.reply_to_text.as_deref(), Some("[Hình ảnh]"));
+        let wire_q = cm.wire_ref.fields.get("quote").expect("quote wire kept");
+        assert_eq!(
+            extract_quote_thumb_url(wire_q),
+            Some(("https://photo-stal-27.zdn.vn/no/img1_t.jpg".into(), false))
+        );
+
+        let filename_attach = json!({
+            "msgId": "5002",
+            "uidFrom": "111222",
+            "dName": "Anh Khoa",
+            "msgType": "webchat",
+            "ts": "1795400002000",
+            "content": "Xem nhé",
+            "quote": {
+                "globalMsgId": "4998",
+                "msgType": "chat.photo",
+                "fromD": "Anh Khoa",
+                "msg": "   ",
+                "attach": {
+                    "href": "https://photo-stal-27.zdn.vn/no/img2.jpg",
+                    "thumb": "https://photo-stal-27.zdn.vn/no/img2_t.jpg",
+                    "title": "IMG_20261124.png"
+                }
+            }
+        });
+        let cm2 = parse_chat_message(&filename_attach).expect("object attach photo quote");
+        assert_eq!(cm2.reply_to_text.as_deref(), Some("[Hình ảnh]"));
+
+        let raw_json_msg = json!({
+            "msgId": "5003",
+            "uidFrom": "111222",
+            "msgType": "webchat",
+            "ts": "1795400003000",
+            "content": "Ok",
+            "quote": {
+                "globalMsgId": "4997",
+                "fromD": "An",
+                "msg": "{\"href\":\"https://photo-stal-27.zdn.vn/no/raw.jpg\",\"thumb\":\"https://photo-stal-27.zdn.vn/no/raw_t.jpg\"}"
+            }
+        });
+        let cm3 = parse_chat_message(&raw_json_msg).expect("raw json in quote.msg");
+        assert_eq!(cm3.reply_to_text.as_deref(), Some("[Hình ảnh]"));
+    }
+
+    #[test]
+    fn parse_chat_message_quoted_photo_with_caption_preserves_caption() {
+        let with_msg_cap = json!({
+            "msgId": "5010",
+            "uidFrom": "111222",
+            "msgType": "webchat",
+            "ts": "1795400010000",
+            "content": "Chuẩn luôn",
+            "quote": {
+                "globalMsgId": "4900",
+                "cliMsgType": 32,
+                "fromD": "Minh",
+                "msg": "Mọi người xem ảnh này",
+                "attach": "{\"href\":\"https://photo-stal-27.zdn.vn/no/cap.jpg\",\"thumb\":\"https://photo-stal-27.zdn.vn/no/cap_t.jpg\"}"
+            }
+        });
+        let cm = parse_chat_message(&with_msg_cap).expect("photo quote with msg caption");
+        assert_eq!(
+            cm.reply_to_text.as_deref(),
+            Some("[Hình ảnh] Mọi người xem ảnh này")
+        );
+
+        let with_attach_cap = json!({
+            "msgId": "5011",
+            "uidFrom": "111222",
+            "msgType": "webchat",
+            "ts": "1795400011000",
+            "content": "Đã nhận",
+            "quote": {
+                "globalMsgId": "4901",
+                "cliMsgType": 32,
+                "fromD": "Minh",
+                "msg": "",
+                "attach": {
+                    "href": "https://photo-stal-27.zdn.vn/no/cap2.jpg",
+                    "thumb": "https://photo-stal-27.zdn.vn/no/cap2_t.jpg",
+                    "title": "Báo cáo tuần"
+                }
+            }
+        });
+        let cm2 = parse_chat_message(&with_attach_cap).expect("photo quote with attach title caption");
+        assert_eq!(cm2.reply_to_text.as_deref(), Some("[Hình ảnh] Báo cáo tuần"));
+
+        let already_prefixed = json!({
+            "msgId": "5012",
+            "uidFrom": "111222",
+            "msgType": "webchat",
+            "ts": "1795400012000",
+            "content": "Ok",
+            "quote": {
+                "globalMsgId": "4902",
+                "cliMsgType": 32,
+                "fromD": "Minh",
+                "msg": "[Hình ảnh] Đã gắn sẵn"
+            }
+        });
+        let cm3 = parse_chat_message(&already_prefixed).expect("already prefixed photo quote");
+        assert_eq!(cm3.reply_to_text.as_deref(), Some("[Hình ảnh] Đã gắn sẵn"));
+    }
+
+    #[test]
+    fn parse_chat_message_quoted_video_sticker_voice_file_and_text() {
+        let video_q = json!({
+            "msgId": "5020",
+            "uidFrom": "111222",
+            "msgType": "webchat",
+            "ts": "1795400020000",
+            "content": "Xem video",
+            "quote": {
+                "globalMsgId": "4801",
+                "cliMsgType": 44,
+                "fromD": "Lan",
+                "msg": "",
+                "attach": "{\"href\":\"https://f.dlmd.me/v.mp4\",\"thumb\":\"https://photo-stal-27.zdn.vn/no/vt.jpg\"}"
+            }
+        });
+        let vcm = parse_chat_message(&video_q).expect("video quote");
+        assert_eq!(vcm.reply_to_text.as_deref(), Some("[Video]"));
+        let vq = vcm.wire_ref.fields.get("quote").unwrap();
+        assert_eq!(
+            extract_quote_thumb_url(vq),
+            Some(("https://photo-stal-27.zdn.vn/no/vt.jpg".into(), true))
+        );
+
+        let sticker_q = json!({
+            "msgId": "5021",
+            "uidFrom": "111222",
+            "msgType": "webchat",
+            "ts": "1795400021000",
+            "content": "Haha",
+            "quote": {
+                "globalMsgId": "4802",
+                "cliMsgType": 36,
+                "fromD": "Lan",
+                "msg": "",
+                "attach": {"catId": 100, "id": 200}
+            }
+        });
+        let scm = parse_chat_message(&sticker_q).expect("sticker quote");
+        assert_eq!(scm.reply_to_text.as_deref(), Some("[Nhãn dán]"));
+        assert_eq!(extract_quote_thumb_url(scm.wire_ref.fields.get("quote").unwrap()), None);
+
+        let voice_q = json!({
+            "msgId": "5022",
+            "uidFrom": "111222",
+            "msgType": "webchat",
+            "ts": "1795400022000",
+            "content": "Nghe rồi",
+            "quote": {
+                "globalMsgId": "4803",
+                "cliMsgType": 31,
+                "fromD": "Lan",
+                "msg": ""
+            }
+        });
+        assert_eq!(
+            parse_chat_message(&voice_q).unwrap().reply_to_text.as_deref(),
+            Some("[Tin nhắn thoại]")
+        );
+
+        let file_q = json!({
+            "msgId": "5023",
+            "uidFrom": "111222",
+            "msgType": "webchat",
+            "ts": "1795400023000",
+            "content": "Đã tải",
+            "quote": {
+                "globalMsgId": "4804",
+                "cliMsgType": 46,
+                "fromD": "Lan",
+                "msg": "",
+                "attach": "{\"fileName\":\"hop_dong.pdf\",\"href\":\"https://zalo.me/renewMedia\"}"
+            }
+        });
+        assert_eq!(
+            parse_chat_message(&file_q).unwrap().reply_to_text.as_deref(),
+            Some("[Tập tin] hop_dong.pdf")
+        );
+
+        let text_q = json!({
+            "msgId": "5024",
+            "uidFrom": "111222",
+            "msgType": "webchat",
+            "ts": "1795400024000",
+            "content": "Đồng ý",
+            "quote": {
+                "globalMsgId": "4805",
+                "cliMsgType": 1,
+                "fromD": "Lan",
+                "msg": "Original text"
+            }
+        });
+        assert_eq!(
+            parse_chat_message(&text_q).unwrap().reply_to_text.as_deref(),
+            Some("Original text")
+        );
+
+        let url_text_q = json!({
+            "msgId": "5025",
+            "uidFrom": "111222",
+            "msgType": "webchat",
+            "ts": "1795400025000",
+            "content": "Đọc thử",
+            "quote": {
+                "globalMsgId": "4806",
+                "cliMsgType": 1,
+                "fromD": "Lan",
+                "msg": "https://example.com/article"
+            }
+        });
+        assert_eq!(
+            parse_chat_message(&url_text_q).unwrap().reply_to_text.as_deref(),
+            Some("https://example.com/article")
+        );
+
+        let recall_q = json!({
+            "msgId": "5026",
+            "uidFrom": "111222",
+            "msgType": "webchat",
+            "ts": "1795400026000",
+            "content": "Ủa",
+            "quote": {
+                "globalMsgId": "4807",
+                "cliMsgType": 45,
+                "fromD": "Lan",
+                "msg": "",
+                "attach": {"thumb": "https://photo-stal-27.zdn.vn/no/recalled.jpg"}
+            }
+        });
+        let rcm = parse_chat_message(&recall_q).unwrap();
+        assert_eq!(rcm.reply_to_text.as_deref(), Some("[Tin nhắn đã thu hồi]"));
+        assert_eq!(extract_quote_thumb_url(rcm.wire_ref.fields.get("quote").unwrap()), None);
+    }
+
+    #[test]
+    fn quote_preview_text_and_repair_thread_backfill_quoted_media() {
+        let photo_msg = ChatMessage {
+            id: "photo-1".into(),
+            kind: crate::message_model::MessageKind::Photo,
+            text: "[Hình ảnh]".into(),
+            link_src: Some("Hình ảnh Zalo".into()),
+            ..Default::default()
+        };
+        assert_eq!(quote_preview_text(&photo_msg), "[Hình ảnh]");
+
+        let legacy_url_photo = ChatMessage {
+            id: "photo-2".into(),
+            kind: crate::message_model::MessageKind::Photo,
+            text: "https://photo-stal-27.zdn.vn/no/old.jpg".into(),
+            link_desc: Some("Ảnh họp".into()),
+            ..Default::default()
+        };
+        assert_eq!(quote_preview_text(&legacy_url_photo), "[Hình ảnh] Ảnh họp");
+
+        let plain_text = ChatMessage {
+            id: "txt-1".into(),
+            kind: crate::message_model::MessageKind::Text,
+            text: "Hẹn 8h nhé".into(),
+            ..Default::default()
+        };
+        assert_eq!(quote_preview_text(&plain_text), "Hẹn 8h nhé");
+
+        let mut msgs = vec![
+            photo_msg,
+            ChatMessage {
+                id: "reply-to-photo".into(),
+                text: "@All check nhé".into(),
+                reply_to_id: Some("photo-1".into()),
+                reply_to_sender: Some("Anh Khoa".into()),
+                reply_to_text: Some("".into()),
+                ..Default::default()
+            },
+            ChatMessage {
+                id: "orphan-blank".into(),
+                text: "Tin khác".into(),
+                reply_to_id: Some("missing-id".into()),
+                reply_to_sender: Some("Ai đó".into()),
+                reply_to_text: Some("   ".into()),
+                ..Default::default()
+            },
+        ];
+        repair_thread_quote_replies(&mut msgs);
+        assert_eq!(msgs[1].reply_to_text.as_deref(), Some("[Hình ảnh]"));
+        assert_eq!(msgs[2].reply_to_text, None);
+    }
+
+    #[tokio::test]
+    async fn send_quote_message_photo_sends_hinh_anh_qmsg_and_merge_repairs_blank_quote() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let host = format!("http://{addr}");
+        let fixture = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let mut bodies = Vec::new();
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buf = [0u8; 8192];
+                let n = stream.read(&mut buf).unwrap();
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                let body = req.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
+                bodies.push(body);
+                let resp = r#"{"error_code":0,"data":{"msgId":"9999"}}"#;
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
+                    resp.len(),
+                    resp
+                )
+                .unwrap();
+            }
+            bodies
+        });
+        let mut session = Session::new(false, false, false).unwrap();
+        session.login = Some(crate::session::LoginInfo {
+            uin: "me_1".into(),
+            ..Default::default()
+        });
+        session.secret_key = Some(vec![7; 32]);
+        session.domains.chat = host.clone();
+        session.domains.group = host;
+
+        let photo_bare = ChatMessage {
+            id: "88001".into(),
+            kind: crate::message_model::MessageKind::Photo,
+            text: "https://photo-stal-27.zdn.vn/no/p.jpg".into(),
+            link_src: Some("Hình ảnh Zalo".into()),
+            ts: 1_795_400_000_000,
+            ..Default::default()
+        };
+        send_quote_message_with_client_id(
+            &session,
+            "peer-1",
+            "Đẹp quá",
+            &photo_bare,
+            false,
+            1_795_400_100_000,
+        )
+        .await
+        .unwrap();
+
+        let photo_cap = ChatMessage {
+            id: "88002".into(),
+            kind: crate::message_model::MessageKind::Photo,
+            text: "Đi ăn trưa".into(),
+            link_src: Some("Hình ảnh Zalo".into()),
+            ts: 1_795_400_000_000,
+            ..Default::default()
+        };
+        send_quote_message_with_client_id(
+            &session,
+            "g123",
+            "Đi thôi",
+            &photo_cap,
+            true,
+            1_795_400_200_000,
+        )
+        .await
+        .unwrap();
+
+        let bodies = fixture.join().unwrap();
+        let decode_body = |form: &str| -> Value {
+            let query = reqwest::Url::parse(&format!("http://localhost/?{form}")).unwrap();
+            let encrypted = query
+                .query_pairs()
+                .find(|(key, _)| key == "params")
+                .unwrap()
+                .1
+                .into_owned();
+            let plain = crate::crypto::decode_aes(&[7; 32], &encrypted).unwrap();
+            serde_json::from_str(&plain).unwrap()
+        };
+        let b0 = decode_body(&bodies[0]);
+        assert_eq!(b0.get("qmsg").and_then(Value::as_str), Some("[Hình ảnh]"));
+        assert_eq!(b0.get("qmsgType").and_then(Value::as_i64), Some(1));
+        assert_eq!(b0.get("qmsgId").and_then(Value::as_u64), Some(88001));
+
+        let b1 = decode_body(&bodies[1]);
+        assert_eq!(
+            b1.get("qmsg").and_then(Value::as_str),
+            Some("[Hình ảnh] Đi ăn trưa")
+        );
+        assert_eq!(b1.get("qmsgType").and_then(Value::as_i64), Some(1));
+        assert_eq!(b1.get("qmsgId").and_then(Value::as_u64), Some(88002));
+
+        let mut thread = Thread {
+            id: "g123".into(),
+            is_group: true,
+            messages: vec![ChatMessage {
+                id: "9001".into(),
+                text: "Check ảnh".into(),
+                reply_to_id: Some("88001".into()),
+                reply_to_sender: Some("An".into()),
+                reply_to_text: Some("".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let history_resp = json!({
+            "data": [{
+                "msgId": "9001",
+                "uidFrom": "u1",
+                "dName": "An",
+                "msgType": "webchat",
+                "ts": "1795400300000",
+                "content": "Check ảnh",
+                "quote": {
+                    "globalMsgId": "88001",
+                    "cliMsgType": 32,
+                    "fromD": "An",
+                    "msg": "",
+                    "attach": "{\"href\":\"https://photo-stal-27.zdn.vn/no/p.jpg\"}"
+                }
+            }]
+        });
+        merge_group_history(&mut thread, &history_resp);
+        assert_eq!(thread.messages[0].reply_to_text.as_deref(), Some("[Hình ảnh]"));
     }
 }

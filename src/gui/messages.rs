@@ -4508,6 +4508,40 @@ pub(super) fn render_chat_bubble(
             || !msg.reactions.is_empty()
             || msg.is_starred);
 
+    let quote_view = resolve_quote_view(msg, album);
+    let quote_w = if let Some(ref qv) = quote_view {
+        let has_thumb_tex = qv.thumb_url.as_deref().is_some_and(|url| {
+            let tkey = format!("thumb_{}", crate::crypto::md5_hex(url));
+            sticker_textures
+                .get(&tkey)
+                .is_some_and(|tex| tex.size()[0] > 2 && tex.size()[1] > 2)
+        });
+        let thumb_extra = if has_thumb_tex { 42.0_f32 } else { 0.0_f32 };
+        let q_body_w = ui.fonts(|f| {
+            f.layout(
+                truncate_chars(&qv.text, 80).into_owned(),
+                FontId::proportional(12.0),
+                Color32::WHITE,
+                (max_text_width - 28.0 - thumb_extra).max(60.0),
+            )
+            .size()
+            .x
+        });
+        let who = msg
+            .reply_to_sender
+            .as_deref()
+            .filter(|sn| !sn.is_empty() && !sn.chars().all(|c| c.is_ascii_digit()))
+            .unwrap_or("Tin nhắn trích dẫn");
+        let q_who_w = ui.fonts(|f| {
+            f.layout_no_wrap(who.to_string(), FontId::proportional(11.5), Color32::WHITE)
+                .size()
+                .x
+        });
+        (q_body_w.max(q_who_w) + 30.0 + thumb_extra).min(max_text_width)
+    } else {
+        0.0_f32
+    };
+
     let photo_caption = if is_photo_card {
         extract_photo_user_caption(msg)
     } else {
@@ -4517,7 +4551,7 @@ pub(super) fn render_chat_bubble(
     let is_frameless_photo = is_photo_card
         && !has_photo_caption
         && !is_anti_recalled_msg
-        && msg.reply_to_text.is_none()
+        && quote_view.is_none()
         && (msg.is_outgoing || !is_group);
 
     let sender_is_name = !msg.sender.is_empty()
@@ -4701,32 +4735,6 @@ pub(super) fn render_chat_bubble(
             .size()
             .x
         });
-        let quote_w = match msg.reply_to_text.as_ref() {
-            Some(qt) => {
-                let q_body_w = ui.fonts(|f| {
-                    f.layout(
-                        truncate_chars(qt, 80).into_owned(),
-                        FontId::proportional(12.0),
-                        Color32::WHITE,
-                        (max_text_width - 28.0).max(80.0),
-                    )
-                    .size()
-                    .x
-                });
-                let who = msg
-                    .reply_to_sender
-                    .as_deref()
-                    .filter(|sn| !sn.is_empty() && !sn.chars().all(|c| c.is_ascii_digit()))
-                    .unwrap_or("Tin nhắn trích dẫn");
-                let q_who_w = ui.fonts(|f| {
-                    f.layout_no_wrap(who.to_string(), FontId::proportional(11.5), Color32::WHITE)
-                        .size()
-                        .x
-                });
-                q_body_w.max(q_who_w) + 30.0
-            }
-            None => 0.0_f32,
-        };
         let sender_w = if show_group_sender {
             ui.fonts(|f| {
                 f.layout_no_wrap(
@@ -4760,6 +4768,7 @@ pub(super) fn render_chat_bubble(
             + 4.0
     })
     .max(anti_recall_min_w)
+    .max(quote_w)
     .min(max_text_width);
 
     let h_margin = if has_sticker || is_frameless_photo {
@@ -4831,7 +4840,17 @@ pub(super) fn render_chat_bubble(
                         ui.set_min_width(content_width);
                         ui.set_max_width(content_width);
                         ui.with_layout(Layout::top_down(Align::Min), |ui| {
-                            quote_action = render_quote_block(ui, msg, pal, true, content_width);
+                            quote_action = render_quote_block_with_media(
+                                ui,
+                                msg,
+                                pal,
+                                true,
+                                content_width,
+                                album,
+                                Some(sticker_textures),
+                                Some(loading_stickers),
+                                Some(failed_stickers),
+                            );
                             if let Some(card) = &call_card_opt {
                                 card_action = render_call_card_widget(ui, card, pal, content_width);
                             } else if !render_sticker_widget(
@@ -5057,7 +5076,17 @@ pub(super) fn render_chat_bubble(
                                 );
                                 ui.add_space(2.0);
                             }
-                            quote_action = render_quote_block(ui, msg, pal, false, content_width);
+                            quote_action = render_quote_block_with_media(
+                                ui,
+                                msg,
+                                pal,
+                                false,
+                                content_width,
+                                album,
+                                Some(sticker_textures),
+                                Some(loading_stickers),
+                                Some(failed_stickers),
+                            );
                             if let Some(card) = &call_card_opt {
                                 card_action = render_call_card_widget(ui, card, pal, content_width);
                             } else if !render_sticker_widget(
@@ -5843,7 +5872,83 @@ pub(super) fn bubble_context_menu(
     action
 }
 
+pub(super) struct ResolvedQuoteView {
+    pub(super) text: String,
+    pub(super) thumb_url: Option<String>,
+    pub(super) is_video: bool,
+}
+
+/// Resolve display text and optional thumbnail URL for a quoted message block.
+pub(super) fn resolve_quote_view(
+    msg: &ChatMessage,
+    album: &[(usize, &ChatMessage)],
+) -> Option<ResolvedQuoteView> {
+    let wire_q = msg
+        .wire_ref
+        .fields
+        .get("quote")
+        .or_else(|| msg.history_source.as_ref().and_then(|v| v.pointer("/meta/quote")));
+    let wire_parsed = wire_q.map(crate::chat::extract_quote_reply_fields);
+    let wire_thumb = wire_q.and_then(crate::chat::extract_quote_thumb_url);
+
+    let album_target = msg.reply_to_id.as_deref().and_then(|rid| {
+        album
+            .iter()
+            .find(|(_, m)| crate::message_navigation::message_matches_reference(m, rid))
+            .map(|(_, m)| *m)
+    });
+
+    let mut text = msg
+        .reply_to_text
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(|t| {
+            if !crate::chat::is_missing_or_raw_quote_text(Some(t)) {
+                Some(t.to_string())
+            } else if let Some((_, _, Some(wt))) = &wire_parsed {
+                Some(wt.clone())
+            } else {
+                crate::chat::normalize_quote_raw_msg(t)
+            }
+        });
+
+    if text.is_none() {
+        text = wire_parsed.and_then(|(_, _, wt)| wt);
+    }
+    if text.is_none() {
+        if let Some(target) = album_target {
+            let preview = crate::chat::quote_preview_text(target);
+            if !preview.trim().is_empty() {
+                text = Some(preview);
+            }
+        }
+    }
+
+    let final_text = text?;
+    let is_recalled_quote = matches!(
+        final_text.trim(),
+        "[Tin nhắn đã thu hồi]" | "[Tin nhắn đã bị xóa]" | "[Tin nhắn đã tự xóa]"
+    );
+    let (thumb_url, is_video) = if is_recalled_quote {
+        (None, false)
+    } else if let Some((u, vid)) = wire_thumb {
+        (Some(u), vid)
+    } else if let Some(target) = album_target {
+        (photo_primary_url(target).map(str::to_string), false)
+    } else {
+        (None, false)
+    };
+
+    Some(ResolvedQuoteView {
+        text: final_text,
+        thumb_url,
+        is_video,
+    })
+}
+
 /// Quoted-message block shown at the top of a reply bubble.
+#[cfg(test)]
 pub(super) fn render_quote_block(
     ui: &mut egui::Ui,
     msg: &ChatMessage,
@@ -5851,13 +5956,28 @@ pub(super) fn render_quote_block(
     outgoing: bool,
     max_w: f32,
 ) -> Option<BubbleAction> {
-    let qt = msg.reply_to_text.as_ref()?;
+    render_quote_block_with_media(ui, msg, pal, outgoing, max_w, &[], None, None, None)
+}
+
+/// Quoted-message block with optional thumbnail fetching and `ResourceLru` protection.
+pub(super) fn render_quote_block_with_media(
+    ui: &mut egui::Ui,
+    msg: &ChatMessage,
+    pal: &ThemePalette,
+    outgoing: bool,
+    max_w: f32,
+    album: &[(usize, &ChatMessage)],
+    sticker_textures: Option<&HashMap<String, TextureHandle>>,
+    mut loading_stickers: Option<&mut HashSet<String>>,
+    failed_stickers: Option<&HashMap<String, (u8, std::time::Instant)>>,
+) -> Option<BubbleAction> {
+    let qv = resolve_quote_view(msg, album)?;
     let (_text_col, meta_col) = if outgoing {
         (pal.bubble_out_text, pal.bubble_out_meta)
     } else {
         (pal.bubble_in_text, pal.bubble_in_meta)
     };
-    let bar_col = Color32::from_rgb(102, 166, 255); // #66A6FF
+    let bar_col = Color32::from_rgb(102, 166, 255);
     let bg_col = if outgoing && pal.is_dark {
         Color32::from_rgba_unmultiplied(0, 0, 0, 42)
     } else if outgoing {
@@ -5867,7 +5987,30 @@ pub(super) fn render_quote_block(
     } else {
         Color32::from_rgb(229, 241, 255)
     };
-    let inner_col_w = (max_w - 28.0).max(72.0);
+
+    let mut thumb_tex: Option<TextureHandle> = None;
+    if let (Some(url), Some(textures)) = (qv.thumb_url.as_deref(), sticker_textures) {
+        let tkey = format!("thumb_{}", crate::crypto::md5_hex(url));
+        if let (Some(loading), Some(failed)) = (loading_stickers.as_deref_mut(), failed_stickers) {
+            crate::gui::queue_sticker_fetch(
+                textures,
+                loading,
+                failed,
+                tkey.clone(),
+                url.to_string(),
+            );
+        }
+        if let Some(tex) = textures.get(&tkey) {
+            crate::gui::mark_texture_used(&tkey);
+            let [tw, th] = tex.size();
+            if tw > 2 && th > 2 {
+                thumb_tex = Some(tex.clone());
+            }
+        }
+    }
+
+    let thumb_reserved = if thumb_tex.is_some() { 42.0_f32 } else { 0.0_f32 };
+    let inner_col_w = (max_w - 28.0 - thumb_reserved).max(60.0);
     let frame = egui::Frame::none()
         .fill(bg_col)
         .rounding(Rounding::same(8.0))
@@ -5877,6 +6020,31 @@ pub(super) fn render_quote_block(
                 let (bar_rect, _) = ui.allocate_exact_size(Vec2::new(3.0, 28.0), Sense::hover());
                 ui.painter()
                     .rect_filled(bar_rect, Rounding::same(1.5), bar_col);
+                if let Some(ref tex) = thumb_tex {
+                    let thumb_img = egui::Image::new(tex)
+                        .fit_to_exact_size(Vec2::splat(34.0))
+                        .maintain_aspect_ratio(false)
+                        .rounding(Rounding::same(4.0))
+                        .sense(Sense::hover());
+                    let img_resp = ui.add(thumb_img);
+                    if qv.is_video {
+                        ui.painter().circle_filled(
+                            img_resp.rect.center(),
+                            8.0,
+                            Color32::from_rgba_unmultiplied(0, 0, 0, 145),
+                        );
+                        let c = img_resp.rect.center();
+                        ui.painter().add(egui::Shape::convex_polygon(
+                            vec![
+                                Pos2::new(c.x - 2.5, c.y - 4.0),
+                                Pos2::new(c.x - 2.5, c.y + 4.0),
+                                Pos2::new(c.x + 4.0, c.y),
+                            ],
+                            Color32::WHITE,
+                            Stroke::NONE,
+                        ));
+                    }
+                }
                 ui.vertical(|ui| {
                     ui.set_width(inner_col_w);
                     let who = msg
@@ -5887,7 +6055,7 @@ pub(super) fn render_quote_block(
                     ui.label(RichText::new(who).color(bar_col).size(11.5).strong());
                     ui.add(
                         egui::Label::new(
-                            RichText::new(truncate_chars(qt, 84))
+                            RichText::new(truncate_chars(&qv.text, 84))
                                 .color(meta_col)
                                 .size(12.0),
                         )
@@ -6454,8 +6622,268 @@ mod quote_navigation_tests {
                 return;
             }
         }
-        panic!("Quote with an exact reference must advertise a clickable target");
-    }
+            panic!("Quote with an exact reference must advertise a clickable target");
+        }
+
+        #[test]
+        fn quote_block_renders_quoted_photo_like_video_and_preserves_jump() {
+            let mut wire_fields = std::collections::BTreeMap::new();
+            wire_fields.insert(
+                "quote".to_string(),
+                serde_json::json!({
+                    "cliMsgId": "photo-1",
+                    "cliMsgType": 32,
+                    "fromD": "Anh Khoa",
+                    "msg": "",
+                    "attach": "{\"href\":\"https://photo-stal-27.zdn.vn/no/p.jpg\",\"thumb\":\"https://photo-stal-27.zdn.vn/no/pt.jpg\",\"title\":\"\"}"
+                }),
+            );
+            let msg = ChatMessage {
+                id: "reply-photo-1".into(),
+                text: "@All check nha".into(),
+                sender: "Anh Khoa".into(),
+                reply_to_id: Some("photo-1".into()),
+                reply_to_sender: Some("Anh Khoa".into()),
+                reply_to_text: Some("".into()),
+                wire_ref: crate::message_model::WireMessageRef {
+                    fields: wire_fields,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+
+            let qv = resolve_quote_view(&msg, &[]).expect("wire quote photo should resolve");
+            assert_eq!(qv.text, "[Hình ảnh]");
+            assert_eq!(
+                qv.thumb_url.as_deref(),
+                Some("https://photo-stal-27.zdn.vn/no/pt.jpg")
+            );
+            assert!(!qv.is_video);
+
+            let ctx = egui::Context::default();
+            let expired_tex = ctx.load_texture(
+                "thumb_expired",
+                egui::ColorImage::new([2, 2], egui::Color32::BLACK),
+                egui::TextureOptions::default(),
+            );
+            let mut textures = HashMap::new();
+            let expired_key = format!(
+                "thumb_{}",
+                crate::crypto::md5_hex("https://photo-stal-27.zdn.vn/no/pt.jpg")
+            );
+            textures.insert(expired_key, expired_tex);
+
+            let mut loading = HashSet::new();
+            let failed = HashMap::new();
+            let mut position = egui::pos2(30.0, 30.0);
+            let mut action = None;
+            let mut saw_photo_label = false;
+            for frame in 0..4 {
+                let mut events = vec![egui::Event::PointerMoved(position)];
+                if frame >= 2 {
+                    events.push(egui::Event::PointerButton {
+                        pos: position,
+                        button: egui::PointerButton::Primary,
+                        pressed: frame == 2,
+                        modifiers: egui::Modifiers::NONE,
+                    });
+                }
+                let output = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            Vec2::new(600.0, 400.0),
+                        )),
+                        events,
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            action = render_chat_bubble(
+                                ui,
+                                &msg,
+                                false,
+                                false,
+                                false,
+                                true,
+                                "Nhóm",
+                                None,
+                                &ThemePalette::light(),
+                                &textures,
+                                &mut loading,
+                                &failed,
+                                &HashMap::new(),
+                                0,
+                                &[],
+                                None,
+                                false,
+                                None,
+                                false,
+                                None,
+                                MdOptions::default(),
+                            );
+                        });
+                    },
+                );
+                if frame == 0 {
+                    position = output
+                        .shapes
+                        .iter()
+                        .find_map(|shape| match &shape.shape {
+                            egui::Shape::Text(text) if text.galley.job.text == "[Hình ảnh]" => {
+                                saw_photo_label = true;
+                                Some(text.pos + Vec2::new(4.0, 4.0))
+                            }
+                            _ => None,
+                        })
+                        .expect("[Hình ảnh] quote label must render");
+                }
+            }
+            assert!(saw_photo_label);
+            assert!(
+                matches!(action, Some(BubbleAction::JumpToQuoted(ref r)) if r == "photo-1"),
+                "clicking quoted photo must emit JumpToQuoted"
+            );
+        }
+
+        #[test]
+        fn quote_block_with_valid_thumbnail_renders_photo_label_and_preserves_jump() {
+            let mut wire_fields = std::collections::BTreeMap::new();
+            wire_fields.insert(
+                "quote".to_string(),
+                serde_json::json!({
+                    "cliMsgId": "photo-2",
+                    "cliMsgType": 32,
+                    "fromD": "Minh",
+                    "msg": "Cà phê sáng",
+                    "attach": "{\"href\":\"https://photo-stal-27.zdn.vn/no/p2.jpg\",\"thumb\":\"https://photo-stal-27.zdn.vn/no/p2t.jpg\"}"
+                }),
+            );
+            let msg = ChatMessage {
+                id: "reply-photo-2".into(),
+                kind: crate::message_model::MessageKind::Photo,
+                text: "[Hình ảnh]".into(),
+                link_src: Some("Hình ảnh Zalo".into()),
+                link_url: Some("https://photo-stal-27.zdn.vn/no/reply.jpg".into()),
+                link_thumb: Some("https://photo-stal-27.zdn.vn/no/reply_t.jpg".into()),
+                sender: "Bạn".into(),
+                is_outgoing: true,
+                reply_to_id: Some("photo-2".into()),
+                reply_to_sender: Some("Minh".into()),
+                reply_to_text: None,
+                wire_ref: crate::message_model::WireMessageRef {
+                    fields: wire_fields,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+
+            let qv = resolve_quote_view(&msg, &[]).expect("wire caption quote should resolve");
+            assert_eq!(qv.text, "[Hình ảnh] Cà phê sáng");
+
+            let ctx = egui::Context::default();
+            let valid_tex = ctx.load_texture(
+                "thumb_valid",
+                egui::ColorImage::new([32, 32], egui::Color32::LIGHT_BLUE),
+                egui::TextureOptions::default(),
+            );
+            let mut textures = HashMap::new();
+            let valid_key = format!(
+                "thumb_{}",
+                crate::crypto::md5_hex("https://photo-stal-27.zdn.vn/no/p2t.jpg")
+            );
+            textures.insert(valid_key, valid_tex);
+
+            let mut loading = HashSet::new();
+            let failed = HashMap::new();
+            let mut thumb_click_pos = None;
+            let mut action = None;
+            let mut saw_caption = false;
+            for frame in 0..4 {
+                let probe_pos = thumb_click_pos.unwrap_or(egui::pos2(30.0, 30.0));
+                let mut events = vec![egui::Event::PointerMoved(probe_pos)];
+                if frame >= 2 {
+                    events.push(egui::Event::PointerButton {
+                        pos: probe_pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: frame == 2,
+                        modifiers: egui::Modifiers::NONE,
+                    });
+                }
+                let output = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            Vec2::new(600.0, 400.0),
+                        )),
+                        events,
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            action = render_chat_bubble(
+                                ui,
+                                &msg,
+                                false,
+                                false,
+                                false,
+                                false,
+                                "Minh",
+                                None,
+                                &ThemePalette::light(),
+                                &textures,
+                                &mut loading,
+                                &failed,
+                                &HashMap::new(),
+                                0,
+                                &[],
+                                None,
+                                false,
+                                None,
+                                false,
+                                None,
+                                MdOptions::default(),
+                            );
+                        });
+                    },
+                );
+                if frame == 0 {
+                    for shape in &output.shapes {
+                        match &shape.shape {
+                            egui::Shape::Text(text)
+                                if text.galley.job.text.contains("[Hình ảnh] Cà phê sáng") =>
+                            {
+                                saw_caption = true;
+                            }
+                            egui::Shape::Rect(rect_shape)
+                                if (rect_shape.rect.width() - 34.0).abs() < 2.0
+                                    && (rect_shape.rect.height() - 34.0).abs() < 2.0 =>
+                            {
+                                thumb_click_pos = Some(rect_shape.rect.center());
+                            }
+                            egui::Shape::Mesh(mesh) => {
+                                let bounds = mesh.calc_bounds();
+                                if (bounds.width() - 34.0).abs() < 2.0
+                                    && (bounds.height() - 34.0).abs() < 2.0
+                                {
+                                    thumb_click_pos = Some(bounds.center());
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    assert!(
+                        thumb_click_pos.is_some(),
+                        "expected rendered 34x34 quote thumbnail shape"
+                    );
+                }
+            }
+            assert!(saw_caption);
+            assert!(
+                matches!(action, Some(BubbleAction::JumpToQuoted(ref r)) if r == "photo-2"),
+                "clicking directly on quote thumbnail must trigger JumpToQuoted, not OpenImagePopup"
+            );
+        }
 
     #[test]
     fn bubble_context_menu_opens_on_secondary_click_and_emits_reply_action() {
