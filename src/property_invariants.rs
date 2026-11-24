@@ -1,11 +1,24 @@
 //! Deterministic property-based fuzz tests for core UI layout, album grouping,
 //! settings sanitization, and QR protocol parsers.
 
+use crate::account_manager::{
+    has_any_saved_credentials_in, wipe_all_saved_session_credentials_in,
+};
+use crate::app_lock::{
+    mask_notification_content, mask_toast_text, pbkdf2_hmac_sha256, popup_allows_interaction,
+    validate_passcode, AppLockConfig, PasscodeMode, VerifyOutcome, APP_LOCK_FILE,
+    CURRENT_VERSION, LOCKOUT_SECS, MAX_FAILED_ATTEMPTS, MIN_ITERATIONS, SALT_LEN,
+};
 use crate::chat::{
     apply_recall_merge, build_native_video_forward_params, build_recall_payload,
     build_set_mute_payload, probe_mp4_metadata, ChatMessage, MediaGroupLayout, MUTE_ACTION_SET,
     MUTE_ACTION_UNSET,
 };
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine as _;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use crate::gui::attachments::is_video_path;
 use crate::gui::lucide;
 use crate::gui::messages::{album_run_lengths, compute_video_thumb_size};
@@ -485,4 +498,608 @@ fn test_target_decode_max_dim_bounds_avatars_and_hd_photos() {
     assert_eq!(crate::gui::worker::target_decode_max_dim("hd_abc123"), 2048);
     assert_eq!(crate::gui::worker::target_decode_max_dim("thumb_abc123"), 720);
     assert_eq!(crate::gui::worker::target_decode_max_dim("stk_123_456"), 720);
+}
+
+struct PropTempDir {
+    path: PathBuf,
+}
+
+impl PropTempDir {
+    fn new(prefix: &str, seed: u64) -> Self {
+        static NEXT_PROP_TMP: AtomicU64 = AtomicU64::new(0);
+        let seq = NEXT_PROP_TMP.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "ctdozlite-prop-{prefix}-{}-{seq}-{seed:x}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&path).expect("create prop temp dir");
+        Self { path }
+    }
+}
+
+impl Drop for PropTempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+fn write_prop_fixture(path: &Path, bytes: &[u8]) {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).expect("create fixture parent");
+    }
+    std::fs::write(path, bytes).expect("write fixture");
+}
+
+fn gen_pin4(rng: &mut Xorshift64) -> String {
+    (0..4)
+        .map(|_| (b'0' + (rng.next_u64() % 10) as u8) as char)
+        .collect()
+}
+
+fn mutate_pin4(pin: &str) -> String {
+    let mut chars: Vec<char> = pin.chars().collect();
+    chars[0] = if chars[0] == '9' { '0' } else { '9' };
+    chars.into_iter().collect()
+}
+
+fn gen_custom_passcode(rng: &mut Xorshift64, len_override: Option<usize>) -> String {
+    const POOL: &[char] = &[
+        'a', 'b', 'c', 'x', 'y', 'z', 'A', 'K', 'Z', '0', '4', '9', '!', '@', '#', '$', '%', '-',
+        '_', '?', 'ă', 'ê', 'ô', 'ư', 'đ', 'Á', 'ệ', '🔒', '✨',
+    ];
+    let len = len_override.unwrap_or_else(|| 4 + (rng.next_u64() % 29) as usize);
+    let mut out = String::new();
+    for _ in 0..len {
+        let idx = (rng.next_u64() as usize) % POOL.len();
+        out.push(POOL[idx]);
+    }
+    out
+}
+
+fn mutate_custom(passcode: &str) -> String {
+    let mut chars: Vec<char> = passcode.chars().collect();
+    let replacement = if chars[0] == '~' { '*' } else { '~' };
+    chars[0] = replacement;
+    chars.into_iter().collect()
+}
+
+fn flip_b64_byte(b64: &str, idx_seed: u64, mask_seed: u64) -> String {
+    let mut raw = STANDARD.decode(b64).expect("valid base64");
+    let idx = (idx_seed as usize) % raw.len();
+    let mask = ((mask_seed as u8) & 0xFE) | 0x01;
+    raw[idx] ^= mask;
+    STANDARD.encode(raw)
+}
+
+fn make_fast_lock_config(
+    mode: PasscodeMode,
+    passcode: &str,
+    salt: &[u8; SALT_LEN],
+    iterations: u32,
+) -> AppLockConfig {
+    let hash = pbkdf2_hmac_sha256(passcode.as_bytes(), salt, iterations);
+    AppLockConfig {
+        version: CURRENT_VERSION,
+        enabled: true,
+        mode,
+        salt_b64: STANDARD.encode(salt),
+        hash_b64: STANDARD.encode(hash),
+        iterations,
+        ..AppLockConfig::default()
+    }
+}
+
+fn assert_serialized_redacts_passcode(cfg: &AppLockConfig, passcode: &str) {
+    let json = serde_json::to_string_pretty(cfg).expect("serialize AppLockConfig");
+    let value: serde_json::Value = serde_json::from_str(&json).expect("parse AppLockConfig JSON");
+    let obj = value.as_object().expect("JSON root object");
+    for (k, v) in obj {
+        let lower_k = k.to_ascii_lowercase();
+        assert!(
+            !lower_k.contains("pass") && !lower_k.contains("pin") && !lower_k.contains("secret"),
+            "unexpected plaintext key {k} in serialized AppLockConfig"
+        );
+        if let Some(s) = v.as_str() {
+            assert_ne!(s, passcode, "JSON field {k} directly exposed passcode");
+        }
+    }
+    let non_b64_or_long = passcode.chars().count() >= 6
+        || !passcode
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'=');
+    if non_b64_or_long {
+        assert!(
+            !json.contains(passcode),
+            "serialized AppLockConfig leaked plaintext passcode substring"
+        );
+    }
+}
+
+/// Verify PBKDF2-HMAC-SHA256 uniqueness, plaintext redaction, and tamper/mode rejection across
+/// full `100_000`-round configs and 100+ randomized lower-iteration sweeps.
+#[test]
+fn prop_app_lock_pbkdf2_roundtrip_and_tamper_rejection() {
+    let mut rng = Xorshift64::new(0xA991_0C01);
+    let mut seen_salts = HashSet::new();
+    let mut seen_hashes = HashSet::new();
+
+    let full_cases = [
+        (PasscodeMode::Pin4, "0427".to_string()),
+        (PasscodeMode::Pin4, "0427".to_string()),
+        (PasscodeMode::Custom, "ĐỗThành#2026".to_string()),
+    ];
+
+    for (idx, (mode, pass)) in full_cases.iter().enumerate() {
+        let cfg = AppLockConfig::create_enabled(*mode, pass).expect("create_enabled succeeds");
+        assert!(cfg.enabled);
+        assert_eq!(cfg.mode, *mode);
+        assert!(seen_salts.insert(cfg.salt_b64.clone()));
+        assert!(seen_hashes.insert(cfg.hash_b64.clone()));
+        assert_serialized_redacts_passcode(&cfg, pass);
+
+        let mut unlock_cfg = cfg.clone();
+        assert_eq!(
+            unlock_cfg.verify_attempt(pass, 1_700_000_000),
+            VerifyOutcome::Unlocked
+        );
+
+        if idx == 2 {
+            let mut wrong_cfg = cfg.clone();
+            assert_eq!(
+                wrong_cfg.verify_attempt(&mutate_custom(pass), 1_700_000_000),
+                VerifyOutcome::Wrong {
+                    remaining_attempts: MAX_FAILED_ATTEMPTS - 1,
+                }
+            );
+
+            let mut tampered_hash = cfg.clone();
+            tampered_hash.hash_b64 = flip_b64_byte(&cfg.hash_b64, rng.next_u64(), rng.next_u64());
+            assert_eq!(
+                tampered_hash.verify_attempt(pass, 1_700_000_000),
+                VerifyOutcome::Wrong {
+                    remaining_attempts: MAX_FAILED_ATTEMPTS - 1,
+                }
+            );
+        }
+    }
+
+    assert!(AppLockConfig::create_enabled(PasscodeMode::Pin4, "12a4").is_err());
+    assert!(AppLockConfig::create_enabled(PasscodeMode::Pin4, "123").is_err());
+    assert!(AppLockConfig::create_enabled(PasscodeMode::Custom, "abc").is_err());
+    assert!(AppLockConfig::create_enabled(PasscodeMode::Custom, &"x".repeat(33)).is_err());
+
+    let tmp = PropTempDir::new("pbkdf2-tamper", 0xA991_0C01);
+    for round in 0..4u64 {
+        let mode = if round % 2 == 0 {
+            PasscodeMode::Pin4
+        } else {
+            PasscodeMode::Custom
+        };
+        let pass = match mode {
+            PasscodeMode::Pin4 => gen_pin4(&mut rng),
+            PasscodeMode::Custom => gen_custom_passcode(&mut rng, None),
+        };
+        let mut salt = [0u8; SALT_LEN];
+        salt[..8].copy_from_slice(&rng.next_u64().to_le_bytes());
+        salt[8..].copy_from_slice(&rng.next_u64().to_le_bytes());
+
+        let cfg = make_fast_lock_config(mode, &pass, &salt, MIN_ITERATIONS);
+        assert!(seen_salts.insert(cfg.salt_b64.clone()));
+        assert!(seen_hashes.insert(cfg.hash_b64.clone()));
+        assert_serialized_redacts_passcode(&cfg, &pass);
+
+        let mut ok_cfg = cfg.clone();
+        assert_eq!(
+            ok_cfg.verify_attempt(&pass, 1_700_000_000),
+            VerifyOutcome::Unlocked
+        );
+
+        let wrong = match mode {
+            PasscodeMode::Pin4 => mutate_pin4(&pass),
+            PasscodeMode::Custom => mutate_custom(&pass),
+        };
+        assert_eq!(
+            cfg.clone().verify_attempt(&wrong, 1_700_000_000),
+            VerifyOutcome::Wrong {
+                remaining_attempts: MAX_FAILED_ATTEMPTS - 1,
+            }
+        );
+
+        let mut bad_hash = cfg.clone();
+        bad_hash.hash_b64 = flip_b64_byte(&cfg.hash_b64, rng.next_u64(), rng.next_u64());
+        assert!(matches!(
+            bad_hash.verify_attempt(&pass, 1_700_000_000),
+            VerifyOutcome::Wrong { .. }
+        ));
+
+        let mut bad_salt = cfg.clone();
+        bad_salt.salt_b64 = flip_b64_byte(&cfg.salt_b64, rng.next_u64(), rng.next_u64());
+        assert!(matches!(
+            bad_salt.verify_attempt(&pass, 1_700_000_000),
+            VerifyOutcome::Wrong { .. }
+        ));
+
+        let mut low_iter = cfg.clone();
+        low_iter.iterations = MIN_ITERATIONS - 1;
+        assert!(matches!(
+            low_iter.verify_attempt(&pass, 1_700_000_000),
+            VerifyOutcome::Wrong { .. }
+        ));
+        let bad_path = tmp.path.join(format!("low_iter_{round}.json"));
+        low_iter.save_to_path(&bad_path).expect("save low iter");
+        assert!(AppLockConfig::load_from_path(&bad_path).is_err());
+
+        let mut disabled = cfg.clone();
+        disabled.enabled = false;
+        assert!(matches!(
+            disabled.verify_attempt(&pass, 1_700_000_000),
+            VerifyOutcome::Wrong { .. }
+        ));
+
+        if mode == PasscodeMode::Custom && !pass.chars().all(|c| c.is_ascii_digit()) {
+            assert!(validate_passcode(PasscodeMode::Pin4, &pass).is_err());
+        }
+    }
+
+    for sweep in 0..120u64 {
+        let iter = 16 + (sweep as u32 % 64);
+        let pass = if sweep % 2 == 0 {
+            gen_pin4(&mut rng)
+        } else {
+            gen_custom_passcode(&mut rng, None)
+        };
+        let wrong = if sweep % 2 == 0 {
+            mutate_pin4(&pass)
+        } else {
+            mutate_custom(&pass)
+        };
+        let mut salt = [0u8; SALT_LEN];
+        salt[..8].copy_from_slice(&rng.next_u64().to_le_bytes());
+        salt[8..].copy_from_slice(&rng.next_u64().to_le_bytes());
+        let expected = pbkdf2_hmac_sha256(pass.as_bytes(), &salt, iter);
+        assert!(seen_hashes.insert(STANDARD.encode(expected)));
+        assert_ne!(
+            pbkdf2_hmac_sha256(wrong.as_bytes(), &salt, iter),
+            expected,
+            "wrong passcode collided at sweep {sweep}"
+        );
+        let mut mutated_salt = salt;
+        mutated_salt[(sweep as usize) % SALT_LEN] ^= 0x01;
+        assert_ne!(
+            pbkdf2_hmac_sha256(pass.as_bytes(), &mutated_salt, iter),
+            expected,
+            "mutated salt collided at sweep {sweep}"
+        );
+        assert_ne!(
+            pbkdf2_hmac_sha256(pass.as_bytes(), &salt, iter + 1),
+            expected,
+            "changed iteration count collided at sweep {sweep}"
+        );
+    }
+}
+
+/// Verify brute-force lockout boundary (`MAX_FAILED_ATTEMPTS`), JSON persistence across reload,
+/// monotonic clamping (`0..=LOCKOUT_SECS`) on backward clock jumps, and counter reset on unlock.
+#[test]
+fn prop_app_lock_lockout_persists_across_reload_and_clamps_clock_rollback() {
+    let mut rng = Xorshift64::new(0xA991_0C02);
+    let tmp = PropTempDir::new("lockout-reload", 0xA991_0C02);
+
+    let full_pass = "9182";
+    let mut full_cfg =
+        AppLockConfig::create_enabled(PasscodeMode::Pin4, full_pass).expect("full config");
+    full_cfg.failed_attempts = MAX_FAILED_ATTEMPTS - 1;
+    let t0 = 1_750_000_000i64;
+    assert_eq!(
+        full_cfg.verify_attempt("0000", t0),
+        VerifyOutcome::LockedOut {
+            remaining_secs: LOCKOUT_SECS,
+        }
+    );
+    let full_path = tmp.path.join("full_lockout.json");
+    full_cfg.save_to_path(&full_path).expect("save full lockout");
+    let mut reloaded_full = AppLockConfig::load_from_path(&full_path)
+        .expect("load full lockout")
+        .expect("present");
+    assert_eq!(
+        reloaded_full.verify_attempt(full_pass, t0 - 500),
+        VerifyOutcome::LockedOut {
+            remaining_secs: LOCKOUT_SECS,
+        }
+    );
+    assert_eq!(
+        reloaded_full.verify_attempt(full_pass, t0 + LOCKOUT_SECS),
+        VerifyOutcome::Unlocked
+    );
+    assert_eq!(reloaded_full.failed_attempts, 0);
+    assert_eq!(reloaded_full.lockout_until_unix, 0);
+
+    let mut base_salt = [0u8; SALT_LEN];
+    base_salt[..8].copy_from_slice(&rng.next_u64().to_le_bytes());
+    base_salt[8..].copy_from_slice(&rng.next_u64().to_le_bytes());
+
+    for round in 0..4u64 {
+        let mode = if round % 2 == 0 {
+            PasscodeMode::Pin4
+        } else {
+            PasscodeMode::Custom
+        };
+        let pass = match mode {
+            PasscodeMode::Pin4 => gen_pin4(&mut rng),
+            PasscodeMode::Custom => gen_custom_passcode(&mut rng, Some(10)),
+        };
+        let wrong = match mode {
+            PasscodeMode::Pin4 => mutate_pin4(&pass),
+            PasscodeMode::Custom => mutate_custom(&pass),
+        };
+        let mut salt = base_salt;
+        salt[0] ^= round as u8;
+        let mut cfg = make_fast_lock_config(mode, &pass, &salt, MIN_ITERATIONS);
+
+        let start_unix = 1_700_000_000i64 + ((rng.next_u64() % 100_000_000) as i64);
+        let attempts_to_run = MAX_FAILED_ATTEMPTS + (round as u32 % 4);
+        for step in 1..=attempts_to_run {
+            let outcome = cfg.verify_attempt(&wrong, start_unix);
+            if step < MAX_FAILED_ATTEMPTS {
+                assert_eq!(
+                    outcome,
+                    VerifyOutcome::Wrong {
+                        remaining_attempts: MAX_FAILED_ATTEMPTS - step,
+                    }
+                );
+                assert_eq!(cfg.remaining_lockout_secs(start_unix), 0);
+            } else {
+                assert_eq!(
+                    outcome,
+                    VerifyOutcome::LockedOut {
+                        remaining_secs: LOCKOUT_SECS,
+                    }
+                );
+                assert_eq!(cfg.remaining_lockout_secs(start_unix), LOCKOUT_SECS);
+            }
+        }
+
+        let cfg_path = tmp.path.join(format!("round_{round}.json"));
+        cfg.save_to_path(&cfg_path).expect("save round config");
+        let mut reloaded = AppLockConfig::load_from_path(&cfg_path)
+            .expect("load round config")
+            .expect("round config present");
+        assert_eq!(reloaded.failed_attempts, cfg.failed_attempts);
+        assert_eq!(reloaded.lockout_until_unix, cfg.lockout_until_unix);
+
+        let boundary_deltas = [-10_000i64, -500, -1, 0, 1, 15, 29, 30, 31, 100];
+        for delta in boundary_deltas
+            .into_iter()
+            .chain((0..12).map(|_| -10_000 + ((rng.next_u64() % 10_101) as i64)))
+        {
+            let probe_now = start_unix.saturating_add(delta);
+            let rem = reloaded.remaining_lockout_secs(probe_now);
+            assert!(
+                (0..=LOCKOUT_SECS).contains(&rem),
+                "clamped lockout {rem} out of range for delta {delta}"
+            );
+            let expected_rem = if delta < 0 {
+                LOCKOUT_SECS
+            } else if delta < LOCKOUT_SECS {
+                LOCKOUT_SECS - delta
+            } else {
+                0
+            };
+            assert_eq!(rem, expected_rem, "unexpected lockout for delta {delta}");
+        }
+
+        assert!(matches!(
+            reloaded.verify_attempt(&pass, start_unix),
+            VerifyOutcome::LockedOut {
+                remaining_secs: LOCKOUT_SECS
+            }
+        ));
+        assert_eq!(
+            reloaded.verify_attempt(&pass, start_unix + LOCKOUT_SECS),
+            VerifyOutcome::Unlocked
+        );
+        assert_eq!(reloaded.failed_attempts, 0);
+        assert_eq!(reloaded.lockout_until_unix, 0);
+        reloaded.save_to_path(&cfg_path).expect("save reset config");
+        let after_reset = AppLockConfig::load_from_path(&cfg_path)
+            .expect("reload reset config")
+            .expect("present");
+        assert_eq!(after_reset.failed_attempts, 0);
+        assert_eq!(after_reset.lockout_until_unix, 0);
+    }
+
+    let shared_cfg = make_fast_lock_config(PasscodeMode::Pin4, "4242", &base_salt, MIN_ITERATIONS);
+    for sweep in 0..120u64 {
+        let start_unix = 1_720_000_000i64 + ((rng.next_u64() % 50_000_000) as i64);
+        let attempts = 1 + (rng.next_u64() % 8) as u32;
+        let mut cfg = shared_cfg.clone();
+        cfg.failed_attempts = attempts;
+        cfg.lockout_until_unix = if attempts >= MAX_FAILED_ATTEMPTS {
+            start_unix + LOCKOUT_SECS
+        } else {
+            0
+        };
+        let sweep_path = tmp.path.join("sweep_lockout.json");
+        if sweep < 20 {
+            cfg.save_to_path(&sweep_path).expect("save sweep");
+            cfg = AppLockConfig::load_from_path(&sweep_path)
+                .expect("load sweep")
+                .expect("present");
+        }
+        let delta = -10_000 + ((rng.next_u64() % 10_101) as i64);
+        let rem = cfg.remaining_lockout_secs(start_unix + delta);
+        assert!((0..=LOCKOUT_SECS).contains(&rem));
+        if attempts >= MAX_FAILED_ATTEMPTS {
+            let expected_rem = if delta < 0 {
+                LOCKOUT_SECS
+            } else if delta < LOCKOUT_SECS {
+                LOCKOUT_SECS - delta
+            } else {
+                0
+            };
+            assert_eq!(rem, expected_rem);
+            if expected_rem > 0 {
+                assert_eq!(
+                    cfg.verify_attempt("4242", start_unix + delta),
+                    VerifyOutcome::LockedOut {
+                        remaining_secs: expected_rem
+                    }
+                );
+            }
+        } else {
+            assert_eq!(rem, 0);
+        }
+    }
+}
+
+/// Verify notification title/body masking, fallback toast masking, and popup interaction denial
+/// across randomized sender/body tokens and `(app_locked, hide_content)` combinations.
+#[test]
+fn prop_app_lock_notification_masking_never_leaks_sender_or_body() {
+    let mut rng = Xorshift64::new(0xA991_0C03);
+    let edge_counts = [0usize, 1, 2, 5, 42, 999, usize::MAX];
+
+    for round in 0..200usize {
+        let sender = format!("SECRET_SENDER_{:016x}_{round}", rng.next_u64());
+        let body = format!(
+            "SECRET_BODY_{:016x}_xin_chao_{round}",
+            rng.next_u64()
+        );
+        let fallback = "SAFE_FALLBACK_TOAST_TEXT";
+        let unread_count = if round < edge_counts.len() {
+            edge_counts[round]
+        } else {
+            (rng.next_u64() % 500) as usize
+        };
+
+        for app_locked in [false, true] {
+            for hide_content in [false, true] {
+                assert_eq!(popup_allows_interaction(app_locked), !app_locked);
+                if app_locked {
+                    assert!(!popup_allows_interaction(true));
+                }
+
+                let (masked_title, masked_body) =
+                    mask_notification_content(app_locked, hide_content, &sender, &body, unread_count);
+                let masked_toast =
+                    mask_toast_text(app_locked, hide_content, fallback, body.clone());
+
+                if app_locked && hide_content {
+                    assert_eq!(masked_title, "ctdozlite");
+                    let expected_body = match unread_count {
+                        0 => "Bạn có tin nhắn mới".to_string(),
+                        1 => "Bạn có 1 tin nhắn mới".to_string(),
+                        count => format!("Bạn có {count} tin nhắn mới"),
+                    };
+                    assert_eq!(masked_body, expected_body);
+                    assert!(!masked_title.contains(&sender));
+                    assert!(!masked_title.contains(&body));
+                    assert!(!masked_body.contains(&sender));
+                    assert!(!masked_body.contains(&body));
+                    assert_eq!(masked_toast, fallback);
+                    assert!(!masked_toast.contains(&sender));
+                    assert!(!masked_toast.contains(&body));
+                } else {
+                    assert_eq!(masked_title, sender);
+                    assert_eq!(masked_body, body);
+                    assert_eq!(masked_toast, body);
+                }
+            }
+        }
+    }
+}
+
+/// Verify "Quên mã khoá? Đăng xuất" deletes `session.json`, `app_lock.json`, and all
+/// `accounts/<uin>.json` credential snapshots while preserving history SQLite DBs, WALs,
+/// thread caches, and per-account attachment directories verbatim.
+#[test]
+fn prop_forget_lock_wipe_removes_all_creds_and_preserves_history_db() {
+    let mut rng = Xorshift64::new(0xA991_0C04);
+
+    for round in 0..40usize {
+        let dir = PropTempDir::new("forget-lock-wipe", round as u64);
+        let accounts_dir = dir.path.join("accounts");
+        let include_session_json = rng.next_u64().is_multiple_of(2) || round == 0;
+        let include_app_lock = rng.next_u64().is_multiple_of(2) || round == 0;
+        let account_count = match round {
+            0 => 0,
+            1 => 1,
+            _ => (rng.next_u64() % 6) as usize,
+        };
+
+        if include_session_json {
+            let session_path = dir.path.join("session.json");
+            write_prop_fixture(&session_path, br#"{"uid":"root_cred"}"#);
+        }
+        if include_app_lock {
+            let lock_path = dir.path.join(APP_LOCK_FILE);
+            write_prop_fixture(&lock_path, br#"{"version":1,"enabled":true}"#);
+        }
+
+        let mut uins = Vec::with_capacity(account_count);
+        let mut seen_uins = HashSet::new();
+        while uins.len() < account_count {
+            let uin = format!("{}", 100_000_000u64 + (rng.next_u64() % 899_999_999));
+            if seen_uins.insert(uin.clone()) {
+                uins.push(uin);
+            }
+        }
+
+        let mut preserved_files: Vec<(PathBuf, Vec<u8>)> = Vec::new();
+        for (idx, uin) in uins.iter().enumerate() {
+            let cred_file = accounts_dir.join(format!("{uin}.json"));
+            write_prop_fixture(&cred_file, format!(r#"{{"uin":"{uin}"}}"#).as_bytes());
+
+            let threads_file = accounts_dir.join(format!("{uin}_threads.json"));
+            let threads_bytes = format!(r#"{{"threads":[{idx}]}}"#).into_bytes();
+            write_prop_fixture(&threads_file, &threads_bytes);
+            preserved_files.push((threads_file, threads_bytes));
+
+            let db_file = accounts_dir.join(format!("{uin}_history.db"));
+            let db_bytes = format!("SQLite format 3\0round={round}\0uin={uin}").into_bytes();
+            write_prop_fixture(&db_file, &db_bytes);
+            preserved_files.push((db_file, db_bytes));
+
+            let wal_file = accounts_dir.join(format!("{uin}_history.db-wal"));
+            let wal_bytes = format!("WAL_PAYLOAD_{round}_{uin}").into_bytes();
+            write_prop_fixture(&wal_file, &wal_bytes);
+            preserved_files.push((wal_file, wal_bytes));
+
+            let note_file = accounts_dir.join(uin).join("note.txt");
+            let note_bytes = format!("attachment note {round}/{uin}").into_bytes();
+            write_prop_fixture(&note_file, &note_bytes);
+            preserved_files.push((note_file, note_bytes));
+        }
+
+        let expected_before = include_session_json || !uins.is_empty();
+        assert_eq!(has_any_saved_credentials_in(&dir.path), expected_before);
+
+        let expected_removed =
+            usize::from(include_session_json) + usize::from(include_app_lock) + uins.len();
+        let removed =
+            wipe_all_saved_session_credentials_in(&dir.path).expect("wipe credentials succeeds");
+        assert_eq!(removed, expected_removed);
+
+        assert!(!dir.path.join("session.json").exists());
+        assert!(!dir.path.join(APP_LOCK_FILE).exists());
+        assert!(!has_any_saved_credentials_in(&dir.path));
+
+        for uin in &uins {
+            assert!(!accounts_dir.join(format!("{uin}.json")).exists());
+        }
+        for (path, expected_bytes) in &preserved_files {
+            assert!(path.is_file(), "expected preserved file {}", path.display());
+            let actual = std::fs::read(path).expect("read preserved file");
+            assert_eq!(
+                &actual,
+                expected_bytes,
+                "preserved file {} was modified",
+                path.display()
+            );
+        }
+
+        let second_removed =
+            wipe_all_saved_session_credentials_in(&dir.path).expect("idempotent wipe");
+        assert_eq!(second_removed, 0);
+    }
 }
