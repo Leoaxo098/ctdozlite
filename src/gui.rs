@@ -1645,6 +1645,61 @@ fn record_activity_if_input(last_activity_ui_time: &mut f64, now_ui: f64, has_us
     }
 }
 
+/// Format sender title and truncated 96-char preview for an incoming chat alert.
+fn format_incoming_notification_text(
+    thread_name: &str,
+    is_group: bool,
+    sender_raw: &str,
+    text_raw: &str,
+) -> (String, String) {
+    let sender_label = if is_group && !sender_raw.is_empty() {
+        format!("{sender_raw} · {thread_name}")
+    } else {
+        thread_name.to_string()
+    };
+    let preview_raw = text_raw.trim();
+    let preview_short = if preview_raw.chars().count() > 96 {
+        let s: String = preview_raw.chars().take(96).collect();
+        format!("{s}…")
+    } else if preview_raw.is_empty() {
+        "[ Đính kèm / Nhãn dán ]".to_string()
+    } else {
+        preview_raw.to_string()
+    };
+    (sender_label, preview_short)
+}
+
+/// Apply lock-screen notification masking to `(title, body, avatar_url)` when active.
+fn mask_chat_notification_payload(
+    should_mask: bool,
+    title: &str,
+    body: &str,
+    avt_url: Option<String>,
+    unread_count: usize,
+) -> (String, String, Option<String>) {
+    let (masked_title, masked_body) = crate::app_lock::mask_notification_content(
+        should_mask,
+        should_mask,
+        title,
+        body,
+        unread_count,
+    );
+    let masked_avt = if should_mask { None } else { avt_url };
+    (masked_title, masked_body, masked_avt)
+}
+
+/// Format `status_msg` for an incoming VoIP call, hiding caller identity while locked.
+fn incoming_call_status_text(app_locked: bool, resolved_name: &str, is_video: bool) -> String {
+    if app_locked {
+        "📲 Cuộc gọi đến — mở khoá để xem & trả lời".to_string()
+    } else {
+        format!(
+            "📲 Cuộc gọi {} đến từ {resolved_name}…",
+            if is_video { "video" } else { "thoại" }
+        )
+    }
+}
+
 /// Decide whether the signed-in display name may appear in the custom title bar.
 fn title_bar_shows_user_name(
     compact_title_bar: bool,
@@ -2640,6 +2695,51 @@ pub(crate) fn queue_sticker_fetch(
     }
 }
 
+/// Emit a masked or unmasked corner popup and OS banner without borrowing `self.threads`.
+#[allow(clippy::too_many_arguments)]
+fn push_thread_chat_notification(
+    thread: &Thread,
+    sender_raw: &str,
+    text_raw: &str,
+    unread_count: usize,
+    should_mask: bool,
+    sticker_textures: &HashMap<String, TextureHandle>,
+    loading_stickers: &mut HashSet<String>,
+    failed_stickers: &HashMap<String, (u8, std::time::Instant)>,
+    incoming_popup: &mut Option<IncomingPopupState>,
+    chat_banners: &mut Vec<(String, String)>,
+) {
+    let (sender_label, preview_short) =
+        format_incoming_notification_text(&thread.name, thread.is_group, sender_raw, text_raw);
+    let raw_avt = thread.avatar.clone().filter(|u| !u.trim().is_empty());
+    let (title, body, avt_url) = mask_chat_notification_payload(
+        should_mask,
+        &sender_label,
+        &preview_short,
+        raw_avt,
+        unread_count,
+    );
+    if let Some(ref url) = avt_url {
+        let tex_key = format!("thumb_{}", crate::crypto::md5_hex(url));
+        queue_sticker_fetch(
+            sticker_textures,
+            loading_stickers,
+            failed_stickers,
+            tex_key,
+            url.clone(),
+        );
+    }
+    *incoming_popup = Some(IncomingPopupState::new(
+        thread.id.clone(),
+        title.clone(),
+        body.clone(),
+        avt_url,
+        thread.is_group,
+        unread_count,
+    ));
+    chat_banners.push((title, body));
+}
+
 impl ZaloGuiApp {
     /// Checks FFmpeg availability and discovered camera devices, displaying a distinct toast
     /// when FFmpeg is absent versus when no local camera device is detected.
@@ -3159,15 +3259,40 @@ impl ZaloGuiApp {
     }
 
     /// Return whether the window is effectively focused (always false while locked).
-    #[allow(dead_code)]
     pub(super) fn effective_window_focused(&self, ctx: &egui::Context) -> bool {
         combine_effective_focus(ctx.input(|i| i.focused), self.app_locked)
     }
 
     /// Return whether notification previews and toast text must be masked while locked.
-    #[allow(dead_code)]
     pub(super) fn should_mask_notifications(&self) -> bool {
         self.app_locked && self.app_lock_config.hide_notifications_when_locked
+    }
+
+    /// Return `(title, body, avatar_url)` masked according to `self.should_mask_notifications()`.
+    fn mask_notification_payload(
+        &self,
+        title: &str,
+        body: &str,
+        avt_url: Option<String>,
+        unread_count: usize,
+    ) -> (String, String, Option<String>) {
+        mask_chat_notification_payload(
+            self.should_mask_notifications(),
+            title,
+            body,
+            avt_url,
+            unread_count,
+        )
+    }
+
+    /// Mask a transient toast message when lock-screen notification hiding is active.
+    fn mask_toast_if_locked(&self, fallback: &str, text: String) -> String {
+        crate::app_lock::mask_toast_text(
+            self.app_locked,
+            self.app_lock_config.hide_notifications_when_locked,
+            fallback,
+            text,
+        )
     }
 
     /// Render the temporary lock-screen panel placeholder until Task 5 builds `app_lock_ui`.
@@ -3229,7 +3354,7 @@ impl ZaloGuiApp {
 
     /// Clear active thread's unread badge and advance its read-point when focused (#146).
     fn mark_active_thread_read_if_focused(&mut self, ctx: &egui::Context) {
-        if !ctx.input(|i| i.focused) {
+        if !self.effective_window_focused(ctx) {
             return;
         }
         let Some(t) = self.threads.get_mut(self.selected_thread_index) else {
@@ -3368,7 +3493,8 @@ impl ZaloGuiApp {
                             .as_ref()
                             .map(|t| t.id.clone())
                             .unwrap_or_default();
-                        let is_focused = ctx.input(|i| i.focused);
+                        let is_focused = self.effective_window_focused(ctx);
+                        let mask_notifications = self.should_mask_notifications();
                         let mut new_incoming_alert = false;
                         let mut chat_banners: Vec<(String, String)> = Vec::new();
                         // Group Workspace: toast khớp keyword gom ở đây để bắn sau merge
@@ -3482,63 +3608,23 @@ impl ZaloGuiApp {
                                                     if let Some((_, sender_raw, text_raw)) =
                                                         notify_items.last()
                                                     {
-                                                        let sender_label = if existing.is_group
-                                                            && !sender_raw.is_empty()
-                                                        {
-                                                            format!(
-                                                                "{} · {}",
-                                                                sender_raw, existing.name
-                                                            )
-                                                        } else {
-                                                            existing.name.clone()
-                                                        };
-                                                        let preview_raw = text_raw.trim();
-                                                        let preview_short: String =
-                                                            if preview_raw.chars().count() > 96 {
-                                                                let s: String = preview_raw
-                                                                    .chars()
-                                                                    .take(96)
-                                                                    .collect();
-                                                                format!("{s}…")
-                                                            } else if preview_raw.is_empty() {
-                                                                "[ Đính kèm / Nhãn dán ]"
-                                                                    .to_string()
-                                                            } else {
-                                                                preview_raw.to_string()
-                                                            };
-                                                        let avt_url = existing
-                                                            .avatar
-                                                            .clone()
-                                                            .filter(|u| !u.trim().is_empty());
-                                                        if let Some(ref url) = avt_url {
-                                                            let tex_key = format!(
-                                                                "thumb_{}",
-                                                                crate::crypto::md5_hex(url)
-                                                            );
-                                                            queue_sticker_fetch(
-                                                                &self.sticker_textures,
-                                                                &mut self.loading_stickers,
-                                                                &self.failed_stickers,
-                                                                tex_key,
-                                                                url.clone(),
-                                                            );
-                                                        }
                                                         let unread_for_thread = self
                                                             .unread_counts
                                                             .get(&existing.id)
                                                             .copied()
                                                             .unwrap_or(1);
-                                                        self.incoming_popup =
-                                                            Some(IncomingPopupState::new(
-                                                                existing.id.clone(),
-                                                                sender_label.clone(),
-                                                                preview_short.clone(),
-                                                                avt_url,
-                                                                existing.is_group,
-                                                                unread_for_thread,
-                                                            ));
-                                                        chat_banners
-                                                            .push((sender_label, preview_short));
+                                                        push_thread_chat_notification(
+                                                            existing,
+                                                            sender_raw,
+                                                            text_raw,
+                                                            unread_for_thread,
+                                                            mask_notifications,
+                                                            &self.sticker_textures,
+                                                            &mut self.loading_stickers,
+                                                            &self.failed_stickers,
+                                                            &mut self.incoming_popup,
+                                                            &mut chat_banners,
+                                                        );
                                                     }
                                                 }
                                             }
@@ -3665,58 +3751,34 @@ impl ZaloGuiApp {
                                 {
                                     new_incoming_alert = true;
                                     if let Some((_, sender_raw, text_raw)) = unseen_items.last() {
-                                        let sender = if nt.is_group && !sender_raw.is_empty() {
-                                            format!("{} · {}", sender_raw, nt.name)
-                                        } else {
-                                            nt.name.clone()
-                                        };
-                                        let preview_raw = text_raw.trim();
-                                        let preview_short: String =
-                                            if preview_raw.chars().count() > 96 {
-                                                let s: String = preview_raw
-                                                    .chars()
-                                                    .take(96)
-                                                    .collect();
-                                                format!("{s}…")
-                                            } else if preview_raw.is_empty() {
-                                                "[ Đính kèm / Nhãn dán ]".to_string()
-                                            } else {
-                                                preview_raw.to_string()
-                                            };
-                                        let avt_url = nt
-                                            .avatar
-                                            .clone()
-                                            .filter(|u| !u.trim().is_empty());
-                                        if let Some(ref url) = avt_url {
-                                            let tex_key = format!(
-                                                "thumb_{}",
-                                                crate::crypto::md5_hex(url)
-                                            );
-                                            queue_sticker_fetch(
-                                                &self.sticker_textures,
-                                                &mut self.loading_stickers,
-                                                &self.failed_stickers,
-                                                tex_key,
-                                                url.clone(),
-                                            );
-                                        }
-                                        self.incoming_popup = Some(IncomingPopupState::new(
-                                            nt.id.clone(),
-                                            sender.clone(),
-                                            preview_short.clone(),
-                                            avt_url,
-                                            nt.is_group,
+                                        push_thread_chat_notification(
+                                            &nt,
+                                            sender_raw,
+                                            text_raw,
                                             inc_cnt,
-                                        ));
-                                        chat_banners.push((sender, preview_short));
+                                            mask_notifications,
+                                            &self.sticker_textures,
+                                            &mut self.loading_stickers,
+                                            &self.failed_stickers,
+                                            &mut self.incoming_popup,
+                                            &mut chat_banners,
+                                        );
                                     }
                                 }
                                 self.threads.push(nt);
                             }
                         }
                         // Group Workspace: bắn toast khớp keyword sau merge (ưu tiên, sau cùng thắng).
-                        for toast in watch_toasts {
-                            self.show_toast(toast);
+                        if mask_notifications {
+                            if let Some(first) = watch_toasts.into_iter().next() {
+                                self.show_toast(
+                                    self.mask_toast_if_locked("🔔 Bạn có thông báo mới", first),
+                                );
+                            }
+                        } else {
+                            for toast in watch_toasts {
+                                self.show_toast(toast);
+                            }
                         }
                         if new_incoming_alert && self.settings.enable_notifications {
                             if self.settings.play_notification_sound {
@@ -4195,7 +4257,7 @@ impl ZaloGuiApp {
                         .get(self.selected_thread_index)
                         .map(|t| t.id.clone())
                         .unwrap_or_default();
-                    let is_focused_now = ctx.input(|i| i.focused);
+                    let is_focused_now = self.effective_window_focused(ctx);
                     let my_uid_count = self.user_uin.clone();
                     for ev in &accepted {
                         if ev.r_type < 0 || ev.historical || banner_state.is_done(ev) {
@@ -4274,8 +4336,18 @@ impl ZaloGuiApp {
                         });
                     }
                     if !reaction_banners.is_empty() && reactions_notify_on {
+                        let masked_reactions: Vec<(String, String, Option<String>, bool, String)> =
+                            reaction_banners
+                                .into_iter()
+                                .map(|(tid, title, avt, is_grp, body)| {
+                                    let (m_title, m_body, m_avt) =
+                                        self.mask_notification_payload(&title, &body, avt, 1);
+                                    (tid, m_title, m_avt, is_grp, m_body)
+                                })
+                                .collect();
                         #[cfg(target_os = "windows")]
-                        if let Some((tid, title, avt, is_grp, body)) = reaction_banners.last().cloned()
+                        if let Some((tid, title, avt, is_grp, body)) =
+                            masked_reactions.last().cloned()
                         {
                             self.incoming_popup = Some(IncomingPopupState::new(
                                 tid, title, body, avt, is_grp, 1,
@@ -4283,7 +4355,7 @@ impl ZaloGuiApp {
                             ctx.request_repaint();
                         }
                         #[cfg(not(target_os = "windows"))]
-                        for (_, title, _, _, body) in &reaction_banners {
+                        for (_, title, _, _, body) in &masked_reactions {
                             crate::os_notify::notify(title, body);
                         }
                         if reactions_sound_on {
@@ -4830,10 +4902,8 @@ impl ZaloGuiApp {
                         .find(|t| t.id == caller_id)
                         .map(|t| t.name.clone())
                         .unwrap_or(caller_name);
-                    self.status_msg = format!(
-                        "📲 Cuộc gọi {} đến từ {resolved_name}…",
-                        if is_video { "video" } else { "thoại" }
-                    );
+                    self.status_msg =
+                        incoming_call_status_text(self.app_locked, &resolved_name, is_video);
                     let cam_enabled = if is_video && crate::media::is_ffmpeg_available() {
                         let (_, cams, scanning) =
                             crate::media::list_media_devices_nonblocking(false);
@@ -4866,7 +4936,7 @@ impl ZaloGuiApp {
                     self.status_msg = msg;
                 }
                 GuiEvent::ScriptToast { message, .. } => {
-                    self.show_toast(message);
+                    self.show_toast(self.mask_toast_if_locked("Thông báo mới", message));
                 }
                 GuiEvent::GroupLeft { group_id: _, success, error } => {
                     if success {
@@ -4991,7 +5061,11 @@ impl ZaloGuiApp {
                     } else {
                         String::new()
                     };
-                    self.show_toast(format!("⏰ Nhắc tin: {preview}{extra} — bấm vào đây để xem"));
+                    let raw_toast =
+                        format!("⏰ Nhắc tin: {preview}{extra} — bấm vào đây để xem");
+                    self.show_toast(
+                        self.mask_toast_if_locked("⏰ Bạn có nhắc hẹn đến hạn", raw_toast),
+                    );
                 }
                 GuiEvent::ReminderListUpdated => {
                     self.refresh_draft_reminder_cache();
@@ -6871,14 +6945,15 @@ impl ZaloGuiApp {
         }
         // Mute state is evaluated by the listener from that account's own thread list;
         // `settings.muted_threads` describes the active account and must not apply here.
+        let unread = activity.incoming.max(1);
         let banners: Vec<(String, String)> = activity
             .banners
             .iter()
             .map(|b| {
-                (
-                    format!("{} → {}", b.title, activity.account_name),
-                    b.body.clone(),
-                )
+                let raw_title = format!("{} → {}", b.title, activity.account_name);
+                let (title, body, _) =
+                    self.mask_notification_payload(&raw_title, &b.body, None, unread);
+                (title, body)
             })
             .collect();
         if banners.is_empty() {
@@ -6887,7 +6962,7 @@ impl ZaloGuiApp {
         *self
             .background_unread
             .entry(activity.uin.clone())
-            .or_insert(0) += activity.incoming.max(1);
+            .or_insert(0) += unread;
         if self.settings.enable_notifications {
             if self.settings.play_notification_sound {
                 crate::media::play_notification_chime();
@@ -8048,5 +8123,122 @@ mod app_lock_state_tests {
             300,
             false
         ));
+    }
+
+    #[test]
+    fn locked_popup_and_notification_masking_invariants() {
+        use crate::app_lock::{
+            mask_notification_content, mask_toast_text, popup_allows_interaction,
+        };
+
+        assert_eq!(
+            mask_notification_content(true, true, "Alice", "Secret message", 0),
+            ("ctdozlite".to_string(), "Bạn có tin nhắn mới".to_string())
+        );
+        assert_eq!(
+            mask_notification_content(true, true, "Alice", "Secret message", 1),
+            ("ctdozlite".to_string(), "Bạn có 1 tin nhắn mới".to_string())
+        );
+        assert_eq!(
+            mask_notification_content(true, true, "Alice", "Secret message", 5),
+            ("ctdozlite".to_string(), "Bạn có 5 tin nhắn mới".to_string())
+        );
+        assert_eq!(
+            mask_chat_notification_payload(
+                true,
+                "Alice",
+                "Secret message",
+                Some("https://example.test/avatar.png".to_string()),
+                5,
+            ),
+            (
+                "ctdozlite".to_string(),
+                "Bạn có 5 tin nhắn mới".to_string(),
+                None
+            )
+        );
+        assert_eq!(
+            mask_toast_text(
+                true,
+                true,
+                "🔔 Bạn có thông báo mới",
+                "🔔 [otp] Bob: 999111".to_string(),
+            ),
+            "🔔 Bạn có thông báo mới"
+        );
+        assert_eq!(
+            mask_toast_text(
+                true,
+                true,
+                "⏰ Bạn có nhắc hẹn đến hạn",
+                "⏰ Nhắc tin: Bí mật".to_string(),
+            ),
+            "⏰ Bạn có nhắc hẹn đến hạn"
+        );
+        assert_eq!(
+            mask_toast_text(
+                true,
+                true,
+                "Thông báo mới",
+                "Script secret payload".to_string(),
+            ),
+            "Thông báo mới"
+        );
+        assert!(!popup_allows_interaction(true));
+        assert_eq!(super::modals::popup_layout_height(popup_allows_interaction(true)), 118.0);
+
+        assert_eq!(
+            mask_notification_content(true, false, "Alice", "Secret message", 3),
+            ("Alice".to_string(), "Secret message".to_string())
+        );
+        assert_eq!(
+            mask_toast_text(
+                true,
+                false,
+                "Thông báo mới",
+                "Visible locked toast".to_string(),
+            ),
+            "Visible locked toast"
+        );
+        assert_eq!(
+            mask_chat_notification_payload(
+                false,
+                "Alice",
+                "Secret message",
+                Some("https://example.test/avatar.png".to_string()),
+                3,
+            ),
+            (
+                "Alice".to_string(),
+                "Secret message".to_string(),
+                Some("https://example.test/avatar.png".to_string()),
+            )
+        );
+        assert!(!popup_allows_interaction(true));
+        assert_eq!(super::modals::popup_layout_height(false), 118.0);
+        assert_eq!(
+            incoming_call_status_text(true, "Alice", true),
+            "📲 Cuộc gọi đến — mở khoá để xem & trả lời"
+        );
+
+        for hide in [true, false] {
+            assert!(popup_allows_interaction(false));
+            assert_eq!(
+                super::modals::popup_layout_height(popup_allows_interaction(false)),
+                164.0
+            );
+            assert_eq!(
+                mask_notification_content(false, hide, "Alice", "Hello", 2),
+                ("Alice".to_string(), "Hello".to_string())
+            );
+            assert_eq!(
+                mask_toast_text(false, hide, "Fallback", "Real toast".to_string()),
+                "Real toast"
+            );
+        }
+        assert_eq!(
+            incoming_call_status_text(false, "Alice", true),
+            "📲 Cuộc gọi video đến từ Alice…"
+        );
     }
 }
