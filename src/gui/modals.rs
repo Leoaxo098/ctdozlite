@@ -10161,44 +10161,8 @@ impl ZaloGuiApp {
             return;
         }
         self.feed_loading_timeline = true;
-        let mut friend_uids = Vec::new();
-        let mut shared_media_by_uid: HashMap<String, Vec<crate::feed::FeedMedia>> = HashMap::new();
-        for t in &self.threads {
-            if !t.is_group && !t.name.contains("Cloud của tôi") {
-                friend_uids.push(t.id.clone());
-                let mut photos = Vec::new();
-                for m in t.messages.iter().rev() {
-                    let is_photo = m.link_src.as_deref() == Some("Hình ảnh Zalo")
-                        || m.text.trim() == "[Hình ảnh]"
-                        || m.text.trim().starts_with("[Hình ảnh] ");
-                    if !is_photo {
-                        continue;
-                    }
-                    if let Some(thumb) = m
-                        .link_thumb
-                        .as_deref()
-                        .or(m.link_url.as_deref())
-                        .filter(|u| !u.is_empty())
-                    {
-                        let full = m.link_url.as_deref().unwrap_or(thumb).to_string();
-                        photos.push(crate::feed::FeedMedia {
-                            photo_id: m.id.clone(),
-                            media_type: "image".to_string(),
-                            url: full,
-                            thumbnail: thumb.to_string(),
-                            width: 640,
-                            height: 480,
-                        });
-                        if photos.len() >= 6 {
-                            break;
-                        }
-                    }
-                }
-                if !photos.is_empty() {
-                    shared_media_by_uid.insert(t.id.clone(), photos);
-                }
-            }
-        }
+        let (friend_uids, shared_media_by_uid) =
+            collect_friend_shared_media_from_threads(&self.threads, &self.user_uin);
         if let Some(tx) = WORKER_TX.get() {
             let _ = tx.send(WorkerCmd::FetchTimelineFeed {
                 friend_uids,
@@ -10353,7 +10317,19 @@ impl ZaloGuiApp {
                     .show(ui, |ui| {
                         ui.spacing_mut().item_spacing.y = 3.0;
                         for prof in &profiles_snap {
-                            if !matches_vn_query(&prof.display_name, &q_low, &q_fold)
+                            let (resolved_name, resolved_ava) = resolve_feed_author_identity(
+                                &prof.uid,
+                                &prof.display_name,
+                                &prof.zalo_name,
+                                &prof.avatar_url,
+                                &self.user_uin,
+                                &self.user_name,
+                                self.user_avatar.as_deref(),
+                                &profiles_snap,
+                                &self.threads,
+                                &self.group_members_map,
+                            );
+                            if !matches_vn_query(&resolved_name, &q_low, &q_fold)
                                 && !matches_vn_query(&prof.status, &q_low, &q_fold)
                             {
                                 continue;
@@ -10388,16 +10364,16 @@ impl ZaloGuiApp {
                                 ui.painter(),
                                 av_c,
                                 18.0,
-                                &prof.display_name,
+                                &resolved_name,
                                 false,
-                                Some(&prof.avatar_url),
+                                (!resolved_ava.is_empty()).then_some(resolved_ava.as_str()),
                                 &self.sticker_textures,
                                 &mut self.loading_stickers,
                             );
                             ui.painter().text(
                                 Pos2::new(row_rect.left() + 52.0, row_rect.top() + 17.0),
                                 egui::Align2::LEFT_CENTER,
-                                truncate_chars(&prof.display_name, 22),
+                                truncate_chars(&resolved_name, 22),
                                 FontId::proportional(13.2),
                                 if is_sel && pal.is_dark {
                                     Color32::WHITE
@@ -10427,7 +10403,10 @@ impl ZaloGuiApp {
                             );
                             if row_resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
                                 self.feed_target_uid = prof.uid.clone();
-                                self.feed_profile = Some(prof.clone());
+                                let mut resolved_prof = prof.clone();
+                                resolved_prof.display_name = resolved_name;
+                                resolved_prof.avatar_url = resolved_ava;
+                                self.feed_profile = Some(resolved_prof);
                             }
                         }
                     });
@@ -10544,6 +10523,18 @@ impl ZaloGuiApp {
     fn render_feed_timeline_column(&mut self, ui: &mut egui::Ui, pal: &ThemePalette, col_w: f32) {
         // 1. Selected Friend Header Banner (if filtering by a specific friend)
         if let Some(prof) = self.feed_profile.clone() {
+            let (prof_name, prof_ava) = resolve_feed_author_identity(
+                &prof.uid,
+                &prof.display_name,
+                &prof.zalo_name,
+                &prof.avatar_url,
+                &self.user_uin,
+                &self.user_name,
+                self.user_avatar.as_deref(),
+                &self.feed_friend_profiles,
+                &self.threads,
+                &self.group_members_map,
+            );
             egui::Frame::none()
                 .fill(pal.bg_elevated)
                 .stroke(Stroke::new(1.0_f32, pal.border))
@@ -10564,9 +10555,15 @@ impl ZaloGuiApp {
                             }
                         }
                         if let Some(tex) = self.sticker_textures.get(&ckey) {
-                            let w = ui.available_width();
+                            crate::gui::mark_texture_used(&ckey);
+                            let w = ui.available_width().max(120.0);
+                            let ts = tex.size_vec2();
+                            let uv = feed_cover_uv(ts.x, ts.y, w, 180.0);
                             let resp = ui.add(
-                                egui::Image::new((tex.id(), Vec2::new(w, 180.0)))
+                                egui::Image::new(tex)
+                                    .uv(uv)
+                                    .fit_to_exact_size(Vec2::new(w, 180.0))
+                                    .maintain_aspect_ratio(false)
                                     .rounding(Rounding::same(10.0))
                                     .sense(Sense::click()),
                             );
@@ -10576,8 +10573,8 @@ impl ZaloGuiApp {
                                     tex_key: ckey,
                                     hd_tex_key: hd,
                                     full_url: prof.cover_url.clone(),
-                                    title: format!("Ảnh bìa của {}", prof.display_name),
-                                    sender: prof.display_name.clone(),
+                                    title: format!("Ảnh bìa của {prof_name}"),
+                                    sender: prof_name.clone(),
                                     time: String::new(),
                                     zoom: 1.0,
                                     pan: Vec2::ZERO,
@@ -10594,16 +10591,16 @@ impl ZaloGuiApp {
                             ui.painter(),
                             av_r.center(),
                             28.0,
-                            &prof.display_name,
+                            &prof_name,
                             false,
-                            Some(&prof.avatar_url),
+                            (!prof_ava.is_empty()).then_some(prof_ava.as_str()),
                             &self.sticker_textures,
                             &mut self.loading_stickers,
                         );
                         ui.add_space(6.0);
                         ui.vertical(|ui| {
                             ui.label(
-                                RichText::new(&prof.display_name)
+                                RichText::new(&prof_name)
                                     .size(16.5)
                                     .color(pal.text_primary)
                                     .strong(),
@@ -10715,42 +10712,59 @@ impl ZaloGuiApp {
 
         let q_low = self.feed_search_query.trim().to_lowercase();
         let q_fold = fold_vn_search(&q_low);
-        let target_filter = self.feed_target_uid.clone();
+        let target_filter = crate::feed::clean_feed_uid(&self.feed_target_uid);
         let mut clicked_image: Option<(String, String, String, String)> = None;
-        let mut select_uid: Option<String> = None;
+        let mut select_author: Option<(String, String, String)> = None;
 
         let items_len = self.feed_items.len();
         let mut rendered_count = 0;
         for idx in 0..items_len {
             let item = self.feed_items[idx].clone();
-            if !target_filter.is_empty() && item.author.uid != target_filter {
+            let item_uid = crate::feed::clean_feed_uid(&item.author.uid);
+            let (resolved_author_name, resolved_author_ava) = resolve_feed_author_identity(
+                &item_uid,
+                &item.author.display_name,
+                "",
+                &item.author.avatar_url,
+                &self.user_uin,
+                &self.user_name,
+                self.user_avatar.as_deref(),
+                &self.feed_friend_profiles,
+                &self.threads,
+                &self.group_members_map,
+            );
+            if !target_filter.is_empty() && item_uid != target_filter {
                 let matches_name = self
                     .feed_profile
                     .as_ref()
                     .map(|p| {
-                        p.display_name
-                            .trim()
-                            .eq_ignore_ascii_case(item.author.display_name.trim())
-                            || p.zalo_name
+                        let p_uid = crate::feed::clean_feed_uid(&p.uid);
+                        p_uid == target_filter
+                            && (p.display_name
                                 .trim()
-                                .eq_ignore_ascii_case(item.author.display_name.trim())
-                            || item
-                                .author
-                                .display_name
-                                .trim()
-                                .eq_ignore_ascii_case(p.display_name.trim())
+                                .eq_ignore_ascii_case(resolved_author_name.trim())
+                                || p.zalo_name
+                                    .trim()
+                                    .eq_ignore_ascii_case(resolved_author_name.trim()))
                     })
                     .unwrap_or(false);
                 if !matches_name {
                     continue;
                 }
             }
-            if !matches_vn_query(&item.author.display_name, &q_low, &q_fold)
+            if !matches_vn_query(&resolved_author_name, &q_low, &q_fold)
                 && !matches_vn_query(&item.content, &q_low, &q_fold)
             {
                 continue;
             }
             rendered_count += 1;
+            let resolved_date = resolve_shared_media_date_str(
+                &item.feed_id,
+                &item_uid,
+                &item.media_list,
+                &item.date_str,
+                &self.threads,
+            );
 
             egui::Frame::none()
                 .fill(pal.bg_elevated)
@@ -10768,21 +10782,26 @@ impl ZaloGuiApp {
                             ui.painter(),
                             av_r.center(),
                             21.0,
-                            &item.author.display_name,
+                            &resolved_author_name,
                             false,
-                            Some(&item.author.avatar_url),
+                            (!resolved_author_ava.is_empty())
+                                .then_some(resolved_author_ava.as_str()),
                             &self.sticker_textures,
                             &mut self.loading_stickers,
                         );
                         if av_resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
-                            select_uid = Some(item.author.uid.clone());
+                            select_author = Some((
+                                item_uid.clone(),
+                                resolved_author_name.clone(),
+                                resolved_author_ava.clone(),
+                            ));
                         }
                         ui.add_space(4.0);
                         ui.vertical(|ui| {
                             ui.horizontal(|ui| {
                                 let name_resp = ui.add(
                                     egui::Label::new(
-                                        RichText::new(&item.author.display_name)
+                                        RichText::new(&resolved_author_name)
                                             .size(14.5)
                                             .color(pal.primary_hover)
                                             .strong(),
@@ -10793,7 +10812,11 @@ impl ZaloGuiApp {
                                     .on_hover_cursor(CursorIcon::PointingHand)
                                     .clicked()
                                 {
-                                    select_uid = Some(item.author.uid.clone());
+                                    select_author = Some((
+                                        item_uid.clone(),
+                                        resolved_author_name.clone(),
+                                        resolved_author_ava.clone(),
+                                    ));
                                 }
                                 if let Some(badge) = &item.status_badge {
                                     ui.label(
@@ -10804,7 +10827,7 @@ impl ZaloGuiApp {
                                 }
                             });
                             ui.label(
-                                RichText::new(&item.date_str)
+                                RichText::new(&resolved_date)
                                     .size(11.8)
                                     .color(pal.text_muted),
                             );
@@ -10840,75 +10863,168 @@ impl ZaloGuiApp {
                                     });
                                 }
                             }
-                            let img_h = if m.width > 0 && m.height > 0 && avail_w.is_finite() {
-                                (avail_w * (m.height as f32 / m.width as f32)).clamp(200.0, 420.0)
-                            } else {
-                                280.0
-                            };
-                            let (r, resp) =
-                                ui.allocate_exact_size(Vec2::new(avail_w, img_h), Sense::click());
-                            if let Some(tex) = self.sticker_textures.get(&mkey) {
-                                ui.painter().image(
-                                    tex.id(),
-                                    r,
-                                    Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-                                    Color32::WHITE,
-                                );
-                            } else {
-                                ui.painter()
-                                    .rect_filled(r, Rounding::same(10.0), pal.bg_input);
-                            }
-                            if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
+                            let tex_size = self
+                                .sticker_textures
+                                .get(&mkey)
+                                .map(|t| t.size_vec2())
+                                .filter(|s| s.x > 2.0 && s.y > 2.0);
+                            let disp = feed_single_image_size(
+                                tex_size,
+                                (m.width, m.height),
+                                avail_w,
+                                420.0,
+                            );
+                            let mut clicked_single = false;
+                            ui.horizontal(|ui| {
+                                let safe_w = if avail_w.is_finite() { avail_w } else { disp.x };
+                                let left_pad = ((safe_w - disp.x) * 0.5).max(0.0);
+                                if left_pad > 0.0 {
+                                    ui.add_space(left_pad);
+                                }
+                                if let Some(tex) = self
+                                    .sticker_textures
+                                    .get(&mkey)
+                                    .filter(|t| t.size()[0] > 2 && t.size()[1] > 2)
+                                {
+                                    crate::gui::mark_texture_used(&mkey);
+                                    let resp = ui.add(
+                                        egui::Image::new(tex)
+                                            .fit_to_exact_size(disp)
+                                            .maintain_aspect_ratio(false)
+                                            .rounding(Rounding::same(10.0))
+                                            .sense(Sense::click()),
+                                    );
+                                    ui.painter().rect_stroke(
+                                        resp.rect,
+                                        Rounding::same(10.0),
+                                        Stroke::new(
+                                            if resp.hovered() { 1.5_f32 } else { 1.0_f32 },
+                                            if resp.hovered() {
+                                                pal.primary
+                                            } else {
+                                                pal.border
+                                            },
+                                        ),
+                                    );
+                                    if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
+                                        clicked_single = true;
+                                    }
+                                } else {
+                                    let (r, resp) = ui.allocate_exact_size(disp, Sense::click());
+                                    ui.painter().rect_filled(
+                                        r,
+                                        Rounding::same(10.0),
+                                        pal.bg_input,
+                                    );
+                                    draw_icon_image(
+                                        ui.painter(),
+                                        r.center(),
+                                        24.0,
+                                        pal.text_muted,
+                                    );
+                                    if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
+                                        clicked_single = true;
+                                    }
+                                }
+                            });
+                            if clicked_single {
                                 clicked_image = Some((
                                     mkey,
                                     m.url.clone(),
                                     item.content.clone(),
-                                    item.author.display_name.clone(),
+                                    resolved_author_name.clone(),
                                 ));
                             }
                         } else {
-                            let cell_w = ((avail_w - 12.0) / 3.0).max(96.0);
-                            ui.horizontal_wrapped(|ui| {
-                                ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
-                                for m in item.media_list.iter().take(6) {
-                                    let mkey =
-                                        format!("fmed_{}", crate::crypto::md5_hex(&m.thumbnail));
-                                    if !self.sticker_textures.contains_key(&mkey)
-                                        && self.loading_stickers.insert(mkey.clone())
-                                    {
-                                        if let Some(tx) = WORKER_TX.get() {
-                                            let _ = tx.send(WorkerCmd::FetchStickerImage {
-                                                key: mkey.clone(),
-                                                url: m.thumbnail.clone(),
-                                            });
+                            let visible_count = media_cnt.min(6);
+                            let cols = feed_grid_columns(visible_count);
+                            let gap = 6.0_f32;
+                            let safe_w = if avail_w.is_finite() {
+                                avail_w.max(96.0)
+                            } else {
+                                420.0
+                            };
+                            let cell_w =
+                                ((safe_w - gap * (cols as f32 - 1.0)) / cols as f32).max(96.0);
+                            let cell_h = if cols == 2 {
+                                (cell_w * 0.78).min(260.0)
+                            } else {
+                                cell_w
+                            };
+                            ui.vertical(|ui| {
+                                ui.spacing_mut().item_spacing.y = gap;
+                                for row in item.media_list.iter().take(6).collect::<Vec<_>>().chunks(cols) {
+                                    ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing = Vec2::new(gap, gap);
+                                        for m in row {
+                                            let mkey = format!(
+                                                "fmed_{}",
+                                                crate::crypto::md5_hex(&m.thumbnail)
+                                            );
+                                            if !self.sticker_textures.contains_key(&mkey)
+                                                && self.loading_stickers.insert(mkey.clone())
+                                            {
+                                                if let Some(tx) = WORKER_TX.get() {
+                                                    let _ = tx.send(WorkerCmd::FetchStickerImage {
+                                                        key: mkey.clone(),
+                                                        url: m.thumbnail.clone(),
+                                                    });
+                                                }
+                                            }
+                                            let tile_size = Vec2::new(cell_w, cell_h);
+                                            let resp = if let Some(tex) = self
+                                                .sticker_textures
+                                                .get(&mkey)
+                                                .filter(|t| t.size()[0] > 2 && t.size()[1] > 2)
+                                            {
+                                                crate::gui::mark_texture_used(&mkey);
+                                                let ts = tex.size_vec2();
+                                                let uv = feed_cover_uv(ts.x, ts.y, cell_w, cell_h);
+                                                let resp = ui.add(
+                                                    egui::Image::new(tex)
+                                                        .uv(uv)
+                                                        .fit_to_exact_size(tile_size)
+                                                        .maintain_aspect_ratio(false)
+                                                        .rounding(Rounding::same(8.0))
+                                                        .sense(Sense::click()),
+                                                );
+                                                if resp.hovered() {
+                                                    ui.painter().rect_stroke(
+                                                        resp.rect,
+                                                        Rounding::same(8.0),
+                                                        Stroke::new(1.5_f32, pal.primary),
+                                                    );
+                                                }
+                                                resp
+                                            } else {
+                                                let (r, resp) =
+                                                    ui.allocate_exact_size(tile_size, Sense::click());
+                                                ui.painter().rect_filled(
+                                                    r,
+                                                    Rounding::same(8.0),
+                                                    pal.bg_input,
+                                                );
+                                                draw_icon_image(
+                                                    ui.painter(),
+                                                    r.center(),
+                                                    20.0,
+                                                    pal.text_muted,
+                                                );
+                                                resp
+                                            };
+                                            if resp
+                                                .on_hover_cursor(CursorIcon::PointingHand)
+                                                .clicked()
+                                            {
+                                                clicked_image = Some((
+                                                    mkey,
+                                                    m.url.clone(),
+                                                    item.content.clone(),
+                                                    resolved_author_name.clone(),
+                                                ));
+                                            }
                                         }
-                                    }
-                                    let (r, resp) = ui.allocate_exact_size(
-                                        Vec2::new(cell_w, cell_w),
-                                        Sense::click(),
-                                    );
-                                    if let Some(tex) = self.sticker_textures.get(&mkey) {
-                                        ui.painter().image(
-                                            tex.id(),
-                                            r,
-                                            Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-                                            Color32::WHITE,
-                                        );
-                                    } else {
-                                        ui.painter().rect_filled(
-                                            r,
-                                            Rounding::same(8.0),
-                                            pal.bg_input,
-                                        );
-                                    }
-                                    if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
-                                        clicked_image = Some((
-                                            mkey,
-                                            m.url.clone(),
-                                            item.content.clone(),
-                                            item.author.display_name.clone(),
-                                        ));
-                                    }
+                                    });
                                 }
                             });
                         }
@@ -11016,15 +11132,38 @@ impl ZaloGuiApp {
                 });
         }
 
-        if let Some(uid) = select_uid {
+        if let Some((uid, fallback_name, fallback_ava)) = select_author {
             self.feed_target_uid = uid.clone();
-            if let Some(p) = self
+            if let Some(mut p) = self
                 .feed_friend_profiles
                 .iter()
-                .find(|p| p.uid == uid)
+                .find(|p| crate::feed::clean_feed_uid(&p.uid) == uid)
                 .cloned()
             {
+                if crate::feed::is_placeholder_author_name(&p.display_name, &p.uid) {
+                    p.display_name = fallback_name;
+                }
+                if p.avatar_url.trim().is_empty() && !fallback_ava.is_empty() {
+                    p.avatar_url = fallback_ava;
+                }
                 self.feed_profile = Some(p);
+            } else {
+                self.feed_profile = Some(crate::feed::SocialUserProfile {
+                    uid: uid.clone(),
+                    username: String::new(),
+                    display_name: fallback_name,
+                    zalo_name: String::new(),
+                    avatar_url: fallback_ava,
+                    cover_url: String::new(),
+                    gender: 0,
+                    sdob: String::new(),
+                    status: String::new(),
+                    is_friend: true,
+                    last_action_time: None,
+                });
+                if let Some(tx) = WORKER_TX.get() {
+                    let _ = tx.send(WorkerCmd::FetchSocialProfile { target_uid: uid });
+                }
             }
         }
         if let Some((tkey, full_u, title, sender)) = clicked_image {
@@ -11090,18 +11229,29 @@ impl ZaloGuiApp {
                                 });
                             }
                         }
-                        let (r, resp) = ui.allocate_exact_size(Vec2::splat(130.0), Sense::click());
-                        if let Some(tex) = self.sticker_textures.get(&tkey) {
-                            ui.painter().image(
-                                tex.id(),
-                                r,
-                                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-                                Color32::WHITE,
-                            );
+                        let resp = if let Some(tex) = self
+                            .sticker_textures
+                            .get(&tkey)
+                            .filter(|t| t.size()[0] > 2 && t.size()[1] > 2)
+                        {
+                            crate::gui::mark_texture_used(&tkey);
+                            let ts = tex.size_vec2();
+                            let uv = feed_cover_uv(ts.x, ts.y, 130.0, 130.0);
+                            ui.add(
+                                egui::Image::new(tex)
+                                    .uv(uv)
+                                    .fit_to_exact_size(Vec2::splat(130.0))
+                                    .maintain_aspect_ratio(false)
+                                    .rounding(Rounding::same(8.0))
+                                    .sense(Sense::click()),
+                            )
                         } else {
+                            let (r, resp) = ui.allocate_exact_size(Vec2::splat(130.0), Sense::click());
                             ui.painter()
                                 .rect_filled(r, Rounding::same(8.0), pal.bg_input);
-                        }
+                            draw_icon_image(ui.painter(), r.center(), 20.0, pal.text_muted);
+                            resp
+                        };
                         if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
                             let hd = self.request_hd_texture(&item.url);
                             self.image_viewer = Some(ImageViewerModal {
@@ -11172,6 +11322,313 @@ impl ZaloGuiApp {
                 }
             });
     }
+}
+
+/// Fit a single feed photo inside `(max_w, max_h)` while preserving its aspect ratio.
+fn feed_single_image_size(
+    tex_size: Option<Vec2>,
+    meta_dims: (u32, u32),
+    max_w: f32,
+    max_h: f32,
+) -> Vec2 {
+    let safe_max_w = if max_w.is_finite() && max_w > 1.0 {
+        max_w
+    } else {
+        420.0
+    };
+    let safe_max_h = if max_h.is_finite() && max_h > 1.0 {
+        max_h
+    } else {
+        420.0
+    };
+    let intrinsic = tex_size
+        .filter(|s| s.x.is_finite() && s.y.is_finite() && s.x > 2.0 && s.y > 2.0)
+        .or_else(|| {
+            (meta_dims.0 > 0 && meta_dims.1 > 0)
+                .then(|| Vec2::new(meta_dims.0 as f32, meta_dims.1 as f32))
+        });
+    let Some(dims) = intrinsic else {
+        return Vec2::new(safe_max_w.min(360.0), safe_max_h.min(240.0));
+    };
+    let scale = (safe_max_w / dims.x).min(safe_max_h / dims.y).min(2.0);
+    Vec2::new((dims.x * scale).max(1.0), (dims.y * scale).max(1.0))
+}
+
+/// Compute center-crop UV coordinates so an image fills `target_w x target_h` without stretching.
+fn feed_cover_uv(tex_w: f32, tex_h: f32, target_w: f32, target_h: f32) -> Rect {
+    if !tex_w.is_finite()
+        || !tex_h.is_finite()
+        || !target_w.is_finite()
+        || !target_h.is_finite()
+        || tex_w <= 0.0
+        || tex_h <= 0.0
+        || target_w <= 0.0
+        || target_h <= 0.0
+    {
+        return Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
+    }
+    let src_aspect = tex_w / tex_h;
+    let dst_aspect = target_w / target_h;
+    if src_aspect > dst_aspect {
+        let span = (dst_aspect / src_aspect).clamp(0.0, 1.0);
+        let start = (1.0 - span) * 0.5;
+        Rect::from_min_max(Pos2::new(start, 0.0), Pos2::new(start + span, 1.0))
+    } else {
+        let span = (src_aspect / dst_aspect).clamp(0.0, 1.0);
+        let start = (1.0 - span) * 0.5;
+        Rect::from_min_max(Pos2::new(0.0, start), Pos2::new(1.0, start + span))
+    }
+}
+
+/// Choose feed collage columns so 2 or 4 photos sit two-wide and 3/5/6 sit three-wide.
+fn feed_grid_columns(count: usize) -> usize {
+    match count {
+        0..=2 | 4 => 2,
+        _ => 3,
+    }
+}
+
+fn is_usable_feed_avatar(url: &str) -> bool {
+    let trimmed = url.trim();
+    !trimmed.is_empty()
+        && !trimmed.ends_with("/default")
+        && !trimmed.contains("default_avatar")
+        && !trimmed.contains("avatar_default")
+        && (trimmed.starts_with("http://") || trimmed.starts_with("https://"))
+}
+
+/// Resolve a feed author's display name and avatar URL against local profiles, threads, and member caches.
+#[allow(clippy::too_many_arguments)]
+fn resolve_feed_author_identity(
+    uid: &str,
+    raw_display_name: &str,
+    raw_zalo_name: &str,
+    raw_avatar_url: &str,
+    my_uin: &str,
+    my_name: &str,
+    my_avatar: Option<&str>,
+    profiles: &[crate::feed::SocialUserProfile],
+    threads: &[Thread],
+    group_members_map: &HashMap<String, Vec<crate::chat::SidebarMember>>,
+) -> (String, String) {
+    let clean_uid = crate::feed::clean_feed_uid(uid);
+    let clean_my_uin = crate::feed::clean_feed_uid(my_uin);
+
+    let mut best_name = if !crate::feed::is_placeholder_author_name(raw_display_name, &clean_uid) {
+        raw_display_name.trim().to_string()
+    } else if !crate::feed::is_placeholder_author_name(raw_zalo_name, &clean_uid) {
+        raw_zalo_name.trim().to_string()
+    } else {
+        String::new()
+    };
+
+    let mut best_ava = if is_usable_feed_avatar(raw_avatar_url) {
+        crate::feed::normalize_social_media_url(raw_avatar_url)
+    } else {
+        String::new()
+    };
+
+    if clean_uid == "0" || (!clean_my_uin.is_empty() && clean_uid == clean_my_uin) {
+        if best_name.is_empty() && !crate::feed::is_placeholder_author_name(my_name, &clean_my_uin)
+        {
+            best_name = my_name.trim().to_string();
+        }
+        if best_ava.is_empty() {
+            if let Some(ava) = my_avatar.filter(|u| is_usable_feed_avatar(u)) {
+                best_ava = crate::feed::normalize_social_media_url(ava);
+            }
+        }
+    }
+
+    if (best_name.is_empty() || best_ava.is_empty()) && !clean_uid.is_empty() {
+        if let Some(prof) = profiles
+            .iter()
+            .find(|p| crate::feed::clean_feed_uid(&p.uid) == clean_uid)
+        {
+            if best_name.is_empty() {
+                if !crate::feed::is_placeholder_author_name(&prof.display_name, &clean_uid) {
+                    best_name = prof.display_name.trim().to_string();
+                } else if !crate::feed::is_placeholder_author_name(&prof.zalo_name, &clean_uid) {
+                    best_name = prof.zalo_name.trim().to_string();
+                } else if !crate::feed::is_placeholder_author_name(&prof.username, &clean_uid) {
+                    best_name = prof.username.trim().to_string();
+                }
+            }
+            if best_ava.is_empty() && is_usable_feed_avatar(&prof.avatar_url) {
+                best_ava = crate::feed::normalize_social_media_url(&prof.avatar_url);
+            }
+        }
+    }
+
+    if (best_name.is_empty() || best_ava.is_empty()) && !clean_uid.is_empty() {
+        if let Some(t) = threads
+            .iter()
+            .find(|t| !t.is_group && crate::feed::clean_feed_uid(&t.id) == clean_uid)
+        {
+            if best_name.is_empty()
+                && !t.name.contains("Cloud của tôi")
+                && !crate::feed::is_placeholder_author_name(&t.name, &clean_uid)
+            {
+                best_name = t.name.trim().to_string();
+            }
+            if best_ava.is_empty() {
+                if let Some(ava) = t.avatar.as_deref().filter(|u| is_usable_feed_avatar(u)) {
+                    best_ava = crate::feed::normalize_social_media_url(ava);
+                }
+            }
+        }
+    }
+
+    if (best_name.is_empty() || best_ava.is_empty()) && !clean_uid.is_empty() {
+        let all_members = group_members_map
+            .values()
+            .flatten()
+            .chain(threads.iter().flat_map(|t| t.presentation.members.iter()));
+        for m in all_members {
+            if crate::feed::clean_feed_uid(&m.id) != clean_uid {
+                continue;
+            }
+            if best_name.is_empty() && !crate::feed::is_placeholder_author_name(&m.name, &clean_uid)
+            {
+                best_name = m.name.trim().to_string();
+            }
+            if best_ava.is_empty() {
+                if let Some(ava) = m.avatar.as_deref().filter(|u| is_usable_feed_avatar(u)) {
+                    best_ava = crate::feed::normalize_social_media_url(ava);
+                }
+            }
+            if !best_name.is_empty() && !best_ava.is_empty() {
+                break;
+            }
+        }
+    }
+
+    if best_name.is_empty() {
+        best_name = "Người dùng Zalo".to_string();
+    }
+
+    (best_name, best_ava)
+}
+
+/// Resolve the true timestamp string for a chat-derived `shared_media_` card when `m.ts` exists.
+fn resolve_shared_media_date_str(
+    feed_id: &str,
+    author_uid: &str,
+    media_list: &[crate::feed::FeedMedia],
+    default_date: &str,
+    threads: &[Thread],
+) -> String {
+    if !feed_id.starts_with("shared_media_") {
+        return default_date.to_string();
+    }
+    let clean_uid = crate::feed::clean_feed_uid(author_uid);
+    if let Some(thread) = threads
+        .iter()
+        .find(|t| !t.is_group && crate::feed::clean_feed_uid(&t.id) == clean_uid)
+    {
+        let mut best_ts: i64 = 0;
+        for med in media_list {
+            if let Some(msg) = thread.messages.iter().find(|m| m.id == med.photo_id) {
+                let norm = crate::clock::normalize_ts_ms(msg.ts);
+                if norm > best_ts {
+                    best_ts = norm;
+                }
+            }
+        }
+        if best_ts > 0 {
+            let formatted = crate::feed::format_vn_timestamp_ms(best_ts);
+            if !formatted.is_empty() {
+                return formatted;
+            }
+        }
+    }
+    default_date.to_string()
+}
+
+/// Collect incoming 1-1 friend photos for feed preview without attributing outgoing user photos to friends.
+fn collect_friend_shared_media_from_threads(
+    threads: &[Thread],
+    my_uin: &str,
+) -> (Vec<String>, HashMap<String, Vec<crate::feed::FeedMedia>>) {
+    let mut friend_uids = Vec::new();
+    let mut shared_media_by_uid: HashMap<String, Vec<crate::feed::FeedMedia>> = HashMap::new();
+    let clean_my_uin = crate::feed::clean_feed_uid(my_uin);
+    for t in threads {
+        let tid = crate::feed::clean_feed_uid(&t.id);
+        let looks_like_group = tid.starts_with("group_")
+            || (tid.starts_with('g')
+                && tid.len() > 1
+                && tid[1..].chars().all(|c| c.is_ascii_digit()));
+        if t.is_group
+            || tid.is_empty()
+            || tid == "0"
+            || (!clean_my_uin.is_empty() && tid == clean_my_uin)
+            || looks_like_group
+            || t.name.contains("Cloud của tôi")
+        {
+            continue;
+        }
+        friend_uids.push(tid.clone());
+        let mut photos = Vec::new();
+        for m in t.messages.iter().rev() {
+            if m.is_outgoing
+                || m.kind == crate::message_model::MessageKind::Delete
+                || m.sender.trim() == "Tôi"
+                || m.sender.trim() == "Zalo"
+            {
+                continue;
+            }
+            let trimmed_text = m.text.trim();
+            if trimmed_text == "[Tin nhắn đã thu hồi]"
+                || trimmed_text.starts_with("[Đã thu hồi]")
+            {
+                continue;
+            }
+            let wire_sender = m
+                .wire_ref
+                .sender
+                .as_ref()
+                .and_then(|v| {
+                    v.as_str()
+                        .map(|s| crate::feed::clean_feed_uid(s))
+                        .or_else(|| v.as_u64().map(|n| n.to_string()))
+                        .or_else(|| v.as_i64().map(|n| n.to_string()))
+                })
+                .unwrap_or_default();
+            if wire_sender == "0" || (!clean_my_uin.is_empty() && wire_sender == clean_my_uin) {
+                continue;
+            }
+            let is_photo = m.link_src.as_deref() == Some("Hình ảnh Zalo")
+                || trimmed_text == "[Hình ảnh]"
+                || trimmed_text.starts_with("[Hình ảnh] ");
+            if !is_photo {
+                continue;
+            }
+            if let Some(thumb) = m
+                .link_thumb
+                .as_deref()
+                .or(m.link_url.as_deref())
+                .filter(|u| !u.is_empty())
+            {
+                let full = m.link_url.as_deref().unwrap_or(thumb).to_string();
+                photos.push(crate::feed::FeedMedia {
+                    photo_id: m.id.clone(),
+                    media_type: "image".to_string(),
+                    url: full,
+                    thumbnail: thumb.to_string(),
+                    width: 0,
+                    height: 0,
+                });
+                if photos.len() >= 6 {
+                    break;
+                }
+            }
+        }
+        if !photos.is_empty() {
+            shared_media_by_uid.insert(tid, photos);
+        }
+    }
+    (friend_uids, shared_media_by_uid)
 }
 
 /// Extract up to 6 concise changelog bullet lines from a GitHub Release body,
@@ -11496,5 +11953,170 @@ mod tests {
         let raw = "Hẹn giờ gửi tin nhắn ([#38](https://github.com/ctdoteam1110/ctdozlite/issues/38)), REST API ([#35](https://github.com/ctdoteam1110/ctdozlite/issues/35))";
         let cleaned = extract_markdown_links_inline(raw);
         assert_eq!(cleaned, "Hẹn giờ gửi tin nhắn (#38), REST API (#35)");
+    }
+
+    #[test]
+    fn feed_single_image_size_preserves_aspect_ratios_and_bounds() {
+        let portrait = feed_single_image_size(Some(Vec2::new(900.0, 1900.0)), (0, 0), 644.0, 420.0);
+        assert!((portrait.y - 420.0).abs() < 0.01);
+        assert!(((portrait.x / portrait.y) - (9.0 / 19.0)).abs() < 0.001);
+        assert!(portrait.x < 210.0, "portrait receipt must stay narrow, got {}", portrait.x);
+
+        let landscape =
+            feed_single_image_size(Some(Vec2::new(1920.0, 1080.0)), (0, 0), 644.0, 420.0);
+        assert!((landscape.x - 644.0).abs() < 0.01);
+        assert!(((landscape.x / landscape.y) - (16.0 / 9.0)).abs() < 0.001);
+
+        let square = feed_single_image_size(Some(Vec2::new(800.0, 800.0)), (0, 0), 644.0, 420.0);
+        assert!((square.x - 420.0).abs() < 0.01);
+        assert!((square.y - 420.0).abs() < 0.01);
+
+        let fallback = feed_single_image_size(None, (0, 0), 644.0, 420.0);
+        assert_eq!(fallback, Vec2::new(360.0, 240.0));
+    }
+
+    #[test]
+    fn feed_cover_uv_center_crops_without_stretching() {
+        let wide_to_square = feed_cover_uv(1600.0, 900.0, 140.0, 140.0);
+        assert!((wide_to_square.min.y - 0.0).abs() < 1e-4);
+        assert!((wide_to_square.max.y - 1.0).abs() < 1e-4);
+        assert!((wide_to_square.width() - (9.0 / 16.0)).abs() < 1e-4);
+        assert!((wide_to_square.center().x - 0.5).abs() < 1e-4);
+
+        let tall_to_square = feed_cover_uv(900.0, 1900.0, 140.0, 140.0);
+        assert!((tall_to_square.min.x - 0.0).abs() < 1e-4);
+        assert!((tall_to_square.max.x - 1.0).abs() < 1e-4);
+        assert!((tall_to_square.height() - (9.0 / 19.0)).abs() < 1e-4);
+        assert!((tall_to_square.center().y - 0.5).abs() < 1e-4);
+    }
+
+    #[test]
+    fn feed_author_resolution_uses_threads_members_and_falls_back_from_numeric_uid() {
+        let thread = Thread {
+            presentation: crate::chat::SidebarPresentation {
+                members: vec![crate::chat::SidebarMember {
+                    id: "777888999".to_string(),
+                    name: "Phạm Thị Lan".to_string(),
+                    avatar: Some("https://ava.zdn.vn/lan.jpg".to_string()),
+                    role: "member".to_string(),
+                }],
+                ..Default::default()
+            },
+            id: "686454111222".to_string(),
+            name: "Nguyễn Quốc Bảo".to_string(),
+            preview: String::new(),
+            time: String::new(),
+            avatar: Some("https://ava.zdn.vn/bao.jpg".to_string()),
+            is_group: false,
+            messages: Vec::new(),
+            unread: Default::default(),
+            vanish: None,
+        };
+        let threads = vec![thread];
+        let members_map = HashMap::new();
+
+        let (name_from_thread, ava_from_thread) = resolve_feed_author_identity(
+            "686454111222",
+            "686454111222",
+            "",
+            "",
+            "100001",
+            "Tôi",
+            None,
+            &[],
+            &threads,
+            &members_map,
+        );
+        assert_eq!(name_from_thread, "Nguyễn Quốc Bảo");
+        assert_eq!(ava_from_thread, "https://ava.zdn.vn/bao.jpg");
+
+        let (name_from_member, ava_from_member) = resolve_feed_author_identity(
+            "777888999_0",
+            "",
+            "",
+            "",
+            "100001",
+            "Tôi",
+            None,
+            &[],
+            &threads,
+            &members_map,
+        );
+        assert_eq!(name_from_member, "Phạm Thị Lan");
+        assert_eq!(ava_from_member, "https://ava.zdn.vn/lan.jpg");
+
+        let (unknown_name, unknown_ava) = resolve_feed_author_identity(
+            "999888777666",
+            "999888777666",
+            "",
+            "",
+            "100001",
+            "Tôi",
+            None,
+            &[],
+            &threads,
+            &members_map,
+        );
+        assert_eq!(unknown_name, "Người dùng Zalo");
+        assert!(unknown_ava.is_empty());
+    }
+
+    #[test]
+    fn collect_friend_shared_media_excludes_outgoing_messages() {
+        let mut outgoing_receipt = ChatMessage::default();
+        outgoing_receipt.id = "msg_out_1".to_string();
+        outgoing_receipt.sender = "Tôi".to_string();
+        outgoing_receipt.text = "[Hình ảnh]".to_string();
+        outgoing_receipt.is_outgoing = true;
+        outgoing_receipt.ts = 1_726_408_850_000;
+        outgoing_receipt.link_src = Some("Hình ảnh Zalo".to_string());
+        outgoing_receipt.link_thumb = Some("https://photo.zdn.vn/receipt.jpg".to_string());
+        outgoing_receipt.link_url = Some("https://photo.zdn.vn/receipt_hd.jpg".to_string());
+
+        let mut incoming_photo = ChatMessage::default();
+        incoming_photo.id = "msg_in_1".to_string();
+        incoming_photo.sender = "Nguyễn Quốc Bảo".to_string();
+        incoming_photo.text = "[Hình ảnh]".to_string();
+        incoming_photo.is_outgoing = false;
+        incoming_photo.ts = 1_726_500_000_000;
+        incoming_photo.link_src = Some("Hình ảnh Zalo".to_string());
+        incoming_photo.link_thumb = Some("https://photo.zdn.vn/friend_photo.jpg".to_string());
+
+        let t1 = Thread {
+            presentation: Default::default(),
+            id: "686454111222".to_string(),
+            name: "Nguyễn Quốc Bảo".to_string(),
+            preview: String::new(),
+            time: String::new(),
+            avatar: None,
+            is_group: false,
+            messages: vec![outgoing_receipt.clone()],
+            unread: Default::default(),
+            vanish: None,
+        };
+        let t2 = Thread {
+            presentation: Default::default(),
+            id: "686454333444".to_string(),
+            name: "Trần Thị Mai".to_string(),
+            preview: String::new(),
+            time: String::new(),
+            avatar: None,
+            is_group: false,
+            messages: vec![outgoing_receipt, incoming_photo],
+            unread: Default::default(),
+            vanish: None,
+        };
+        let (uids, media_map) = collect_friend_shared_media_from_threads(&[t1, t2], "100001");
+        assert_eq!(uids.len(), 2);
+        assert!(
+            !media_map.contains_key("686454111222"),
+            "outgoing receipt must not be attributed to friend"
+        );
+        let mai_media = media_map
+            .get("686454333444")
+            .expect("incoming friend photo must be kept");
+        assert_eq!(mai_media.len(), 1);
+        assert_eq!(mai_media[0].photo_id, "msg_in_1");
+        assert_eq!((mai_media[0].width, mai_media[0].height), (0, 0));
     }
 }
