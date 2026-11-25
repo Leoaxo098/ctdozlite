@@ -1866,6 +1866,18 @@ impl Default for MdOptions {
     }
 }
 
+/// Compute a bounded width for the single-photo loading placeholder so it never exceeds `max_text_width`.
+fn photo_placeholder_width(max_text_width: f32) -> f32 {
+    max_text_width
+        .min(280.0)
+        .max(110.0_f32.min(max_text_width))
+}
+
+/// Resolve the short single-line status text painted inside an unloaded photo placeholder box.
+fn photo_placeholder_status_label() -> &'static str {
+    "Đang tải hình ảnh..."
+}
+
 pub(super) fn render_message_body(
     ui: &mut egui::Ui,
     msg: &ChatMessage,
@@ -2121,7 +2133,7 @@ pub(super) fn render_message_body(
                 }
             } else {
                 // Loading / Placeholder frame with visual image icon and loading feedback
-                let disp_w = max_text_width.min(280.0).max(110.0);
+                let disp_w = photo_placeholder_width(max_text_width);
                 let disp_h = 150.0_f32;
                 let (rect, resp) =
                     ui.allocate_exact_size(Vec2::new(disp_w, disp_h), Sense::click());
@@ -2146,15 +2158,11 @@ pub(super) fn render_message_body(
                     26.0,
                     text_col.linear_multiply(0.45),
                 );
-                let label_text = if title_label != "Hình ảnh" {
-                    title_label.clone()
-                } else {
-                    "Đang tải hình ảnh...".to_string()
-                };
-                ui.painter().text(
+                let clipped = ui.painter().with_clip_rect(rect.shrink(6.0));
+                clipped.text(
                     rect.center() + Vec2::new(0.0, 20.0),
                     egui::Align2::CENTER_CENTER,
-                    label_text,
+                    photo_placeholder_status_label(),
                     FontId::proportional(12.5),
                     text_col.linear_multiply(0.7),
                 );
@@ -4442,6 +4450,47 @@ pub(super) fn format_vanish_remaining(remain_ms: i64) -> String {
     }
 }
 
+/// Detect primary double-click on a bubble without nesting `egui::Context` locks.
+fn check_bubble_double_click_reply(
+    ui: &egui::Ui,
+    bubble_rect: Rect,
+    has_interactive_card: bool,
+    vanished: bool,
+) -> bool {
+    if has_interactive_card || vanished {
+        return false;
+    }
+    let (dbl_reply_enabled, modal_open) = ui.ctx().data(|d| {
+        (
+            d.get_temp::<bool>(Id::new("pref_double_click_to_reply"))
+                .unwrap_or(true),
+            d.get_temp::<bool>(Id::new("chat_overlay_modal_open"))
+                .unwrap_or(false),
+        )
+    });
+    if !dbl_reply_enabled || modal_open {
+        return false;
+    }
+    let (dbl_clicked, interact_pos) = ui.input(|i| {
+        (
+            i.pointer.button_double_clicked(egui::PointerButton::Primary),
+            i.pointer.interact_pos(),
+        )
+    });
+    if !dbl_clicked {
+        return false;
+    }
+    let Some(pos) = interact_pos else {
+        return false;
+    };
+    if !bubble_rect.contains(pos) {
+        return false;
+    }
+    ui.ctx()
+        .layer_id_at(pos)
+        .is_none_or(|layer| layer == ui.layer_id())
+}
+
 pub(super) fn render_chat_bubble(
     ui: &mut egui::Ui,
     msg: &ChatMessage,
@@ -4595,7 +4644,7 @@ pub(super) fn render_chat_bubble(
                 (tw_f * scale).clamp(max_w.min(140.0), max_w).ceil()
             }
         } else {
-            max_text_width.min(280.0).max(110.0)
+            photo_placeholder_width(max_text_width)
         };
         if let Some(cap_str) = photo_caption {
             let cap_w = ui.fonts(|f| {
@@ -4937,26 +4986,12 @@ pub(super) fn render_chat_bubble(
                             }
                         });
                     });
-                let dbl_reply_enabled = ui
-                    .ctx()
-                    .data(|d| d.get_temp::<bool>(Id::new("pref_double_click_to_reply")))
-                    .unwrap_or(true);
-                let modal_open = ui
-                    .ctx()
-                    .data(|d| d.get_temp::<bool>(Id::new("chat_overlay_modal_open")))
-                    .unwrap_or(false);
-                if dbl_reply_enabled
-                    && !modal_open
-                    && !has_interactive_card
-                    && !vanished
-                    && ui.input(|i| {
-                        i.pointer.button_double_clicked(egui::PointerButton::Primary)
-                            && i.pointer.interact_pos().is_some_and(|p| {
-                                fr.response.rect.contains(p)
-                                    && ui.ctx().layer_id_at(p).is_none_or(|l| l == ui.layer_id())
-                            })
-                    })
-                {
+                if check_bubble_double_click_reply(
+                    ui,
+                    fr.response.rect,
+                    has_interactive_card,
+                    vanished,
+                ) {
                     return Some(BubbleAction::Reply);
                 }
                 let hover_action = if !vanished && album.len() < 2 {
@@ -5143,26 +5178,12 @@ pub(super) fn render_chat_bubble(
                             }
                         });
                     });
-                let dbl_reply_enabled = ui
-                    .ctx()
-                    .data(|d| d.get_temp::<bool>(Id::new("pref_double_click_to_reply")))
-                    .unwrap_or(true);
-                let modal_open = ui
-                    .ctx()
-                    .data(|d| d.get_temp::<bool>(Id::new("chat_overlay_modal_open")))
-                    .unwrap_or(false);
-                if dbl_reply_enabled
-                    && !modal_open
-                    && !has_interactive_card
-                    && !vanished
-                    && ui.input(|i| {
-                        i.pointer.button_double_clicked(egui::PointerButton::Primary)
-                            && i.pointer.interact_pos().is_some_and(|p| {
-                                fr.response.rect.contains(p)
-                                    && ui.ctx().layer_id_at(p).is_none_or(|l| l == ui.layer_id())
-                            })
-                    })
-                {
+                if check_bubble_double_click_reply(
+                    ui,
+                    fr.response.rect,
+                    has_interactive_card,
+                    vanished,
+                ) {
                     return Some(BubbleAction::Reply);
                 }
                 let hover_action = if !vanished && album.len() < 2 {
@@ -5334,6 +5355,215 @@ fn menu_text_item(ui: &mut egui::Ui, label: &str, text_color: Color32) -> egui::
     resp.on_hover_cursor(CursorIcon::PointingHand)
 }
 
+const BUBBLE_CTX_MENU_KEY: &str = "active_bubble_context_menu";
+const BUBBLE_CTX_OPEN_TIME_KEY: &str = "bubble_context_menu_open_time";
+const BUBBLE_TRANSLATE_SUB_KEY: &str = "bubble_translate_submenu";
+const BUBBLE_FLYOUT_RECT_KEY: &str = "bubble_translate_flyout_rect";
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ContextMenuMetrics {
+    inner_w: f32,
+    outer_w: f32,
+    outer_h: f32,
+}
+
+/// Compute context menu dimensions from rendered rows alone so hover flyouts never shift size.
+fn compute_context_menu_metrics(msg: &ChatMessage, now_ms: i64) -> ContextMenuMetrics {
+    let vanished = msg.text.trim() == crate::chat::VANISH_EXPIRED_TEXT;
+    let has_reactions = !msg.reaction_summaries.is_empty() || !msg.reactions.is_empty();
+    let inner_w = if has_reactions { 220.0_f32 } else { 196.0_f32 };
+    let mut rows = 0_usize;
+    if has_reactions && !vanished {
+        rows += 1;
+    }
+    if !vanished {
+        rows += 3;
+    }
+    if !vanished && !msg.text.trim().is_empty() {
+        rows += 1;
+    }
+    rows += 2;
+    if !vanished {
+        rows += 2;
+    }
+    if !vanished && is_zalo_photo_message(msg) && photo_primary_url(msg).is_some() {
+        rows += 2;
+    }
+    if !vanished && is_zalo_file_or_video_message(msg) {
+        if msg.link_url.as_deref().is_some_and(|u| !u.is_empty()) {
+            if matches!(
+                classify_attachment(msg),
+                Some(AttachmentKind::Voice | AttachmentKind::Audio)
+            ) {
+                rows += 1;
+            }
+            rows += 1;
+        }
+    }
+    if crate::chat::can_edit_message(msg, now_ms) {
+        rows += 1;
+    }
+    if msg.is_outgoing && msg.edited {
+        rows += 1;
+    }
+    if !vanished
+        && msg.is_outgoing
+        && msg.text.trim() != "[Tin nhắn đã thu hồi]"
+        && !msg.text.starts_with("[Đã thu hồi]")
+    {
+        rows += 1;
+    }
+    rows += 1;
+    let outer_w = inner_w + 22.0;
+    let outer_h = 76.0 + rows as f32 * 31.0;
+    ContextMenuMetrics {
+        inner_w,
+        outer_w,
+        outer_h,
+    }
+}
+
+/// Clamp the context menu position within `screen` using its full outer width and height.
+fn clamp_context_menu_pos(menu_pos: Pos2, screen: Rect, outer_w: f32, outer_h: f32) -> Pos2 {
+    let min_x = screen.left() + 8.0;
+    let max_x = (screen.right() - outer_w - 8.0).max(min_x);
+    let min_y = screen.top() + 8.0;
+    let max_y = (screen.bottom() - outer_h - 8.0).max(min_y);
+    Pos2::new(menu_pos.x.clamp(min_x, max_x), menu_pos.y.clamp(min_y, max_y))
+}
+
+/// Compute screen-clamped position for the translate language flyout beside `outer_menu_rect`.
+fn translate_flyout_pos(
+    outer_menu_rect: Rect,
+    row: Rect,
+    screen: Rect,
+    fly_w: f32,
+    fly_h: f32,
+) -> Pos2 {
+    let fly_outer_w = fly_w + 14.0;
+    let right_x = outer_menu_rect.right() + 4.0;
+    let x = if right_x + fly_outer_w + 8.0 <= screen.right() {
+        right_x
+    } else {
+        (outer_menu_rect.left() - 4.0 - fly_outer_w).max(screen.left() + 8.0)
+    };
+    let min_y = screen.top() + 8.0;
+    let max_y = (screen.bottom() - fly_h - 8.0).max(min_y);
+    let y = (row.top() - 6.0).clamp(min_y, max_y);
+    Pos2::new(x, y)
+}
+
+/// True while `pos` travels horizontally or diagonally across the margin and gap toward `flyout`.
+fn translate_corridor_contains(
+    outer_menu_rect: Rect,
+    row: Rect,
+    flyout: Rect,
+    pos: Pos2,
+) -> bool {
+    let full_y_min = row.top().min(flyout.top()) - 4.0;
+    let full_y_max = row.bottom().max(flyout.bottom()) + 4.0;
+    let pad_y_max = (row.bottom() + 20.0).min(full_y_max);
+    if flyout.center().x >= outer_menu_rect.center().x {
+        let in_gap = pos.x >= outer_menu_rect.right() - 1.0
+            && pos.x <= flyout.left() + 1.0
+            && pos.y >= full_y_min
+            && pos.y <= full_y_max;
+        let in_pad = pos.x >= row.right() - 1.0
+            && pos.x <= outer_menu_rect.right()
+            && pos.y >= full_y_min
+            && pos.y <= pad_y_max;
+        in_gap || in_pad
+    } else {
+        let in_gap = pos.x >= flyout.right() - 1.0
+            && pos.x <= outer_menu_rect.left() + 1.0
+            && pos.y >= full_y_min
+            && pos.y <= full_y_max;
+        let in_pad = pos.x >= outer_menu_rect.left()
+            && pos.x <= row.left() + 1.0
+            && pos.y >= full_y_min
+            && pos.y <= pad_y_max;
+        in_gap || in_pad
+    }
+}
+
+/// Decide whether the translate submenu stays open across row hover, corridor travel, and flyout hover.
+fn should_keep_translate_flyout_open(
+    sub_open: bool,
+    translate_hovered: bool,
+    pointer_pos: Option<Pos2>,
+    outer_menu_rect: Rect,
+    translate_row: Option<Rect>,
+    flyout_rect: Option<Rect>,
+) -> bool {
+    let Some(row) = translate_row else {
+        return false;
+    };
+    if translate_hovered {
+        return true;
+    }
+    if !sub_open {
+        return false;
+    }
+    let Some(pos) = pointer_pos else {
+        return true;
+    };
+    let in_row_band = pos.y >= row.top()
+        && pos.y <= row.bottom()
+        && pos.x >= outer_menu_rect.left()
+        && pos.x <= outer_menu_rect.right();
+    if in_row_band {
+        return true;
+    }
+    if let Some(fr) = flyout_rect {
+        if fr.expand(4.0).contains(pos) || translate_corridor_contains(outer_menu_rect, row, fr, pos)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Dismiss the context menu when a pointer press/click lands outside both menu frame and open flyout.
+fn should_dismiss_context_menu_on_pointer(
+    now_time: f64,
+    open_time: f64,
+    pointer_pressed_or_clicked: bool,
+    pointer_pos: Option<Pos2>,
+    outer_menu_rect: Rect,
+    flyout_rect: Option<Rect>,
+    sub_open: bool,
+) -> bool {
+    if !pointer_pressed_or_clicked || now_time <= open_time + 0.05 {
+        return false;
+    }
+    let Some(pos) = pointer_pos else {
+        return false;
+    };
+    let in_main = outer_menu_rect.expand(2.0).contains(pos);
+    let in_flyout = sub_open && flyout_rect.is_some_and(|r| r.expand(2.0).contains(pos));
+    !in_main && !in_flyout
+}
+
+/// Open the bubble context menu from either right-click or the hover bar `...` button with synced keys.
+fn open_bubble_context_menu(
+    ctx: &egui::Context,
+    msg_key: String,
+    anchor_pos: Pos2,
+    idx: usize,
+    open_time: f64,
+) {
+    let hover_id = Id::new("active_hover_reaction_bubble");
+    ctx.data_mut(|d| {
+        d.insert_temp(Id::new(BUBBLE_CTX_MENU_KEY), (msg_key, anchor_pos, idx));
+        d.insert_temp(Id::new(BUBBLE_CTX_OPEN_TIME_KEY), open_time);
+        d.remove::<String>(hover_id);
+        d.remove::<(String, Rect, u64)>(hover_id.with("state"));
+        d.remove::<bool>(Id::new(BUBBLE_TRANSLATE_SUB_KEY));
+        d.remove::<Rect>(Id::new(BUBBLE_FLYOUT_RECT_KEY));
+    });
+    ctx.request_repaint();
+}
+
 pub(super) fn bubble_context_menu(
     ui: &mut egui::Ui,
     bubble: &egui::Response,
@@ -5345,32 +5575,26 @@ pub(super) fn bubble_context_menu(
     _display_sender: &str,
     pending_translate: bool,
 ) -> Option<BubbleAction> {
-    let ctx_menu_key = Id::new("active_bubble_context_menu");
-    let open_time_key = Id::new("bubble_context_menu_open_time");
-    let translate_sub_key = Id::new("bubble_translate_submenu");
+    let ctx_menu_key = Id::new(BUBBLE_CTX_MENU_KEY);
+    let open_time_key = Id::new(BUBBLE_CTX_OPEN_TIME_KEY);
+    let translate_sub_key = Id::new(BUBBLE_TRANSLATE_SUB_KEY);
+    let flyout_rect_key = Id::new(BUBBLE_FLYOUT_RECT_KEY);
     let this_key = format!("{}_{}", msg.id, msg.ts);
 
-    let pointer_pos = ui
-        .ctx()
-        .input(|i| i.pointer.hover_pos().or(i.pointer.interact_pos()));
-    let in_bubble = pointer_pos.map_or(false, |p| bubble.rect.contains(p));
-
-    let secondary_clicked = ui.ctx().input(|i| {
-        i.pointer.button_clicked(egui::PointerButton::Secondary)
-            || (i.pointer.button_clicked(egui::PointerButton::Primary)
-                && (i.modifiers.ctrl || i.modifiers.command))
+    let (pointer_pos, secondary_clicked, current_time) = ui.ctx().input(|i| {
+        (
+            i.pointer.hover_pos().or(i.pointer.interact_pos()),
+            i.pointer.button_clicked(egui::PointerButton::Secondary)
+                || (i.pointer.button_clicked(egui::PointerButton::Primary)
+                    && (i.modifiers.ctrl || i.modifiers.command)),
+            i.time,
+        )
     });
+    let in_bubble = pointer_pos.map_or(false, |p| bubble.rect.contains(p));
 
     if in_bubble && secondary_clicked {
         let click_pos = pointer_pos.unwrap_or(bubble.rect.left_top());
-        let current_time = ui.input(|i| i.time);
-        ui.ctx().data_mut(|d| {
-            d.insert_temp(ctx_menu_key, (this_key.clone(), click_pos, idx));
-            d.insert_temp(open_time_key, current_time);
-            d.remove::<String>(Id::new("active_hover_reaction_bubble"));
-            d.remove::<bool>(translate_sub_key);
-        });
-        ui.ctx().request_repaint();
+        open_bubble_context_menu(ui.ctx(), this_key.clone(), click_pos, idx, current_time);
     }
 
     let active_menu: Option<(String, Pos2, usize)> = ui.ctx().data(|d| d.get_temp(ctx_menu_key));
@@ -5381,35 +5605,19 @@ pub(super) fn bubble_context_menu(
     let mut close_menu = false;
 
     let has_reactions = !msg.reaction_summaries.is_empty() || !msg.reactions.is_empty();
-    let sub_open: bool = ui
-        .ctx()
-        .data(|d| d.get_temp(translate_sub_key).unwrap_or(false));
+    let now_ms = crate::login::unix_now() * 1000;
+    let metrics = compute_context_menu_metrics(msg, now_ms);
     let screen = ui.ctx().screen_rect();
-    let menu_w = if has_reactions || sub_open {
-        220.0_f32
-    } else {
-        196.0_f32
-    };
-    let menu_h = if sub_open { 430.0_f32 } else { 300.0_f32 };
-    let pos = Pos2::new(
-        menu_pos.x.clamp(
-            screen.left() + 8.0,
-            (screen.right() - menu_w - 8.0).max(screen.left() + 8.0),
-        ),
-        menu_pos.y.clamp(
-            screen.top() + 8.0,
-            (screen.bottom() - menu_h - 8.0).max(screen.top() + 8.0),
-        ),
-    );
+    let menu_w = metrics.inner_w;
+    let pos = clamp_context_menu_pos(menu_pos, screen, metrics.outer_w, metrics.outer_h);
 
-    let flyout_rect_key = Id::new("bubble_translate_flyout_rect");
     let mut translate_row: Option<Rect> = None;
-    let mut menu_frame_rect: Option<Rect> = None;
-    egui::Area::new(Id::new(("active_ctx_menu_area", idx, msg.ts, &msg.id)))
+    let mut translate_hovered = false;
+    let area_resp = egui::Area::new(Id::new(("active_ctx_menu_area", idx, msg.ts, &msg.id)))
         .order(egui::Order::Foreground)
         .fixed_pos(pos)
         .show(ui.ctx(), |ui| {
-            egui::Frame::none()
+            let frame_resp = egui::Frame::none()
                 .fill(if pal.is_dark {
                     Color32::from_rgb(33, 37, 43)
                 } else {
@@ -5555,8 +5763,9 @@ pub(super) fn bubble_context_menu(
                             }
                             // Hover opens the source-language flyout beside the menu.
                             if resp.hovered() {
+                                translate_hovered = true;
                                 ui.ctx().data_mut(|d| {
-                                    d.insert_temp(translate_sub_key, !sub_open);
+                                    d.insert_temp(translate_sub_key, true);
                                 });
                             }
                             translate_row = Some(resp.rect);
@@ -5708,7 +5917,6 @@ pub(super) fn bubble_context_menu(
                     // 7b. Sửa tin (WaveA3): chỉ text của mình trong 15 phút.
                     // recall + gửi mới (hạn chế: bên kia thấy thu hồi + tin mới).
                     {
-                        let now_ms = crate::login::unix_now() * 1000;
                         if crate::chat::can_edit_message(msg, now_ms)
                             && menu_item(ui, lucide::SLIDERS, "Sửa", pal.text_primary).clicked()
                         {
@@ -5756,60 +5964,62 @@ pub(super) fn bubble_context_menu(
                         action = Some(BubbleAction::DeleteForMe);
                         close_menu = true;
                     }
-
-                    let menu_rect = ui.min_rect();
-                    menu_frame_rect = Some(menu_rect);
-                    let pointer_pos = ui
-                        .ctx()
-                        .input(|i| i.pointer.hover_pos().or(i.pointer.interact_pos()));
-                    let flyout_rect: Option<Rect> = ui
-                        .ctx()
-                        .data(|d| d.get_temp(flyout_rect_key));
-                    // Hovering another row of the main menu closes the flyout.
-                    if let (Some(pos), Some(row)) = (ui.ctx().input(|i| i.pointer.hover_pos()), translate_row) {
-                        let in_row_band = pos.y >= row.top() && pos.y <= row.bottom();
-                        if menu_rect.contains(pos) && !in_row_band {
-                            ui.ctx().data_mut(|d| d.remove::<bool>(translate_sub_key));
-                        }
-                    }
-                    let open_time: f64 =
-                        ui.ctx().data(|d| d.get_temp(open_time_key)).unwrap_or(0.0);
-                    if ui.input(|i| i.time) > open_time + 0.05 {
-                        let pressed = ui.ctx().input(|i| i.pointer.any_pressed());
-                        if pressed {
-                            if let Some(pos) = pointer_pos {
-                                let in_flyout = flyout_rect.is_some_and(|r| r.expand(4.0).contains(pos));
-                                if !menu_rect.expand(4.0).contains(pos) && !in_flyout {
-                                    close_menu = true;
-                                }
-                            }
-                        }
-                    }
-                    if ui.ctx().input(|i| i.key_pressed(egui::Key::Escape)) {
-                        close_menu = true;
-                    }
                 });
+            frame_resp.response.rect
+        });
+    let outer_menu_rect = area_resp.inner;
+
+    let (hover_pos, interact_pos, pointer_pressed_or_clicked, esc_pressed, now_time) =
+        ui.ctx().input(|i| {
+            (
+                i.pointer.hover_pos(),
+                i.pointer.interact_pos(),
+                i.pointer.any_pressed() || i.pointer.any_click(),
+                i.key_pressed(egui::Key::Escape),
+                i.time,
+            )
+        });
+    let (prev_sub_open, prev_flyout_rect, open_time): (bool, Option<Rect>, f64) =
+        ui.ctx().data(|d| {
+            (
+                d.get_temp(translate_sub_key).unwrap_or(false),
+                d.get_temp(flyout_rect_key),
+                d.get_temp(open_time_key).unwrap_or(0.0),
+            )
         });
 
-    let sub_open: bool = ui
-        .ctx()
-        .data(|d| d.get_temp(translate_sub_key).unwrap_or(false));
-    match (sub_open && !close_menu, translate_row, menu_frame_rect) {
-        (true, Some(row), Some(menu_rect)) => {
-            const FLY_W: f32 = 150.0;
-            let screen = ui.ctx().screen_rect();
-            // Content rect -> frame edge is the 10 px inner margin.
-            let right_x = menu_rect.right() + 10.0 + 4.0;
-            let x = if right_x + FLY_W + 20.0 <= screen.right() {
-                right_x
+    let next_sub_open = if close_menu {
+        false
+    } else {
+        should_keep_translate_flyout_open(
+            prev_sub_open,
+            translate_hovered,
+            hover_pos,
+            outer_menu_rect,
+            translate_row,
+            prev_flyout_rect,
+        )
+    };
+    if next_sub_open != prev_sub_open {
+        ui.ctx().data_mut(|d| {
+            if next_sub_open {
+                d.insert_temp(translate_sub_key, true);
             } else {
-                menu_rect.left() - 10.0 - 4.0 - FLY_W - 12.0
-            };
-            let fly_h = 9.0 * 31.0 + 12.0;
-            let y = (row.top() - 6.0).min(screen.bottom() - fly_h - 8.0).max(screen.top() + 8.0);
+                d.remove::<bool>(translate_sub_key);
+            }
+        });
+        ui.ctx().request_repaint();
+    }
+
+    let mut current_flyout_rect: Option<Rect> = None;
+    match (next_sub_open && !close_menu, translate_row) {
+        (true, Some(row)) => {
+            const FLY_W: f32 = 150.0;
+            const FLY_H: f32 = 314.0;
+            let fly_pos = translate_flyout_pos(outer_menu_rect, row, screen, FLY_W, FLY_H);
             let shown = egui::Area::new(Id::new(("bubble_translate_flyout", idx, msg.ts, &msg.id)))
                 .order(egui::Order::Foreground)
-                .fixed_pos(Pos2::new(x, y))
+                .fixed_pos(fly_pos)
                 .show(ui.ctx(), |ui| {
                     egui::Frame::none()
                         .fill(if pal.is_dark {
@@ -5853,6 +6063,7 @@ pub(super) fn bubble_context_menu(
                         });
                 });
             let r = shown.response.rect;
+            current_flyout_rect = Some(r);
             ui.ctx().data_mut(|d| d.insert_temp(flyout_rect_key, r));
         }
         _ => {
@@ -5860,12 +6071,30 @@ pub(super) fn bubble_context_menu(
         }
     }
 
+    if !close_menu {
+        let dismiss_pos = interact_pos.or(hover_pos);
+        if esc_pressed
+            || should_dismiss_context_menu_on_pointer(
+                now_time,
+                open_time,
+                pointer_pressed_or_clicked,
+                dismiss_pos,
+                outer_menu_rect,
+                current_flyout_rect,
+                next_sub_open,
+            )
+        {
+            close_menu = true;
+        }
+    }
+
     if close_menu {
-        ui.ctx().data_mut(|d| d.remove::<Rect>(flyout_rect_key));
-        ui.ctx()
-            .data_mut(|d| d.remove::<(String, Pos2, usize)>(ctx_menu_key));
-        ui.ctx()
-            .data_mut(|d| d.remove::<bool>(translate_sub_key));
+        ui.ctx().data_mut(|d| {
+            d.remove::<Rect>(flyout_rect_key);
+            d.remove::<(String, Pos2, usize)>(ctx_menu_key);
+            d.remove::<bool>(translate_sub_key);
+            d.remove::<f64>(open_time_key);
+        });
         ui.ctx().request_repaint();
     }
 
@@ -6297,15 +6526,14 @@ pub(super) fn render_hover_reaction_bar(
                             .on_hover_text("Thêm tùy chọn")
                             .clicked()
                         {
-                            let ctx_menu_key = Id::new("active_bubble_context_menu");
-                            let open_time_key = Id::new("active_bubble_context_menu_time");
                             let current_time = ui.ctx().input(|i| i.time);
-                            ui.ctx().data_mut(|d| {
-                                d.insert_temp(ctx_menu_key, (msg_key.clone(), menu_anchor, idx));
-                                d.insert_temp(open_time_key, current_time);
-                                d.remove::<String>(hover_id);
-                            });
-                            ui.ctx().request_repaint();
+                            open_bubble_context_menu(
+                                ui.ctx(),
+                                msg_key.clone(),
+                                menu_anchor,
+                                idx,
+                                current_time,
+                            );
                         }
                     });
                 });
@@ -7892,5 +8120,720 @@ mod md_block_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod msg_ui_regression_tests {
+    use super::*;
+
+    fn draw_single_bubble(
+        ctx: &egui::Context,
+        msg: &ChatMessage,
+        screen: Rect,
+        time: f64,
+        events: Vec<egui::Event>,
+        occlude_pos: Option<Pos2>,
+    ) -> (Option<BubbleAction>, egui::FullOutput) {
+        let mut action = None;
+        let empty_tex = HashMap::new();
+        let mut loading = HashSet::new();
+        let failed = HashMap::new();
+        let out = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                time: Some(time),
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    action = render_chat_bubble(
+                        ui,
+                        msg,
+                        false,
+                        false,
+                        msg.is_outgoing,
+                        false,
+                        "Tester",
+                        None,
+                        &ThemePalette::dark(),
+                        &empty_tex,
+                        &mut loading,
+                        &failed,
+                        &empty_tex,
+                        0,
+                        &[],
+                        None,
+                        false,
+                        None,
+                        false,
+                        None,
+                        MdOptions::default(),
+                    );
+                });
+                if let Some(op) = occlude_pos {
+                    egui::Area::new(Id::new("test_occluding_overlay"))
+                        .order(egui::Order::Foreground)
+                        .fixed_pos(op - Vec2::new(40.0, 40.0))
+                        .show(ctx, |ui| {
+                            let _ = ui.allocate_exact_size(
+                                Vec2::new(80.0, 80.0),
+                                Sense::click_and_drag(),
+                            );
+                        });
+                }
+            },
+        );
+        (action, out)
+    }
+
+    #[test]
+    fn double_click_reply_works_without_deadlock_and_respects_top_layer() {
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(720.0, 520.0));
+        for is_outgoing in [true, false] {
+            let ctx = egui::Context::default();
+            let msg = ChatMessage {
+                id: format!("dbl-{is_outgoing}"),
+                text: "Double click target message".into(),
+                sender: if is_outgoing { "Bạn" } else { "An" }.into(),
+                is_outgoing,
+                ts: 1_700_000_123,
+                ..Default::default()
+            };
+            let (_, out0) = draw_single_bubble(&ctx, &msg, screen, 0.1, Vec::new(), None);
+            let click_pos = out0
+                .shapes
+                .iter()
+                .find_map(|s| match &s.shape {
+                    egui::Shape::Text(t) if t.galley.job.text.contains("Double click target") => {
+                        Some(t.pos + Vec2::new(8.0, 6.0))
+                    }
+                    _ => None,
+                })
+                .expect("bubble text must render");
+
+            let steps = [
+                (0.20, true),
+                (0.22, false),
+                (0.28, true),
+                (0.30, false),
+            ];
+            let mut last_action = None;
+            for (t, pressed) in steps {
+                let events = vec![
+                    egui::Event::PointerMoved(click_pos),
+                    egui::Event::PointerButton {
+                        pos: click_pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ];
+                let (act, _) = draw_single_bubble(&ctx, &msg, screen, t, events, None);
+                last_action = act;
+            }
+            assert!(
+                matches!(last_action, Some(BubbleAction::Reply)),
+                "expected Reply on double-click for is_outgoing={is_outgoing}"
+            );
+
+            let ctx_occ = egui::Context::default();
+            let _ = draw_single_bubble(&ctx_occ, &msg, screen, 0.1, Vec::new(), Some(click_pos));
+            let mut occluded_action = None;
+            for (t, pressed) in steps {
+                let events = vec![
+                    egui::Event::PointerMoved(click_pos),
+                    egui::Event::PointerButton {
+                        pos: click_pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ];
+                let (act, _) =
+                    draw_single_bubble(&ctx_occ, &msg, screen, t, events, Some(click_pos));
+                occluded_action = act;
+            }
+            assert!(
+                occluded_action.is_none(),
+                "occluded top layer must suppress double-click reply"
+            );
+        }
+    }
+
+    #[test]
+    fn translate_flyout_hover_is_idempotent_bridges_corridor_and_closes_on_other_rows() {
+        let ctx = egui::Context::default();
+        let msg = ChatMessage {
+            id: "ctx-flyout".into(),
+            text: "Hello world translate".into(),
+            sender: "An".into(),
+            ts: 1_700_000_200,
+            ..Default::default()
+        };
+        let bubble_rect = Rect::from_min_size(Pos2::new(60.0, 80.0), Vec2::new(180.0, 44.0));
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(960.0, 720.0));
+        let open_pos = bubble_rect.center();
+
+        for (t, events) in [
+            (1.0, vec![egui::Event::PointerMoved(open_pos)]),
+            (
+                1.05,
+                vec![
+                    egui::Event::PointerMoved(open_pos),
+                    egui::Event::PointerButton {
+                        pos: open_pos,
+                        button: egui::PointerButton::Secondary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            ),
+            (
+                1.10,
+                vec![
+                    egui::Event::PointerMoved(open_pos),
+                    egui::Event::PointerButton {
+                        pos: open_pos,
+                        button: egui::PointerButton::Secondary,
+                        pressed: false,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            ),
+        ] {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    time: Some(t),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let br = ui.interact(bubble_rect, Id::new("b_fly"), Sense::hover());
+                        let _ = bubble_context_menu(
+                            ui,
+                            &br,
+                            &msg,
+                            0,
+                            &ThemePalette::dark(),
+                            &HashMap::new(),
+                            false,
+                            "An",
+                            false,
+                        );
+                    });
+                },
+            );
+        }
+
+        let mut translate_pos = None;
+        let mut pin_pos = None;
+        let mut delete_pos_before = None;
+        let out_menu = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                time: Some(1.15),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let br = ui.interact(bubble_rect, Id::new("b_fly"), Sense::hover());
+                    let _ = bubble_context_menu(
+                        ui,
+                        &br,
+                        &msg,
+                        0,
+                        &ThemePalette::dark(),
+                        &HashMap::new(),
+                        false,
+                        "An",
+                        false,
+                    );
+                });
+            },
+        );
+        for s in &out_menu.shapes {
+            if let egui::Shape::Text(t) = &s.shape {
+                if t.galley.job.text == "Dịch tin nhắn" {
+                    translate_pos = Some(t.pos + Vec2::new(20.0, 4.0));
+                } else if t.galley.job.text == "Ghim tin nhắn" {
+                    pin_pos = Some(t.pos + Vec2::new(20.0, 4.0));
+                } else if t.galley.job.text == "Xóa chỉ ở phía tôi" {
+                    delete_pos_before = Some(t.pos);
+                }
+            }
+        }
+        let translate_pos = translate_pos.expect("Dịch tin nhắn row must exist");
+        let pin_pos = pin_pos.expect("Ghim tin nhắn row must exist");
+        let delete_pos_before = delete_pos_before.expect("Xóa chỉ ở phía tôi row must exist");
+
+        let mut flyout_item_pos = None;
+        for step in 0..5 {
+            let out_hover = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    time: Some(1.20 + step as f64 * 0.02),
+                    events: vec![egui::Event::PointerMoved(translate_pos)],
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let br = ui.interact(bubble_rect, Id::new("b_fly"), Sense::hover());
+                        let _ = bubble_context_menu(
+                            ui,
+                            &br,
+                            &msg,
+                            0,
+                            &ThemePalette::dark(),
+                            &HashMap::new(),
+                            false,
+                            "An",
+                            false,
+                        );
+                    });
+                },
+            );
+            let sub_open: bool = ctx.data(|d| {
+                d.get_temp(Id::new(BUBBLE_TRANSLATE_SUB_KEY))
+                    .unwrap_or(false)
+            });
+            assert!(
+                sub_open,
+                "hovering Dịch tin nhắn must keep submenu open at step {step} (no 60fps blink)"
+            );
+            for s in &out_hover.shapes {
+                if let egui::Shape::Text(t) = &s.shape {
+                    if t.galley.job.text == "Xóa chỉ ở phía tôi" {
+                        assert!(
+                            (t.pos.y - delete_pos_before.y).abs() < 0.5,
+                            "main menu Y must NOT shift when flyout opens: before={} after={}",
+                            delete_pos_before.y,
+                            t.pos.y
+                        );
+                    }
+                    if t.galley.job.text == "Tiếng Anh" {
+                        flyout_item_pos = Some(t.pos + Vec2::new(15.0, 4.0));
+                    }
+                }
+            }
+        }
+
+        let flyout_rect: Rect = ctx
+            .data(|d| d.get_temp(Id::new(BUBBLE_FLYOUT_RECT_KEY)))
+            .expect("flyout rect must be recorded");
+        let flyout_item_pos = flyout_item_pos.expect("flyout language item must render");
+        let corridor_pos = Pos2::new(flyout_rect.left() - 2.0, translate_pos.y + 4.0);
+
+        for probe in [corridor_pos, flyout_item_pos] {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    time: Some(1.40),
+                    events: vec![egui::Event::PointerMoved(probe)],
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let br = ui.interact(bubble_rect, Id::new("b_fly"), Sense::hover());
+                        let _ = bubble_context_menu(
+                            ui,
+                            &br,
+                            &msg,
+                            0,
+                            &ThemePalette::dark(),
+                            &HashMap::new(),
+                            false,
+                            "An",
+                            false,
+                        );
+                    });
+                },
+            );
+            let sub_open: bool = ctx.data(|d| {
+                d.get_temp(Id::new(BUBBLE_TRANSLATE_SUB_KEY))
+                    .unwrap_or(false)
+            });
+            assert!(
+                sub_open,
+                "submenu must stay open in corridor/flyout at {probe:?}"
+            );
+        }
+
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                time: Some(1.50),
+                events: vec![egui::Event::PointerMoved(pin_pos)],
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let br = ui.interact(bubble_rect, Id::new("b_fly"), Sense::hover());
+                    let _ = bubble_context_menu(
+                        ui,
+                        &br,
+                        &msg,
+                        0,
+                        &ThemePalette::dark(),
+                        &HashMap::new(),
+                        false,
+                        "An",
+                        false,
+                    );
+                });
+            },
+        );
+        let sub_open_after_other_row: bool = ctx.data(|d| {
+            d.get_temp(Id::new(BUBBLE_TRANSLATE_SUB_KEY))
+                .unwrap_or(false)
+        });
+        assert!(
+            !sub_open_after_other_row,
+            "moving to another main-menu row must close flyout"
+        );
+    }
+
+    #[test]
+    fn context_menu_height_fits_bottom_delete_row_without_clipping() {
+        let mut msg = ChatMessage {
+            id: "photo-ctx-h".into(),
+            text: "[Hình ảnh] caption".into(),
+            sender: "Bạn".into(),
+            is_outgoing: true,
+            edited: true,
+            link_src: Some("Hình ảnh Zalo".into()),
+            link_url: Some("https://b-f17-zpcloud.zdn.vn/1/photo.jpg".into()),
+            reactions: vec!["👍".into()],
+            ts: 1_700_000_300,
+            ..Default::default()
+        };
+        let m1 = compute_context_menu_metrics(&msg, 1_700_000_300_000);
+        msg.edited = false;
+        let m2 = compute_context_menu_metrics(&msg, 1_700_000_400_000);
+        assert!(m1.outer_h > m2.outer_h);
+
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 620.0));
+        let ctx = egui::Context::default();
+        ctx.data_mut(|d| {
+            d.insert_temp(
+                Id::new(BUBBLE_CTX_MENU_KEY),
+                (format!("{}_{}", msg.id, msg.ts), Pos2::new(300.0, 590.0), 0usize),
+            );
+            d.insert_temp(Id::new(BUBBLE_CTX_OPEN_TIME_KEY), 1.0_f64);
+        });
+        let bubble_rect = Rect::from_min_size(Pos2::new(200.0, 480.0), Vec2::new(160.0, 60.0));
+        let mut out = Default::default();
+        for t in [1.10, 1.15] {
+            out = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    time: Some(t),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let br = ui.interact(bubble_rect, Id::new("b_clip"), Sense::hover());
+                        let _ = bubble_context_menu(
+                            ui,
+                            &br,
+                            &msg,
+                            0,
+                            &ThemePalette::dark(),
+                            &HashMap::new(),
+                            true,
+                            "Bạn",
+                            false,
+                        );
+                    });
+                },
+            );
+        }
+        let delete_y = out
+            .shapes
+            .iter()
+            .find_map(|s| match &s.shape {
+                egui::Shape::Text(t) if t.galley.job.text == "Xóa chỉ ở phía tôi" => Some(t.pos.y),
+                _ => None,
+            })
+            .expect("bottom delete row must render");
+        assert!(
+            delete_y + 20.0 <= screen.bottom(),
+            "Xóa chỉ ở phía tôi must not be clipped below screen bottom ({delete_y} vs {})",
+            screen.bottom()
+        );
+    }
+
+    #[test]
+    fn hover_bar_more_button_syncs_open_time_and_dismisses_in_one_outside_click() {
+        let ctx = egui::Context::default();
+        let msg = ChatMessage {
+            id: "hover-more-sync".into(),
+            text: "Sync key test".into(),
+            sender: "An".into(),
+            ts: 1_700_000_400,
+            ..Default::default()
+        };
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0));
+        let bubble_rect = Rect::from_min_size(Pos2::new(100.0, 140.0), Vec2::new(160.0, 44.0));
+
+        ctx.data_mut(|d| {
+            d.insert_temp(Id::new(BUBBLE_TRANSLATE_SUB_KEY), true);
+            d.insert_temp(
+                Id::new(BUBBLE_FLYOUT_RECT_KEY),
+                Rect::from_min_size(Pos2::new(500.0, 200.0), Vec2::new(150.0, 280.0)),
+            );
+        });
+
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                time: Some(2.0),
+                events: vec![egui::Event::PointerMoved(bubble_rect.center())],
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let _ = render_hover_reaction_bar(
+                        ui,
+                        bubble_rect,
+                        &msg,
+                        0,
+                        false,
+                        &ThemePalette::dark(),
+                        &HashMap::new(),
+                    );
+                });
+            },
+        );
+        let out_bar = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                time: Some(2.03),
+                events: vec![egui::Event::PointerMoved(bubble_rect.center())],
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let _ = render_hover_reaction_bar(
+                        ui,
+                        bubble_rect,
+                        &msg,
+                        0,
+                        false,
+                        &ThemePalette::dark(),
+                        &HashMap::new(),
+                    );
+                });
+            },
+        );
+        let (_, bar_rect, _): (String, Rect, u64) = ctx
+            .data(|d| d.get_temp(Id::new("active_hover_reaction_bubble").with("state")))
+            .expect("hover bar must appear");
+        let more_pos = out_bar
+            .shapes
+            .iter()
+            .filter_map(|s| match &s.shape {
+                egui::Shape::Circle(c) if (c.radius - 1.4).abs() < 0.2 => Some(c.center),
+                _ => None,
+            })
+            .nth(1)
+            .unwrap_or(Pos2::new(bar_rect.right() - 15.0, bar_rect.center().y));
+
+        for (t, pressed) in [(2.06, None), (2.10, Some(true)), (2.12, Some(false))] {
+            let mut events = vec![egui::Event::PointerMoved(more_pos)];
+            if let Some(p) = pressed {
+                events.push(egui::Event::PointerButton {
+                    pos: more_pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: p,
+                    modifiers: egui::Modifiers::NONE,
+                });
+            }
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    time: Some(t),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let _ = render_hover_reaction_bar(
+                            ui,
+                            bubble_rect,
+                            &msg,
+                            0,
+                            false,
+                            &ThemePalette::dark(),
+                            &HashMap::new(),
+                        );
+                        let br = ui.interact(bubble_rect, Id::new("b_sync"), Sense::hover());
+                        let _ = bubble_context_menu(
+                            ui,
+                            &br,
+                            &msg,
+                            0,
+                            &ThemePalette::dark(),
+                            &HashMap::new(),
+                            false,
+                            "An",
+                            false,
+                        );
+                    });
+                },
+            );
+        }
+
+        let open_time: Option<f64> = ctx.data(|d| d.get_temp(Id::new(BUBBLE_CTX_OPEN_TIME_KEY)));
+        assert_eq!(open_time, Some(2.12));
+        let stale_sub: Option<bool> = ctx.data(|d| d.get_temp(Id::new(BUBBLE_TRANSLATE_SUB_KEY)));
+        assert!(stale_sub.is_none(), "stale translate submenu must be cleared");
+        let stale_flyout: Option<Rect> =
+            ctx.data(|d| d.get_temp(Id::new(BUBBLE_FLYOUT_RECT_KEY)));
+        assert!(stale_flyout.is_none(), "stale flyout rect must be cleared");
+
+        let menu_active: Option<(String, Pos2, usize)> =
+            ctx.data(|d| d.get_temp(Id::new(BUBBLE_CTX_MENU_KEY)));
+        assert!(menu_active.is_some(), "menu must remain open right after ... click");
+
+        let outside_pos = Pos2::new(760.0, 560.0);
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                time: Some(2.30),
+                events: vec![
+                    egui::Event::PointerMoved(outside_pos),
+                    egui::Event::PointerButton {
+                        pos: outside_pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let br = ui.interact(bubble_rect, Id::new("b_sync"), Sense::hover());
+                    let _ = bubble_context_menu(
+                        ui,
+                        &br,
+                        &msg,
+                        0,
+                        &ThemePalette::dark(),
+                        &HashMap::new(),
+                        false,
+                        "An",
+                        false,
+                    );
+                });
+            },
+        );
+        let menu_after_outside_click: Option<(String, Pos2, usize)> =
+            ctx.data(|d| d.get_temp(Id::new(BUBBLE_CTX_MENU_KEY)));
+        assert!(
+            menu_after_outside_click.is_none(),
+            "single outside click must dismiss context menu immediately"
+        );
+    }
+
+    #[test]
+    fn dismiss_geometry_protects_outer_frame_padding_and_active_flyout() {
+        let outer = Rect::from_min_size(Pos2::new(100.0, 100.0), Vec2::new(216.0, 360.0));
+        let flyout = Rect::from_min_size(Pos2::new(320.0, 200.0), Vec2::new(162.0, 314.0));
+        assert!(!should_dismiss_context_menu_on_pointer(
+            2.0,
+            1.0,
+            true,
+            Some(Pos2::new(103.0, 103.0)),
+            outer,
+            None,
+            false,
+        ));
+        assert!(!should_dismiss_context_menu_on_pointer(
+            2.0,
+            1.0,
+            true,
+            Some(flyout.center()),
+            outer,
+            Some(flyout),
+            true,
+        ));
+        assert!(should_dismiss_context_menu_on_pointer(
+            2.0,
+            1.0,
+            true,
+            Some(flyout.center()),
+            outer,
+            Some(flyout),
+            false,
+        ));
+        assert!(should_dismiss_context_menu_on_pointer(
+            2.0,
+            1.0,
+            true,
+            Some(Pos2::new(50.0, 50.0)),
+            outer,
+            Some(flyout),
+            true,
+        ));
+    }
+
+    #[test]
+    fn photo_placeholder_keeps_caption_strictly_below_grey_box() {
+        let ctx = egui::Context::default();
+        let caption_text = "SƠN THỦY VĨNH TƯỜNG\n💎 GIÁ VÀNG CẬP NHẬT NGÀY 24/11/2026\nhttps://vangbacsonthuy.com";
+        let msg = ChatMessage {
+            id: "photo-placeholder-overlap".into(),
+            text: format!("[Hình ảnh] {caption_text}"),
+            sender: "Sơn Thủy Vĩnh Tường".into(),
+            is_outgoing: false,
+            link_src: Some("Hình ảnh Zalo".into()),
+            link_url: Some("https://b-f17-zpcloud.zdn.vn/1/gold.jpg".into()),
+            link_title: Some(caption_text.into()),
+            link_desc: Some(caption_text.into()),
+            ts: 1_700_000_500,
+            ..Default::default()
+        };
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(720.0, 640.0));
+        let (_, out) = draw_single_bubble(&ctx, &msg, screen, 0.1, Vec::new(), None);
+
+        let placeholder_rect = out
+            .shapes
+            .iter()
+            .find_map(|s| match &s.shape {
+                egui::Shape::Rect(r) if (r.rect.height() - 150.0).abs() < 2.0 => Some(r.rect),
+                _ => None,
+            })
+            .expect("150px photo placeholder rect must render");
+
+        let mut saw_loading_label = false;
+        let mut saw_caption = false;
+        for s in &out.shapes {
+            if let egui::Shape::Text(t) = &s.shape {
+                let txt = &t.galley.job.text;
+                if txt == "Đang tải hình ảnh..." {
+                    saw_loading_label = true;
+                    assert!(
+                        placeholder_rect.contains(t.pos),
+                        "loading status label should sit inside placeholder box"
+                    );
+                }
+                if txt.contains("SƠN THỦY VĨNH TƯỜNG") || txt.contains("GIÁ VÀNG CẬP NHẬT") {
+                    saw_caption = true;
+                    assert!(
+                        t.pos.y >= placeholder_rect.bottom(),
+                        "caption text must sit strictly below placeholder ({} < {})",
+                        t.pos.y,
+                        placeholder_rect.bottom()
+                    );
+                }
+            }
+        }
+        assert!(saw_loading_label, "placeholder status label must render");
+        assert!(saw_caption, "photo caption must render below placeholder");
     }
 }
