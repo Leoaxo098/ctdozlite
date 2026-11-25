@@ -1046,6 +1046,9 @@ impl ZaloGuiApp {
         }
 
         // 2. Standard toast notice
+        if !super::toast_overlay_allows_standard_toast(is_locked) {
+            return;
+        }
         let Some((ref text, ts)) = self.toast_notice else {
             return;
         };
@@ -2252,6 +2255,7 @@ impl ZaloGuiApp {
 
                                             if let Some(target) = delete_target {
                                                 let _ = crate::account_manager::delete_saved_account(&target);
+                                                self.refresh_saved_credentials_cache();
                                             }
 
                                             ui.add_space(14.0);
@@ -8196,6 +8200,7 @@ impl ZaloGuiApp {
                 Ok(()) => self.show_toast("Đã xóa tài khoản đã lưu khỏi thiết bị"),
                 Err(e) => self.show_toast(format!("⚠️ {e}")),
             }
+            self.refresh_saved_credentials_cache();
         }
     }
 

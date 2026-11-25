@@ -670,7 +670,7 @@ fn prop_app_lock_pbkdf2_roundtrip_and_tamper_rejection() {
 
     let tmp = PropTempDir::new("pbkdf2-tamper", 0xA991_0C01);
     for round in 0..4u64 {
-        let mode = if round % 2 == 0 {
+        let mode = if round.is_multiple_of(2) {
             PasscodeMode::Pin4
         } else {
             PasscodeMode::Custom
@@ -743,12 +743,12 @@ fn prop_app_lock_pbkdf2_roundtrip_and_tamper_rejection() {
 
     for sweep in 0..120u64 {
         let iter = 16 + (sweep as u32 % 64);
-        let pass = if sweep % 2 == 0 {
+        let pass = if sweep.is_multiple_of(2) {
             gen_pin4(&mut rng)
         } else {
             gen_custom_passcode(&mut rng, None)
         };
-        let wrong = if sweep % 2 == 0 {
+        let wrong = if sweep.is_multiple_of(2) {
             mutate_pin4(&pass)
         } else {
             mutate_custom(&pass)
@@ -819,7 +819,7 @@ fn prop_app_lock_lockout_persists_across_reload_and_clamps_clock_rollback() {
     base_salt[8..].copy_from_slice(&rng.next_u64().to_le_bytes());
 
     for round in 0..4u64 {
-        let mode = if round % 2 == 0 {
+        let mode = if round.is_multiple_of(2) {
             PasscodeMode::Pin4
         } else {
             PasscodeMode::Custom

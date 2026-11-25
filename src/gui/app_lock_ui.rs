@@ -81,6 +81,53 @@ fn format_verify_error(outcome: VerifyOutcome) -> String {
     }
 }
 
+/// Resolve inline Settings error text while keeping lockout countdowns live and clearing
+/// stale lockout notices once the cooldown expires.
+fn resolve_settings_error_text(
+    cfg: &AppLockConfig,
+    settings_error: &mut Option<String>,
+    now_unix: i64,
+) -> Option<(String, bool)> {
+    let lockout_rem = cfg.remaining_lockout_secs(now_unix);
+    if lockout_rem > 0 {
+        let msg = format_verify_error(VerifyOutcome::LockedOut {
+            remaining_secs: lockout_rem,
+        });
+        *settings_error = Some(msg.clone());
+        Some((msg, true))
+    } else {
+        if settings_error
+            .as_deref()
+            .is_some_and(|s| s.starts_with("Quá nhiều lần nhập sai"))
+        {
+            *settings_error = None;
+        }
+        settings_error.clone().map(|msg| (msg, false))
+    }
+}
+
+/// Render inline verification or lockout errors for Settings `Changing` / `Disabling` panels.
+fn render_settings_panel_error(
+    ui: &mut egui::Ui,
+    ctx: &egui::Context,
+    pal: &ThemePalette,
+    cfg: &AppLockConfig,
+    settings_error: &mut Option<String>,
+) {
+    let now_unix = crate::login::unix_now();
+    if let Some((err, active_lockout)) = resolve_settings_error_text(cfg, settings_error, now_unix) {
+        if active_lockout {
+            ctx.request_repaint_after(Duration::from_millis(500));
+        }
+        ui.add_space(6.0);
+        ui.label(
+            RichText::new(err)
+                .color(pal.danger_text)
+                .size(12.2),
+        );
+    }
+}
+
 /// Render a single-line masked passcode input inside a themed frame; returns `(response, enter_pressed)`.
 fn render_passcode_field(
     ui: &mut egui::Ui,
@@ -675,14 +722,13 @@ impl ZaloGuiApp {
                             "Nhập lại mã khoá để xác nhận",
                             false,
                         );
-                        if let Some(ref err) = self.app_lock_ui.settings_error {
-                            ui.add_space(6.0);
-                            ui.label(
-                                RichText::new(err)
-                                    .color(pal.danger_text)
-                                    .size(12.2),
-                            );
-                        }
+                        render_settings_panel_error(
+                            ui,
+                            ctx,
+                            pal,
+                            &self.app_lock_config,
+                            &mut self.app_lock_ui.settings_error,
+                        );
                         ui.add_space(10.0);
                         ui.horizontal(|ui| {
                             let save_btn = egui::Button::new(
@@ -836,14 +882,13 @@ impl ZaloGuiApp {
                             "Nhập lại mã khoá mới",
                             false,
                         );
-                        if let Some(ref err) = self.app_lock_ui.settings_error {
-                            ui.add_space(6.0);
-                            ui.label(
-                                RichText::new(err)
-                                    .color(pal.danger_text)
-                                    .size(12.2),
-                            );
-                        }
+                        render_settings_panel_error(
+                            ui,
+                            ctx,
+                            pal,
+                            &self.app_lock_config,
+                            &mut self.app_lock_ui.settings_error,
+                        );
                         ui.add_space(8.0);
                         ui.horizontal(|ui| {
                             let apply_btn = egui::Button::new(
@@ -900,6 +945,11 @@ impl ZaloGuiApp {
                                             self.app_lock_ui.draft_current.clear();
                                             self.app_lock_ui.settings_error =
                                                 Some(format_verify_error(outcome));
+                                            if self.app_lock_config.remaining_lockout_secs(now) > 0 {
+                                                ctx.request_repaint_after(Duration::from_millis(
+                                                    500,
+                                                ));
+                                            }
                                             ctx.request_repaint();
                                         }
                                         Err(err) => {
@@ -937,14 +987,13 @@ impl ZaloGuiApp {
                             "Nhập mã khoá hiện tại",
                             false,
                         );
-                        if let Some(ref err) = self.app_lock_ui.settings_error {
-                            ui.add_space(6.0);
-                            ui.label(
-                                RichText::new(err)
-                                    .color(pal.danger_text)
-                                    .size(12.2),
-                            );
-                        }
+                        render_settings_panel_error(
+                            ui,
+                            ctx,
+                            pal,
+                            &self.app_lock_config,
+                            &mut self.app_lock_ui.settings_error,
+                        );
                         ui.add_space(8.0);
                         ui.horizontal(|ui| {
                             let disable_btn = egui::Button::new(
@@ -989,6 +1038,9 @@ impl ZaloGuiApp {
                                         let _ = persist_app_lock_config(&self.app_lock_config);
                                         self.app_lock_ui.settings_error =
                                             Some(format_verify_error(outcome));
+                                        if self.app_lock_config.remaining_lockout_secs(now) > 0 {
+                                            ctx.request_repaint_after(Duration::from_millis(500));
+                                        }
                                         ctx.request_repaint();
                                     }
                                 }
@@ -1090,8 +1142,8 @@ impl ZaloGuiApp {
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_pin4_submit, format_verify_error, idle_timeout_label, sanitize_passcode_draft,
-        sanitize_pin4_input, Pin4SubmitAction,
+        classify_pin4_submit, format_verify_error, idle_timeout_label,
+        resolve_settings_error_text, sanitize_passcode_draft, sanitize_pin4_input, Pin4SubmitAction,
     };
     use crate::app_lock::{PasscodeMode, VerifyOutcome, IDLE_PRESETS_SECS};
 
@@ -1133,5 +1185,32 @@ mod tests {
         );
         assert_eq!(classify_pin4_submit("1234", false), Pin4SubmitAction::Submit);
         assert_eq!(classify_pin4_submit("1234", true), Pin4SubmitAction::Submit);
+    }
+
+    #[test]
+    fn settings_panel_lockout_error_updates_live_countdown_and_clears_on_expiry() {
+        let mut cfg = crate::app_lock::AppLockConfig::create_enabled(
+            PasscodeMode::Pin4,
+            "4242",
+        )
+        .unwrap();
+        cfg.lockout_until_unix = 1_700_000_030;
+        let mut settings_error = Some(format_verify_error(VerifyOutcome::LockedOut {
+            remaining_secs: 30,
+        }));
+
+        let (msg_mid, repaint) =
+            resolve_settings_error_text(&cfg, &mut settings_error, 1_700_000_018).unwrap();
+        assert!(repaint);
+        assert!(msg_mid.contains("12"));
+
+        assert!(resolve_settings_error_text(&cfg, &mut settings_error, 1_700_000_030).is_none());
+        assert!(settings_error.is_none());
+
+        let mut custom_err = Some("Mã xác nhận không khớp".to_string());
+        let (msg_other, repaint_other) =
+            resolve_settings_error_text(&cfg, &mut custom_err, 1_700_000_035).unwrap();
+        assert!(!repaint_other);
+        assert_eq!(msg_other, "Mã xác nhận không khớp");
     }
 }

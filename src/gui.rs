@@ -1733,8 +1733,69 @@ fn title_bar_shows_update_pill(
 }
 
 /// Decide whether the Quick-Lock button appears in the custom title bar.
-fn title_bar_shows_lock_button(app_locked: bool, is_logged_in: bool, enabled: bool) -> bool {
-    !app_locked && (is_logged_in || enabled)
+fn title_bar_shows_lock_button(
+    app_locked: bool,
+    has_session_or_saved_creds: bool,
+    _enabled: bool,
+) -> bool {
+    !app_locked && has_session_or_saved_creds
+}
+
+/// Return whether standard floating toast overlays may render (suppressed while locked).
+pub(super) fn toast_overlay_allows_standard_toast(app_locked: bool) -> bool {
+    !app_locked
+}
+
+/// Mask toast text and scrub file-reveal metadata while lock-screen notification hiding is active.
+fn prepare_toast_payload(
+    app_locked: bool,
+    hide_notifications_when_locked: bool,
+    raw: String,
+    reveal_path: Option<String>,
+) -> (String, Option<String>) {
+    let masked = crate::app_lock::mask_toast_text(
+        app_locked,
+        hide_notifications_when_locked,
+        "Thông báo mới",
+        raw,
+    );
+    let safe_reveal = if app_locked && hide_notifications_when_locked {
+        None
+    } else {
+        reveal_path
+    };
+    (masked, safe_reveal)
+}
+
+/// Return true only when an active call overlay represents a live call (not a closed error dialog).
+fn is_live_active_call(call: Option<&ActiveCallOverlay>) -> bool {
+    call.is_some_and(|c| c.error_reason.is_none())
+}
+
+/// Build OS reaction notification `(title, body)` payloads, collapsing into one masked banner
+/// when lock-screen notification hiding is active.
+#[cfg(any(not(target_os = "windows"), test))]
+fn reaction_os_notify_payloads(
+    mask_notifications: bool,
+    masked_reactions: &[(String, String, Option<String>, bool, String)],
+) -> Vec<(String, String)> {
+    if masked_reactions.is_empty() {
+        return Vec::new();
+    }
+    if mask_notifications {
+        vec![crate::app_lock::mask_notification_content(
+            true,
+            true,
+            "",
+            "",
+            masked_reactions.len(),
+        )]
+    } else {
+        masked_reactions
+            .iter()
+            .map(|(_, title, _, _, body)| (title.clone(), body.clone()))
+            .collect()
+    }
 }
 
 /// Right-side top-edge width reserved for title-bar control buttons in frameless resize hit-testing.
@@ -1765,6 +1826,8 @@ pub struct ZaloGuiApp {
     /// Saved accounts listed in the account menu; refreshed when the menu opens so the
     /// directory scan stays off the per-frame path.
     pub(crate) account_menu_accounts: Vec<crate::account_manager::AccountProfile>,
+    /// Cached flag indicating saved session credentials exist on disk, avoiding per-frame scans.
+    has_saved_credentials_cached: bool,
 
     // Login screen state
     login_tab: LoginTab,
@@ -2198,6 +2261,7 @@ impl ZaloGuiApp {
             pending_add_account_uin: None,
             background_unread: HashMap::new(),
             account_menu_accounts: Vec::new(),
+            has_saved_credentials_cached: has_creds,
             login_tab: LoginTab::QrCode,
             phone_input: String::new(),
             password_input: String::new(),
@@ -3434,6 +3498,7 @@ impl ZaloGuiApp {
                     // đổi sang tài khoản khác PHẢI clear sạch state cũ (#119).
                     let is_refresh = self.is_logged_in && self.user_uin == uin;
                     self.is_logged_in = true;
+                    self.has_saved_credentials_cached = true;
                     self.pending_add_account_uin = None;
                     self.user_name = name;
                     self.user_uin = uin;
@@ -3909,6 +3974,7 @@ impl ZaloGuiApp {
                 }
                 GuiEvent::LoggedOut => {
                     self.reset_session_ui_after_logout();
+                    self.refresh_saved_credentials_cache();
                 }
                 GuiEvent::AccountSwitched {
                     uin,
@@ -3920,6 +3986,7 @@ impl ZaloGuiApp {
                     // ở đây phòng trường hợp GUI còn draft treo chưa kịp lưu.
                     self.flush_group_note_pending();
                     self.is_logged_in = true;
+                    self.has_saved_credentials_cached = true;
                     self.pending_add_account_uin = None;
                     self.user_uin = uin;
                     crate::account_manager::set_active_uin(&self.user_uin);
@@ -4358,8 +4425,11 @@ impl ZaloGuiApp {
                             ctx.request_repaint();
                         }
                         #[cfg(not(target_os = "windows"))]
-                        for (_, title, _, _, body) in &masked_reactions {
-                            crate::os_notify::notify(title, body);
+                        for (title, body) in reaction_os_notify_payloads(
+                            self.should_mask_notifications(),
+                            &masked_reactions,
+                        ) {
+                            crate::os_notify::notify(&title, &body);
                         }
                         if reactions_sound_on {
                             #[cfg(target_os = "windows")]
@@ -5548,7 +5618,7 @@ impl ZaloGuiApp {
                             self.app_lock_ui.last_activity_ui_time,
                             now_ui,
                             self.app_lock_config.idle_timeout_secs,
-                            self.active_call.is_some(),
+                            is_live_active_call(self.active_call.as_ref()),
                         )
                     {
                         self.try_trigger_lock(ctx);
@@ -5560,6 +5630,7 @@ impl ZaloGuiApp {
                     self.qr_texture = None;
                     self.login_in_progress = false;
                     self.account_menu_accounts.clear();
+                    self.has_saved_credentials_cached = false;
                     self.active_call = None;
                     self.app_lock_config = crate::app_lock::AppLockConfig::default();
                     self.app_locked = false;
@@ -5786,7 +5857,7 @@ impl ZaloGuiApp {
                 self.app_lock_ui.last_activity_ui_time,
                 now_ui,
                 self.app_lock_config.idle_timeout_secs,
-                self.active_call.is_some(),
+                is_live_active_call(self.active_call.as_ref()),
             );
             if sleep_jumped || idle_expired {
                 self.try_trigger_lock(ctx);
@@ -6248,7 +6319,7 @@ impl ZaloGuiApp {
         // clickable even right up to the top-right corner of the frameless window.
         let reserve_w = title_bar_controls_reserve_width(title_bar_shows_lock_button(
             self.app_locked,
-            self.is_logged_in,
+            self.is_logged_in || self.has_saved_credentials_cached,
             self.app_lock_config.enabled,
         ));
         if pos.y < screen.top() + 34.0 && pos.x >= screen.right() - reserve_w {
@@ -6555,7 +6626,7 @@ impl ZaloGuiApp {
 
                         if title_bar_shows_lock_button(
                             self.app_locked,
-                            self.is_logged_in,
+                            self.is_logged_in || self.has_saved_credentials_cached,
                             self.app_lock_config.enabled,
                         ) {
                             let (lock_rect, lock_resp) =
@@ -6600,14 +6671,15 @@ impl ZaloGuiApp {
                                 .clicked()
                             {
                                 if self.app_lock_config.enabled {
-                                    if self.is_logged_in
-                                        || crate::account_manager::has_any_saved_credentials()
-                                    {
+                                    self.refresh_saved_credentials_cache();
+                                    if self.is_logged_in || self.has_saved_credentials_cached {
                                         self.lock_now(ctx);
                                     }
-                                } else {
+                                } else if self.is_logged_in {
                                     self.settings_modal_open = true;
                                     self.settings_tab = SettingsTab::Privacy;
+                                } else {
+                                    self.show_toast("Đăng nhập để thiết lập Khoá ứng dụng");
                                 }
                             }
                             buttons_left_x = lock_rect.left();
@@ -7051,9 +7123,18 @@ impl ZaloGuiApp {
         }
     }
 
+    /// Refresh the cached saved-credentials flag without running disk checks per frame.
+    pub(crate) fn refresh_saved_credentials_cache(&mut self) {
+        self.has_saved_credentials_cached =
+            self.is_logged_in || crate::account_manager::has_any_saved_credentials();
+    }
+
     /// Reload the saved accounts shown in the account menu.
     pub(crate) fn refresh_account_menu_accounts(&mut self) {
         self.account_menu_accounts = crate::account_manager::list_saved_accounts(&self.user_uin);
+        self.has_saved_credentials_cached = self.is_logged_in
+            || !self.account_menu_accounts.is_empty()
+            || crate::account_manager::has_any_saved_credentials();
     }
 
     /// Switch the UI to another saved account without scanning a QR code again.
@@ -7075,6 +7156,7 @@ impl ZaloGuiApp {
             self.pending_add_account_uin = None;
             return;
         }
+        self.has_saved_credentials_cached = true;
         // Remember the current account so "Thoát thêm tài khoản" can return to it. No
         // Logout is sent (#103): `RequestQr` signs the worker session out in memory only,
         // and the saved snapshot keeps the account listening in the background.
@@ -7117,16 +7199,31 @@ impl ZaloGuiApp {
     }
 
     fn show_toast(&mut self, msg: impl Into<String>) {
-        let text = msg.into();
-        self.status_msg = text.clone();
+        let raw = msg.into();
+        let mask = self.should_mask_notifications();
+        let (text, _) = prepare_toast_payload(
+            self.app_locked,
+            self.app_lock_config.hide_notifications_when_locked,
+            raw.clone(),
+            None,
+        );
+        if !mask {
+            self.status_msg = raw;
+        }
         self.toast_notice = Some((text, std::time::Instant::now()));
         self.toast_reveal_path = None;
     }
 
     /// Toast with an "Mở thư mục" button that reveals `path` in the OS file manager.
     fn show_toast_with_reveal(&mut self, msg: impl Into<String>, path: String) {
+        let (_, reveal) = prepare_toast_payload(
+            self.app_locked,
+            self.app_lock_config.hide_notifications_when_locked,
+            String::new(),
+            Some(path),
+        );
         self.show_toast(msg);
-        self.toast_reveal_path = Some(path);
+        self.toast_reveal_path = reveal;
     }
 
     /// Append files to the composer queue, skipping duplicates and anything past the cap,
@@ -8152,7 +8249,8 @@ mod app_lock_state_tests {
         assert!(!title_bar_shows_lock_button(true, true, true));
         assert!(!title_bar_shows_lock_button(false, false, false));
         assert!(title_bar_shows_lock_button(false, true, false));
-        assert!(title_bar_shows_lock_button(false, false, true));
+        assert!(!title_bar_shows_lock_button(false, false, true));
+        assert!(title_bar_shows_lock_button(false, true, true));
 
         assert_eq!(title_bar_controls_reserve_width(false), 180.0);
         assert_eq!(title_bar_controls_reserve_width(true), 216.0);
@@ -8319,5 +8417,65 @@ mod app_lock_state_tests {
             incoming_call_status_text(false, "Alice", true),
             "📲 Cuộc gọi video đến từ Alice…"
         );
+
+        assert_eq!(
+            prepare_toast_payload(
+                true,
+                true,
+                "✅ Đã lưu tập tin \"secret.pdf\" tại C:\\secret\\secret.pdf".to_string(),
+                Some("C:\\secret\\secret.pdf".to_string()),
+            ),
+            ("Thông báo mới".to_string(), None)
+        );
+        assert_eq!(
+            prepare_toast_payload(
+                false,
+                true,
+                "✅ Đã lưu tập tin \"ok.pdf\"".to_string(),
+                Some("C:\\Downloads\\ok.pdf".to_string()),
+            ),
+            (
+                "✅ Đã lưu tập tin \"ok.pdf\"".to_string(),
+                Some("C:\\Downloads\\ok.pdf".to_string()),
+            )
+        );
+        assert!(!toast_overlay_allows_standard_toast(true));
+        assert!(toast_overlay_allows_standard_toast(false));
+
+        let reactions = vec![
+            (
+                "100".to_string(),
+                "Alice".to_string(),
+                None,
+                false,
+                "❤️ Đã thả cảm xúc".to_string(),
+            ),
+            (
+                "200".to_string(),
+                "Bob".to_string(),
+                None,
+                true,
+                "👍 Đã thả cảm xúc".to_string(),
+            ),
+        ];
+        assert_eq!(
+            reaction_os_notify_payloads(true, &reactions),
+            vec![("ctdozlite".to_string(), "Bạn có 2 tin nhắn mới".to_string())]
+        );
+        assert_eq!(reaction_os_notify_payloads(false, &reactions).len(), 2);
+
+        let mut call_overlay = ActiveCallOverlay::new(
+            "100".to_string(),
+            "Alice".to_string(),
+            false,
+            false,
+            "Đang gọi".to_string(),
+            false,
+            false,
+        );
+        assert!(is_live_active_call(Some(&call_overlay)));
+        call_overlay.error_reason = Some("Kết thúc".to_string());
+        assert!(!is_live_active_call(Some(&call_overlay)));
+        assert!(!is_live_active_call(None));
     }
 }

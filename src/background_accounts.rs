@@ -96,6 +96,7 @@ pub async fn supervise(session: Arc<tokio::sync::Mutex<Session>>, sink: Activity
             _ = tick.tick() => {}
             _ = RECONCILE.notified() => {}
         }
+        let wipe_epoch = account_manager::credential_wipe_epoch();
         let connected = session
             .lock()
             .await
@@ -105,16 +106,14 @@ pub async fn supervise(session: Arc<tokio::sync::Mutex<Session>>, sink: Activity
             .unwrap_or_default();
         let ui_uin = account_manager::active_uin();
         let wanted = tokio::task::spawn_blocking(move || {
-            // A session restored at startup has no snapshot yet; without one the account
-            // is missing from the account menu and cannot be switched back to.
             if account_manager::is_safe_uin(&connected)
-                && !account_manager::session_snapshot_path(&connected).exists()
+                && account_manager::credential_wipe_epoch() == wipe_epoch
             {
-                // Best effort: retried on the next tick.
-                let _ = account_manager::save_current_account_snapshot(&connected);
+                let _ = account_manager::sync_background_account_snapshot(&connected, wipe_epoch);
             }
-            // Name, avatar and phone arrive after login; keep the snapshot's label current.
-            let _ = account_manager::refresh_session_snapshot(&connected);
+            if account_manager::credential_wipe_epoch() != wipe_epoch {
+                return Vec::new();
+            }
             let saved = account_manager::list_saved_accounts(&connected);
             accounts_to_listen(&ui_uin, &connected, saved)
         })

@@ -52,6 +52,49 @@ pub fn accounts_dir() -> PathBuf {
     PathBuf::from("accounts")
 }
 
+/// Return the accounts directory inside `data_dir`.
+fn accounts_dir_in(data_dir: &Path) -> PathBuf {
+    data_dir.join("accounts")
+}
+
+/// Return the isolated session snapshot file path (`<data_dir>/accounts/<uin>.json`).
+fn session_snapshot_path_in(data_dir: &Path, uin: &str) -> PathBuf {
+    accounts_dir_in(data_dir).join(format!("{uin}.json"))
+}
+
+/// Return the isolated threads snapshot file path (`<data_dir>/accounts/<uin>_threads.json`).
+fn threads_snapshot_path_in(data_dir: &Path, uin: &str) -> PathBuf {
+    accounts_dir_in(data_dir).join(format!("{uin}_threads.json"))
+}
+
+/// Copy the live `session.json` under `data_dir` over the snapshot of `uin` without taking
+/// [`CREDENTIAL_WIPE_LOCK`]; callers must already hold it.
+fn refresh_session_snapshot_unlocked(data_dir: &Path, uin: &str) -> Result<bool> {
+    if !is_safe_uin(uin) {
+        return Ok(false);
+    }
+    let live = data_dir.join("session.json");
+    let snapshot = session_snapshot_path_in(data_dir, uin);
+    let modified = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+    let Some(live_ts) = modified(&live) else {
+        return Ok(false);
+    };
+    if modified(&snapshot).is_some_and(|snap_ts| snap_ts >= live_ts) {
+        return Ok(false);
+    }
+    let text = std::fs::read_to_string(&live)?;
+    // The file on disk may already belong to another account (login in progress).
+    let owner = serde_json::from_str::<serde_json::Value>(&text)
+        .ok()
+        .and_then(|v| v.pointer("/login/uin").and_then(|u| u.as_str()).map(str::to_string));
+    if owner.as_deref() != Some(uin) {
+        return Ok(false);
+    }
+    std::fs::create_dir_all(accounts_dir_in(data_dir))?;
+    crate::data_dir::write_private_atomic(&snapshot, text.as_bytes())?;
+    Ok(true)
+}
+
 /// Copy the live `session.json` over the snapshot of `uin` when it is newer.
 ///
 /// The profile name, avatar and phone number are filled in after login, so a snapshot
@@ -61,29 +104,8 @@ pub fn accounts_dir() -> PathBuf {
 /// # Errors
 /// Returns an error when the live session cannot be read or the snapshot cannot be written.
 pub fn refresh_session_snapshot(uin: &str) -> Result<bool> {
-    if !is_safe_uin(uin) {
-        return Ok(false);
-    }
-    let live = Path::new("session.json");
-    let snapshot = session_snapshot_path(uin);
-    let modified = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
-    let Some(live_ts) = modified(live) else {
-        return Ok(false);
-    };
-    if modified(&snapshot).is_some_and(|snap_ts| snap_ts >= live_ts) {
-        return Ok(false);
-    }
-    let text = std::fs::read_to_string(live)?;
-    // The file on disk may already belong to another account (login in progress).
-    let owner = serde_json::from_str::<serde_json::Value>(&text)
-        .ok()
-        .and_then(|v| v.pointer("/login/uin").and_then(|u| u.as_str()).map(str::to_string));
-    if owner.as_deref() != Some(uin) {
-        return Ok(false);
-    }
-    std::fs::create_dir_all(accounts_dir())?;
-    crate::data_dir::write_private_atomic(&snapshot, text.as_bytes())?;
-    Ok(true)
+    let _wipe_guard = lock_credential_wipe();
+    refresh_session_snapshot_unlocked(Path::new("."), uin)
 }
 
 /// Legacy shared image cache, still used while no account is signed in.
@@ -94,6 +116,21 @@ const SHARED_MEDIA_CACHE_DIR: &str = "stickers_cache";
 // message; the critical section only clones or replaces one short string.
 static ACTIVE_UIN: std::sync::RwLock<String> = std::sync::RwLock::new(String::new());
 static ACCOUNT_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+static CREDENTIAL_WIPE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static CREDENTIAL_WIPE_EPOCH: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Acquire the cross-thread lock serializing credential snapshot writes against wipes.
+fn lock_credential_wipe() -> std::sync::MutexGuard<'static, ()> {
+    CREDENTIAL_WIPE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Monotonic generation counter incremented every time saved credentials are wiped.
+pub fn credential_wipe_epoch() -> u64 {
+    CREDENTIAL_WIPE_EPOCH.load(std::sync::atomic::Ordering::SeqCst)
+}
 
 /// `true` when `uin` is safe to embed in a file name (ASCII letters, digits, `-`, `_`).
 ///
@@ -300,6 +337,8 @@ pub fn has_any_saved_credentials() -> bool {
 /// under `data_dir`, preserving `accounts/*_threads.json`, `accounts/*_history.db*`, and
 /// `accounts/<uin>/` subdirectories.
 pub fn wipe_all_saved_session_credentials_in(data_dir: &Path) -> Result<usize> {
+    let _wipe_guard = lock_credential_wipe();
+    CREDENTIAL_WIPE_EPOCH.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let mut removed = 0usize;
     for target in [
         data_dir.join("session.json"),
@@ -392,17 +431,23 @@ pub fn list_saved_accounts(current_uin: &str) -> Vec<AccountProfile> {
     out
 }
 
-/// Remove legacy root cache/DB files (`threads_cache.json`, `zalo_history.db` + WAL/SHM)
-/// so multi-account switches or QR logins never inherit another account's data.
-pub fn remove_legacy_shared_caches() {
+/// Remove legacy root cache/DB files under `data_dir` (`threads_cache.json`, `zalo_history.db`
+/// + WAL/SHM) so multi-account switches or QR logins never inherit another account's data.
+pub fn remove_legacy_shared_caches_in(data_dir: &Path) {
     for legacy in [
         "threads_cache.json",
         "zalo_history.db",
         "zalo_history.db-wal",
         "zalo_history.db-shm",
     ] {
-        let _ = std::fs::remove_file(legacy);
+        let _ = std::fs::remove_file(data_dir.join(legacy));
     }
+}
+
+/// Remove legacy root cache/DB files (`threads_cache.json`, `zalo_history.db` + WAL/SHM)
+/// so multi-account switches or QR logins never inherit another account's data.
+pub fn remove_legacy_shared_caches() {
+    remove_legacy_shared_caches_in(Path::new("."));
 }
 
 fn any_account_history_db_exists(dir: &Path) -> bool {
@@ -417,21 +462,17 @@ fn any_account_history_db_exists(dir: &Path) -> bool {
     })
 }
 
-/// Save the current session into `accounts/<uin>.json` (only if `session.json` belongs to `uin`).
-///
-/// Runtime history and thread caches already write directly to `accounts/<uin>_history.db` and
-/// `accounts/<uin>_threads.json` — never copy root `zalo_history.db` or `threads_cache.json`
-/// over per-account files (except one-time migration from legacy single-account root storage
-/// when zero `accounts/*_history.db` existed before).
-pub fn save_current_account_snapshot(uin: &str) -> Result<()> {
+/// Save the live `session.json` under `data_dir` into `accounts/<uin>.json` without acquiring
+/// [`CREDENTIAL_WIPE_LOCK`]; callers must already hold it.
+fn save_current_account_snapshot_unlocked(data_dir: &Path, uin: &str) -> Result<()> {
     if !is_safe_uin(uin) {
         return Ok(());
     }
-    let dir = accounts_dir();
+    let dir = accounts_dir_in(data_dir);
     std::fs::create_dir_all(&dir)?;
 
-    let live = Path::new("session.json");
-    if let Ok(text) = std::fs::read_to_string(live) {
+    let live = data_dir.join("session.json");
+    if let Ok(text) = std::fs::read_to_string(&live) {
         let owner = serde_json::from_str::<serde_json::Value>(&text)
             .ok()
             .and_then(|v| {
@@ -440,7 +481,10 @@ pub fn save_current_account_snapshot(uin: &str) -> Result<()> {
                     .map(str::to_string)
             });
         if owner.as_deref() == Some(uin) {
-            crate::data_dir::write_private_atomic(&session_snapshot_path(uin), text.as_bytes())?;
+            crate::data_dir::write_private_atomic(
+                &session_snapshot_path_in(data_dir, uin),
+                text.as_bytes(),
+            )?;
         }
     }
 
@@ -448,16 +492,75 @@ pub fn save_current_account_snapshot(uin: &str) -> Result<()> {
     // before any `accounts/*_history.db` exists at all.
     let acc_db = dir.join(format!("{uin}_history.db"));
     if !acc_db.exists() && !any_account_history_db_exists(&dir) {
-        if Path::new("zalo_history.db").exists() {
-            let _ = std::fs::copy("zalo_history.db", &acc_db);
+        let legacy_db = data_dir.join("zalo_history.db");
+        if legacy_db.exists() {
+            let _ = std::fs::copy(&legacy_db, &acc_db);
         }
-        let acc_threads = threads_snapshot_path(uin);
-        if !acc_threads.exists() && Path::new("threads_cache.json").exists() {
-            let _ = std::fs::copy("threads_cache.json", &acc_threads);
+        let acc_threads = threads_snapshot_path_in(data_dir, uin);
+        let legacy_threads = data_dir.join("threads_cache.json");
+        if !acc_threads.exists() && legacy_threads.exists() {
+            let _ = std::fs::copy(&legacy_threads, &acc_threads);
         }
-        remove_legacy_shared_caches();
+        remove_legacy_shared_caches_in(data_dir);
     }
     Ok(())
+}
+
+/// Save the current session into `accounts/<uin>.json` (only if `session.json` belongs to `uin`).
+///
+/// Runtime history and thread caches already write directly to `accounts/<uin>_history.db` and
+/// `accounts/<uin>_threads.json` — never copy root `zalo_history.db` or `threads_cache.json`
+/// over per-account files (except one-time migration from legacy single-account root storage
+/// when zero `accounts/*_history.db` existed before).
+pub fn save_current_account_snapshot(uin: &str) -> Result<()> {
+    let _wipe_guard = lock_credential_wipe();
+    save_current_account_snapshot_unlocked(Path::new("."), uin)
+}
+
+/// Guarded background snapshot sync parameterized by `data_dir`, epoch source, and active UIN
+/// lookup so tests stay isolated from global `ACTIVE_UIN` and the working directory.
+fn sync_background_account_snapshot_in_with<F>(
+    data_dir: &Path,
+    uin: &str,
+    epoch_at_read: u64,
+    epoch_counter: &std::sync::atomic::AtomicU64,
+    active_uin_fn: F,
+) -> Result<bool>
+where
+    F: FnOnce() -> String,
+{
+    if !is_safe_uin(uin) {
+        return Ok(false);
+    }
+    let _wipe_guard = lock_credential_wipe();
+    if epoch_counter.load(std::sync::atomic::Ordering::SeqCst) != epoch_at_read {
+        return Ok(false);
+    }
+    if active_uin_fn().is_empty() {
+        return Ok(false);
+    }
+    if !data_dir.join("session.json").exists() {
+        return Ok(false);
+    }
+    let snapshot = session_snapshot_path_in(data_dir, uin);
+    if !snapshot.exists() {
+        save_current_account_snapshot_unlocked(data_dir, uin)?;
+        return Ok(snapshot.exists());
+    }
+    refresh_session_snapshot_unlocked(data_dir, uin)
+}
+
+/// Create or refresh `accounts/<uin>.json` for `background_accounts::supervise`, aborting
+/// immediately if a credential wipe bumped [`credential_wipe_epoch`] since `epoch_at_read`,
+/// if [`active_uin`] was cleared, or if `session.json` no longer exists.
+pub fn sync_background_account_snapshot(uin: &str, epoch_at_read: u64) -> Result<bool> {
+    sync_background_account_snapshot_in_with(
+        Path::new("."),
+        uin,
+        epoch_at_read,
+        &CREDENTIAL_WIPE_EPOCH,
+        active_uin,
+    )
 }
 
 /// Switch to a target account:
@@ -696,5 +799,72 @@ mod tests {
         assert_eq!(std::fs::read(acc_dir.join("111_history.db")).unwrap(), b"db");
         assert_eq!(std::fs::read(acc_dir.join("111_history.db-wal")).unwrap(), b"wal");
         assert_eq!(std::fs::read(acc_dir.join("111").join("note.txt")).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn stale_wipe_epoch_aborts_background_snapshot_without_recreating_file() {
+        let dir = TempDir::new("stale-wipe-epoch");
+        let root = dir.path();
+        let acc_dir = root.join("accounts");
+        std::fs::create_dir_all(&acc_dir).unwrap();
+        let session_bytes = br#"{"login":{"uin":"777888","display_name":"Test User"}}"#;
+        std::fs::write(root.join("session.json"), session_bytes).unwrap();
+        std::fs::write(acc_dir.join("777888.json"), session_bytes).unwrap();
+
+        let epoch_at_read = credential_wipe_epoch();
+        let removed = wipe_all_saved_session_credentials_in(root).unwrap();
+        assert_eq!(removed, 2);
+        assert!(!acc_dir.join("777888.json").exists());
+
+        std::fs::write(root.join("session.json"), session_bytes).unwrap();
+        let wrote = sync_background_account_snapshot_in_with(
+            root,
+            "777888",
+            epoch_at_read,
+            &CREDENTIAL_WIPE_EPOCH,
+            || "777888".to_string(),
+        )
+        .unwrap();
+        assert!(!wrote);
+        assert!(!acc_dir.join("777888.json").exists());
+    }
+
+    #[test]
+    fn background_snapshot_sync_guards_epoch_active_uin_and_session_existence() {
+        let dir = TempDir::new("guard-snapshot");
+        let root = dir.path();
+        let epoch_counter = std::sync::atomic::AtomicU64::new(5);
+        let session_bytes = br#"{"login":{"uin":"777888","display_name":"Test User"}}"#;
+
+        assert!(!sync_background_account_snapshot_in_with(
+            root,
+            "777888",
+            5,
+            &epoch_counter,
+            || "777888".to_string(),
+        )
+        .unwrap());
+        assert!(!root.join("accounts").join("777888.json").exists());
+
+        std::fs::write(root.join("session.json"), session_bytes).unwrap();
+        assert!(!sync_background_account_snapshot_in_with(
+            root,
+            "777888",
+            5,
+            &epoch_counter,
+            String::new,
+        )
+        .unwrap());
+        assert!(!root.join("accounts").join("777888.json").exists());
+
+        assert!(sync_background_account_snapshot_in_with(
+            root,
+            "777888",
+            5,
+            &epoch_counter,
+            || "777888".to_string(),
+        )
+        .unwrap());
+        assert!(root.join("accounts").join("777888.json").exists());
     }
 }
