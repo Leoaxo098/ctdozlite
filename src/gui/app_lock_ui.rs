@@ -53,6 +53,7 @@ struct FieldOutput {
     enter_pressed: bool,
     has_focus: bool,
     toggle_clicked: bool,
+    #[cfg_attr(not(test), allow(dead_code))]
     first_box_rect: Option<Rect>,
 }
 
