@@ -1903,7 +1903,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                             for voip_ev in
                                                 crate::call::extract_voip_controls(data_node)
                                             {
-                                                cb.for_account(s_snap.clone(), gui_tx_ws.clone()).handle_control_event(voip_ev);
+                                                cb.for_account(crate::call::CallAccountContext::new(s_snap.clone(), gui_tx_ws.clone())).handle_control_event(voip_ev);
                                             }
                                             crate::chat::dispatch_file_done_controls(data_node);
                                             let mute_evs = crate::chat::extract_mute_controls(
@@ -2053,7 +2053,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                 let ctrl_res = crate::call::poll_control_events(&s_snap, &mut state).await;
                                 if let Ok((events, mute_evs, typing_evs, seen_evs, sync_evs)) = ctrl_res {
                                     if !scope.is_current() || !session_matches_active(&s_snap) { continue; }
-                                    for ev in events { cb.for_account(s_snap.clone(), scope.clone()).handle_control_event(ev); }
+                                    for ev in events { cb.for_account(crate::call::CallAccountContext::new(s_snap.clone(), scope.clone())).handle_control_event(ev); }
                                     if !mute_evs.is_empty() {
                                         let _ = scope.send(GuiEvent::MuteEventsReceived(mute_evs));
                                         ctx_ctrl.request_repaint();
@@ -2163,7 +2163,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                     );
                     let tasks = if global { &mut global_tasks } else { &mut account_tasks };
                     let gui_tx = if global { gui_tx.clone() } else { gui_tx.scoped() };
-                    let call_bridge = snapshot.map(|snapshot| call_bridge.for_account(snapshot, gui_tx.clone()))
+                    let call_bridge = snapshot.map(|snapshot| call_bridge.for_account(crate::call::CallAccountContext::new(snapshot, gui_tx.clone())))
                         .unwrap_or_else(|| call_bridge.as_ref().clone());
                     let gui_tx = authentication_events(&cmd, gui_tx, &call_bridge);
                     match cmd {
@@ -2332,7 +2332,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             };
                             let (cur_uin, gui_tx) = {
                                 let mut s = session.lock().await;
-                                call_bridge.end_call_for_account(s.clone(), gui_tx.scoped());
+                                call_bridge.end_call_for_account(crate::call::CallAccountContext::new(s.clone(), gui_tx.scoped()));
                                 let uin = departing_account_uin(&s, &command_origin);
                                 let tx = gui_tx.advance_account();
                                 s.logout();
@@ -2366,7 +2366,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             }
                             let (previous, gui_tx) = {
                                 let mut s = session.lock().await;
-                                call_bridge.end_call_for_account(s.clone(), gui_tx.scoped());
+                                call_bridge.end_call_for_account(crate::call::CallAccountContext::new(s.clone(), gui_tx.scoped()));
                                 let previous = s.clone();
                                 let tx = gui_tx.advance_account();
                                 // Background loops see no active account during the disk transition.
@@ -6781,7 +6781,7 @@ mod account_task_tests {
             root.clone(),
             egui::Context::default(),
         )
-        .for_account(session, departing.clone());
+        .for_account(crate::call::CallAccountContext::new(session, departing.clone()));
         let current = authentication_events(&WorkerCmd::RequestQr, departing.clone(), &bridge);
         assert!(!departing.is_current());
         assert!(current.is_current());

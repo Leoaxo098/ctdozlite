@@ -1264,7 +1264,6 @@ pub(crate) struct EditingMessage {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub(crate) struct AppSettings {
-    // 1. Cài đặt chung
     show_all_contacts: bool,
     language: String,
     autostart_on_boot: bool,
@@ -1272,7 +1271,6 @@ pub(crate) struct AppSettings {
     download_dir: String,
     /// Mã ngôn ngữ đích cho dịch tin nhắn (vi/en/zh/ja/ko...). Mặc định vi.
     translate_target: String,
-    // 2. Quyền riêng tư
     show_birthday: String,
     show_online_status: bool,
     show_seen_status: bool,
@@ -1285,7 +1283,6 @@ pub(crate) struct AppSettings {
     friend_src_qr: bool,
     friend_src_group: bool,
     friend_src_card: bool,
-    // 3. Giao diện
     pub(crate) theme_mode: String, // "light" | "dark" | "system"
     pub(crate) use_avatar_as_wallpaper: bool,
     pub(crate) font_family: String,
@@ -1300,10 +1297,8 @@ pub(crate) struct AppSettings {
     pub(crate) custom_accent_color: Option<String>,
     pub(crate) custom_bubble_out_bg: Option<String>,
     pub(crate) custom_bubble_in_bg: Option<String>,
-    // 4. Thông báo
     enable_notifications: bool,
     play_notification_sound: bool,
-    // 5. Tin nhắn
     quick_messages_enabled: bool,
     quick_reply_enabled: bool,
     quick_reply_items: Vec<String>,
@@ -1319,16 +1314,13 @@ pub(crate) struct AppSettings {
     double_click_to_reply: bool,
     show_typing_indicator: bool,
     send_message_key: String, // "enter" | "cmd_enter"
-    // 6. Tiện ích
     suggest_stickers_while_typing: bool,
     suggest_mentions: bool,
     enable_gif_search: bool,
     enable_sticker_keyword_search: bool,
-    // 7. Thiết bị cuộc gọi (Mic & Camera)
     selected_mic_device: String,
     selected_camera_device: String,
     mic_gain_percent: u32,
-    // 8. Quản lý hội thoại (Context menu: Ghim, Phân loại, Tắt thông báo, Ẩn)
     pinned_threads: Vec<String>,
     muted_threads: HashMap<String, i64>,
     hidden_threads: HashSet<String>,
@@ -1340,10 +1332,8 @@ pub(crate) struct AppSettings {
     /// Folder đang active ("" = Tất cả). Lưu cùng settings.
     #[serde(default)]
     active_chat_folder: String,
-    // 9. Cập nhật tự động qua GitHub Releases API
     auto_check_updates: bool,
     skipped_update_version: String,
-    // 10. Proxy & Đa tài khoản (#64)
     proxy_url: String,
     multi_profile_name: String,
     /// LLM endpoint (OpenAI-compatible). Trống = resolve từ opencode.json / Ollama local.
@@ -5476,13 +5466,9 @@ fn file_uri(path: &str) -> String {
     out
 }
 
-// ---------------------------------------------------------------------------
 // Lightweight Background Session Worker (2-thread Tokio pool, off-UI disk I/O)
-// ---------------------------------------------------------------------------
 
-// ---------------------------------------------------------------------------
 // Main eframe::App Implementation
-// ---------------------------------------------------------------------------
 
 impl eframe::App for ZaloGuiApp {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
@@ -5796,9 +5782,7 @@ impl ZaloGuiApp {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Screen Renderers
-// ---------------------------------------------------------------------------
 
 impl ZaloGuiApp {
     fn resize_cursor_for(dir: egui::ResizeDirection) -> CursorIcon {
@@ -6115,7 +6099,6 @@ impl ZaloGuiApp {
                 let mut buttons_left_x = bar_rect.right();
 
                 ui.horizontal_centered(|ui| {
-                    // 1. App Logo (20x20)
                     let (logo_rect, _) =
                         ui.allocate_exact_size(Vec2::new(20.0, 20.0), Sense::hover());
                     if let Some(tex) = &self.app_logo_texture {
@@ -6157,7 +6140,6 @@ impl ZaloGuiApp {
                         );
                     }
 
-                    // 2. Right-side Window Control Buttons
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.spacing_mut().item_spacing.x = 0.0;
 
@@ -6375,7 +6357,6 @@ impl ZaloGuiApp {
                     });
                 });
 
-                // 3. Interactive drag / double-click region covering everything left of the control buttons
                 let drag_rect = Rect::from_min_max(
                     bar_rect.min,
                     Pos2::new((buttons_left_x - 2.0).max(bar_rect.left() + 40.0), bar_rect.max.y),

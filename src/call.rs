@@ -1191,9 +1191,9 @@ impl PureRustCallState {
     fn matches_pending_answer(
         &self,
         identity: (i64, std::time::Instant),
-        events: &crate::gui::GuiTx,
+        account_current: bool,
     ) -> bool {
-        events.is_current()
+        account_current
             && !self.is_caller
             && !self.is_connected
             && (self.call_id, self.started_at) == identity
@@ -1239,13 +1239,13 @@ impl Drop for PureRustCallState {
 /// Install an outgoing call only while its account, dial generation and slot still match.
 async fn try_install_dialed_call(
     active: &Mutex<Option<PureRustCallState>>,
-    events: &crate::gui::GuiTx,
+    account_current: impl Fn() -> bool,
     dial_epoch: &std::sync::atomic::AtomicU64,
     expected_epoch: u64,
     state: PureRustCallState,
 ) -> Option<PureRustCallState> {
     let mut active = active.lock().await;
-    if !events.is_current()
+    if !account_current()
         || dial_epoch.load(std::sync::atomic::Ordering::SeqCst) != expected_epoch
         || active.is_some()
     {
@@ -2284,8 +2284,21 @@ pub fn build_callee_extend_data(
     format!("{extend_obj}\n")
 }
 
+/// Account snapshot and event generation carried together across queued call actions.
+#[derive(Clone)]
+pub(crate) struct CallAccountContext {
+    session: Session,
+    events: crate::gui::GuiTx,
+}
+
+impl CallAccountContext {
+    pub(crate) fn new(session: Session, events: crate::gui::GuiTx) -> Self {
+        Self { session, events: events.for_call() }
+    }
+}
+
 enum CallEngineCmd {
-    AccountCommand(Box<(Session, crate::gui::GuiTx, CallEngineCmd)>),
+    AccountCommand(Box<(CallAccountContext, CallEngineCmd)>),
     MakeCall {
         partner_id: String,
         partner_name: String,
@@ -2304,7 +2317,7 @@ enum CallEngineCmd {
         user_ids: Vec<String>,
     },
     EndCall {
-        context: Option<Box<(Session, crate::gui::GuiTx)>>,
+        context: Option<Box<CallAccountContext>>,
     },
     ControlEvent(Value),
 }
@@ -2312,7 +2325,7 @@ enum CallEngineCmd {
 #[derive(Clone)]
 pub struct CallBridge {
     cmd_tx: mpsc::UnboundedSender<CallEngineCmd>,
-    account_context: Option<Arc<(Session, crate::gui::GuiTx)>>,
+    account_context: Option<Arc<CallAccountContext>>,
 }
 
 impl CallBridge {
@@ -2336,7 +2349,8 @@ impl CallBridge {
             while let Some(cmd) = cmd_rx.recv().await {
                 let (cmd, session, gui_tx) = match cmd {
                     CallEngineCmd::AccountCommand(context) => {
-                        let (snapshot, events, command) = *context;
+                        let (context, command) = *context;
+                        let CallAccountContext { session: snapshot, events } = context;
                         if !events.is_current()
                             && !matches!(&command, CallEngineCmd::EndCall { .. })
                         {
@@ -2814,7 +2828,7 @@ impl CallBridge {
                                             .ok();
                                         if let Some(orphaned) = try_install_dialed_call(
                                             &active_clone,
-                                            &gui_tx_clone,
+                                            || gui_tx_clone.is_current(),
                                             &dial_epoch_clone,
                                             expected_epoch,
                                             state,
@@ -3099,7 +3113,7 @@ impl CallBridge {
                             };
                             if let Some(orphaned) = try_install_dialed_call(
                                 &active_clone,
-                                &gui_tx_clone,
+                                || gui_tx_clone.is_current(),
                                 &dial_epoch_clone,
                                 expected_epoch,
                                 state,
@@ -3148,7 +3162,7 @@ impl CallBridge {
                                     .await
                                     .as_ref()
                                     .map(|s| {
-                                        s.matches_pending_answer(identity, &gui_tx_clone)
+                                        s.matches_pending_answer(identity, gui_tx_clone.is_current())
                                             && !s.ringing_sent
                                     })
                                     .unwrap_or(false);
@@ -3157,7 +3171,7 @@ impl CallBridge {
                                     let (cid, caller, grp, gid, host) = {
                                         let g = active_clone.lock().await;
                                         match g.as_ref().filter(|s| {
-                                            s.matches_pending_answer(identity, &gui_tx_clone)
+                                            s.matches_pending_answer(identity, gui_tx_clone.is_current())
                                         }) {
                                             Some(s) => (
                                                 s.call_id,
@@ -3188,7 +3202,7 @@ impl CallBridge {
                                             dispatch_send_signal(&s_snap, 12439, &req_12439).await;
                                     }
                                     if !active_clone.lock().await.as_ref().is_some_and(|s| {
-                                        s.matches_pending_answer(identity, &gui_tx_clone)
+                                        s.matches_pending_answer(identity, gui_tx_clone.is_current())
                                     }) {
                                         return;
                                     }
@@ -3203,7 +3217,7 @@ impl CallBridge {
                                     let (relay_src, from_u, part_u, is_vid, sess_raw, grp_u32) = {
                                         let g = active_clone.lock().await;
                                         match g.as_ref().filter(|s| {
-                                            s.matches_pending_answer(identity, &gui_tx_clone)
+                                            s.matches_pending_answer(identity, gui_tx_clone.is_current())
                                         }) {
                                             Some(s) => (
                                                 s.invite_payload.clone(),
@@ -3263,7 +3277,7 @@ impl CallBridge {
                                     );
                                     let mut g = active_clone.lock().await;
                                     if let Some(st) = g.as_mut().filter(|s| {
-                                        s.matches_pending_answer(identity, &gui_tx_clone)
+                                        s.matches_pending_answer(identity, gui_tx_clone.is_current())
                                     }) {
                                         st.sess_id = sess_id;
                                         if !rtp_ip.is_empty() {
@@ -3296,7 +3310,7 @@ impl CallBridge {
                             );
                             if let Some(st) = guard
                                 .as_mut()
-                                .filter(|s| s.matches_pending_answer(identity, &gui_tx_clone))
+                                .filter(|s| s.matches_pending_answer(identity, gui_tx_clone.is_current()))
                             {
                                 let call_id = st.call_id;
                                 let caller_id = st.partner_id.clone();
@@ -3696,7 +3710,7 @@ impl CallBridge {
                     CallEngineCmd::EndCall { context } => {
                         dial_epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         let (s_snap, gui_tx) = match context {
-                            Some(context) => *context,
+                            Some(context) => (context.session, context.events),
                             None => (session.lock().await.clone(), gui_tx),
                         };
                         let taken = active_call.lock().await.take();
@@ -3957,8 +3971,7 @@ impl CallBridge {
                                         }
                                         let _ = cmd_tx_inner.send(CallEngineCmd::AccountCommand(
                                             Box::new((
-                                                s_snap,
-                                                gui_tx.clone(),
+                                                CallAccountContext::new(s_snap, gui_tx.clone()),
                                                 CallEngineCmd::ControlEvent(synth),
                                             )),
                                         ));
@@ -4852,17 +4865,17 @@ impl CallBridge {
     }
 
     /// Bind user call commands before they enter the engine's asynchronous queue.
-    pub(crate) fn for_account(&self, session: Session, events: crate::gui::GuiTx) -> Self {
+    pub(crate) fn for_account(&self, context: CallAccountContext) -> Self {
         Self {
             cmd_tx: self.cmd_tx.clone(),
-            account_context: Some(Arc::new((session, events.for_call()))),
+            account_context: Some(Arc::new(context)),
         }
     }
 
     /// Queue a command with the bound account snapshot when the bridge has one.
     fn send_command(&self, command: CallEngineCmd) {
         let command = if let Some(context) = &self.account_context {
-            CallEngineCmd::AccountCommand(Box::new((context.0.clone(), context.1.clone(), command)))
+            CallEngineCmd::AccountCommand(Box::new(((**context).clone(), command)))
         } else {
             command
         };
@@ -4918,9 +4931,9 @@ impl CallBridge {
     }
 
     /// Bind account-transition hangup to the departing session and event generation.
-    pub(crate) fn end_call_for_account(&self, session: Session, events: crate::gui::GuiTx) {
+    pub(crate) fn end_call_for_account(&self, context: CallAccountContext) {
         let _ = self.cmd_tx.send(CallEngineCmd::EndCall {
-            context: Some(Box::new((session, events))),
+            context: Some(Box::new(context)),
         });
     }
 }
@@ -4973,12 +4986,12 @@ mod tests {
         let mut incoming = pending_test_call();
         incoming.is_caller = false;
         let identity = (incoming.call_id, incoming.started_at);
-        assert!(incoming.matches_pending_answer(identity, &events));
+        assert!(incoming.matches_pending_answer(identity, events.is_current()));
         incoming.started_at += std::time::Duration::from_secs(1);
-        assert!(!incoming.matches_pending_answer(identity, &events));
+        assert!(!incoming.matches_pending_answer(identity, events.is_current()));
         incoming.started_at = identity.1;
         root.advance_account();
-        assert!(!incoming.matches_pending_answer(identity, &events));
+        assert!(!incoming.matches_pending_answer(identity, events.is_current()));
     }
 
     #[tokio::test]
@@ -4992,7 +5005,7 @@ mod tests {
         root.advance_account();
         let active = Mutex::new(None);
         let epoch = std::sync::atomic::AtomicU64::new(0);
-        let rejected = try_install_dialed_call(&active, &departing, &epoch, 0, state).await;
+        let rejected = try_install_dialed_call(&active, || departing.is_current(), &epoch, 0, state).await;
         assert!(active.lock().await.is_none());
         assert!(rejected.is_some());
         drop(rejected);
@@ -5009,7 +5022,7 @@ mod tests {
         let active = Mutex::new(Some(existing));
         let epoch = std::sync::atomic::AtomicU64::new(0);
         let rejected =
-            try_install_dialed_call(&active, &events, &epoch, 0, pending_test_call()).await;
+            try_install_dialed_call(&active, || events.is_current(), &epoch, 0, pending_test_call()).await;
         assert_eq!(active.lock().await.as_ref().unwrap().call_id, 9);
         assert!(rejected.is_some());
     }
@@ -5021,7 +5034,7 @@ mod tests {
         let epoch = std::sync::atomic::AtomicU64::new(2);
         let active = Mutex::new(None);
         assert!(
-            try_install_dialed_call(&active, &events, &epoch, 1, pending_test_call())
+            try_install_dialed_call(&active, || events.is_current(), &epoch, 1, pending_test_call())
                 .await
                 .is_some()
         );
@@ -5082,16 +5095,16 @@ mod tests {
         let mut original = Session::new(false, false, false).unwrap();
         original.zpw_sek = Some("fake-account-a".into());
         bridge
-            .for_account(original.clone(), events)
+            .for_account(CallAccountContext::new(original.clone(), events))
             .make_call("thread-a", "Test", None, true, false);
         original.zpw_sek = Some("fake-account-b".into());
         let CallEngineCmd::AccountCommand(context) = receiver.try_recv().unwrap() else {
             panic!("user call actions must retain their account context");
         };
-        assert_eq!(context.0.zpw_sek.as_deref(), Some("fake-account-a"));
+        assert_eq!(context.0.session.zpw_sek.as_deref(), Some("fake-account-a"));
         assert_eq!(original.zpw_sek.as_deref(), Some("fake-account-b"));
         assert!(
-            matches!(context.2, CallEngineCmd::MakeCall { partner_id, .. } if partner_id == "thread-a")
+            matches!(context.1, CallEngineCmd::MakeCall { partner_id, .. } if partner_id == "thread-a")
         );
     }
 
@@ -5106,7 +5119,7 @@ mod tests {
         let root = crate::gui::GuiTx::new(event_tx, eframe::egui::Context::default());
         let mut session = Session::new(false, false, false).unwrap();
         session.zpw_sek = Some("fake-departing-session".into());
-        bridge.end_call_for_account(session.clone(), root.scoped());
+        bridge.end_call_for_account(CallAccountContext::new(session.clone(), root.scoped()));
         session.logout();
         root.advance_account();
         let CallEngineCmd::EndCall {
@@ -5115,9 +5128,9 @@ mod tests {
         else {
             panic!("hangup must retain its originating account");
         };
-        assert_eq!(context.0.zpw_sek.as_deref(), Some("fake-departing-session"));
+        assert_eq!(context.session.zpw_sek.as_deref(), Some("fake-departing-session"));
         assert!(session.zpw_sek.is_none());
-        assert!(!context.1.is_current());
+        assert!(!context.events.is_current());
     }
 
     #[test]
