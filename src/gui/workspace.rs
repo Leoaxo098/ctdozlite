@@ -11,6 +11,58 @@ pub(crate) fn compute_chat_stream_height(avail_h: f32, reserved_bottom_h: f32) -
     (avail_h - reserved_bottom_h).max(48.0)
 }
 
+/// Resolves right-drawer circle action #4 ("Quản lý nhóm" / "Đồng bộ lịch sử"):
+/// returns `(next_ext_open, should_scroll_to_workspace, should_sync_history)`.
+pub(crate) fn resolve_group_manage_click(is_group: bool, currently_open: bool) -> (bool, bool, bool) {
+    if is_group {
+        let next = !currently_open;
+        (next, next, false)
+    } else {
+        (currently_open, false, true)
+    }
+}
+
+/// Returns `Some(target_bottom_y)` when `chat_scroll` rendered at a stale offset while forced
+/// or stuck to bottom, so the frame discards and re-renders aligned to the bottom.
+pub(crate) fn compute_chat_scroll_resync(
+    force_bottom: bool,
+    jump_active: bool,
+    rendered_offset_y: f32,
+    post_offset_y: f32,
+    content_h: f32,
+    inner_h: f32,
+) -> Option<f32> {
+    if jump_active || !content_h.is_finite() || !inner_h.is_finite() {
+        return None;
+    }
+    let max_offset = (content_h - inner_h).max(0.0);
+    let rendered_stale = (rendered_offset_y - max_offset).abs() > 1.0;
+    let stuck_at_bottom = (post_offset_y - max_offset).abs() <= 1.0;
+    if (force_bottom && (rendered_stale || !stuck_at_bottom))
+        || (stuck_at_bottom && rendered_stale)
+    {
+        Some(max_offset)
+    } else {
+        None
+    }
+}
+
+/// Persists snapped bottom offset and requests an immediate multipass discard (or repaint fallback).
+fn sync_chat_scroll_bottom_pass(
+    ctx: &egui::Context,
+    scroll_id: Id,
+    target_y: f32,
+    offset_x: f32,
+) {
+    let mut state = egui::scroll_area::State::default();
+    state.offset = Vec2::new(offset_x, target_y);
+    state.store(ctx, scroll_id);
+    ctx.request_discard("chat_scroll_bottom_sync");
+    if !ctx.will_discard() {
+        ctx.request_repaint();
+    }
+}
+
 /// Computes the overlay/panel width for the conversation Info Drawer at a given viewport width.
 pub(crate) fn compute_compact_drawer_width(screen_w: f32) -> f32 {
     if screen_w < 880.0 {
@@ -3416,32 +3468,44 @@ impl ZaloGuiApp {
                                         }
 
                                         // 4. Quản lý nhóm / Đồng bộ
+                                        let ext_id = Id::new(("drw_sec_ext", d_id.as_str()));
+                                        let ext_open: bool = d_is_group
+                                            && ui.ctx().data(|d| d.get_temp(ext_id)).unwrap_or(false);
                                         if draw_circle_action(
                                             ui,
                                             lucide::SETTINGS,
                                             if d_is_group { "Quản lý" } else { "Đồng bộ" },
                                             if d_is_group { "nhóm" } else { "lịch sử" },
-                                            false,
+                                            ext_open,
                                         )
                                         .clicked()
                                         {
+                                            let (next_open, should_scroll, should_sync) =
+                                                resolve_group_manage_click(d_is_group, ext_open);
                                             if d_is_group {
-                                                let ext_id = Id::new(("drw_sec_ext", d_id.as_str()));
-                                                let cur: bool = ui
-                                                    .ctx()
-                                                    .data(|d| d.get_temp(ext_id))
-                                                    .unwrap_or(false);
-                                                ui.ctx().data_mut(|d| d.insert_temp(ext_id, !cur));
-                                            }
-                                            if let Some(tx) = WORKER_TX.get() {
-                                                let _ = tx.send(WorkerCmd::RefreshThreads);
-                                                let _ = tx.send(WorkerCmd::LoadGroupHistory {
-                                                    group_id: d_id.clone(),
-                                                    is_group: d_is_group,
-                                                    have: d_msg_count,
+                                                let scroll_id =
+                                                    Id::new(("drw_sec_ext_scroll", d_id.as_str()));
+                                                ui.ctx().data_mut(|d| {
+                                                    d.insert_temp(ext_id, next_open);
+                                                    if should_scroll {
+                                                        d.insert_temp(scroll_id, true);
+                                                    } else {
+                                                        d.remove::<bool>(scroll_id);
+                                                    }
                                                 });
+                                                ctx.request_repaint();
                                             }
-                                            self.show_toast("Đang đồng bộ dữ liệu hội thoại…");
+                                            if should_sync {
+                                                if let Some(tx) = WORKER_TX.get() {
+                                                    let _ = tx.send(WorkerCmd::RefreshThreads);
+                                                    let _ = tx.send(WorkerCmd::LoadGroupHistory {
+                                                        group_id: d_id.clone(),
+                                                        is_group: d_is_group,
+                                                        have: d_msg_count,
+                                                    });
+                                                }
+                                                self.show_toast("Đang đồng bộ dữ liệu hội thoại…");
+                                            }
                                         }
                                     });
 
@@ -3968,7 +4032,7 @@ impl ZaloGuiApp {
                                 .get(&ws_id)
                                 .cloned()
                                 .unwrap_or_default();
-                            egui::Frame::none()
+                            let ws_resp = egui::Frame::none()
                                 .inner_margin(Margin::symmetric(16.0, 14.0))
                                 .show(ui, |ui| {
                                     ui.horizontal(|ui| {
@@ -4480,6 +4544,18 @@ impl ZaloGuiApp {
                                         });
                                     }
                                 });
+                            let scroll_id = Id::new(("drw_sec_ext_scroll", d_id.as_str()));
+                            if ui.ctx().data(|d| d.get_temp::<bool>(scroll_id)).unwrap_or(false) {
+                                ui.ctx().data_mut(|d| d.remove::<bool>(scroll_id));
+                                let focus_rect = Rect::from_min_size(
+                                    ws_resp.response.rect.min,
+                                    Vec2::new(
+                                        ws_resp.response.rect.width(),
+                                        ws_resp.response.rect.height().min(260.0),
+                                    ),
+                                );
+                                ui.scroll_to_rect(focus_rect, Some(Align::Center));
+                            }
                         }
                             if let Some(m) = self.group_summary_pending.take() {
                                 self.show_toast(m);
@@ -4576,18 +4652,13 @@ impl ZaloGuiApp {
                                                 ui.horizontal(|ui| {
                                                     ui.spacing_mut().item_spacing.x = gap;
                                                     for (tkey, thumb_u, full_u, ptitle) in chunk {
-                                                        if !self.sticker_textures.contains_key(tkey)
-                                                            && self.loading_stickers.insert(tkey.clone())
-                                                        {
-                                                            if let Some(tx) = WORKER_TX.get() {
-                                                                let _ = tx.send(
-                                                                    WorkerCmd::FetchStickerImage {
-                                                                        key: tkey.clone(),
-                                                                        url: thumb_u.clone(),
-                                                                    },
-                                                                );
-                                                            }
-                                                        }
+                                                        queue_sticker_fetch(
+                                                            &self.sticker_textures,
+                                                            &mut self.loading_stickers,
+                                                            &self.failed_stickers,
+                                                            tkey.clone(),
+                                                            thumb_u.clone(),
+                                                        );
                                                         let (cell_r, cell_resp) = ui
                                                             .allocate_exact_size(
                                                                 Vec2::splat(cell_sz),
@@ -6961,10 +7032,21 @@ impl ZaloGuiApp {
                         ui.available_height(),
                         base_composer_h + composer_extra_h + picker_reserve,
                     );
+                    let scroll_id = ui.make_persistent_id(Id::new(("chat_scroll", &thread_id)));
+                    let rendered_offset_y = egui::scroll_area::State::load(ctx, scroll_id)
+                        .map_or(0.0, |s| s.offset.y);
+                    if jump_index.is_some() {
+                        self.force_scroll_to_bottom = false;
+                    }
+                    let force_snap = self.force_scroll_to_bottom && jump_index.is_none();
                     let chat_scroll_out = egui::ScrollArea::vertical()
-                        .id_salt(Id::new(("chat_scroll", &thread_id)))
+                        .id_salt(("chat_scroll", &thread_id))
                         .max_height(msg_area_height)
                         .auto_shrink([false, false])
+                        .scroll_bar_visibility(
+                            egui::scroll_area::ScrollBarVisibility::AlwaysVisible,
+                        )
+                        .animated(!force_snap)
                         .stick_to_bottom(jump_index.is_none())
                         .show(ui, |ui| {
                             egui::Frame::none()
@@ -7316,18 +7398,37 @@ impl ZaloGuiApp {
                                                     jump_scrolled |= jump_scroll_pending;
                                                 }
                                             }
-                                            let (bottom_rect, _) = ui.allocate_exact_size(Vec2::new(1.0, 1.0), Sense::hover());
-                                            if self.force_scroll_to_bottom {
-                                                ui.scroll_to_rect(bottom_rect, Some(Align::BOTTOM));
-                                                self.force_scroll_to_bottom = false;
-                                            }
+                                            let _ = ui.allocate_exact_size(Vec2::new(1.0, 1.0), Sense::hover());
                                         }
                                     }
                                 });
                         });
 
+                    let max_scroll_offset = (chat_scroll_out.content_size.y
+                        - chat_scroll_out.inner_rect.height())
+                    .max(0.0);
+                    let resync_y = compute_chat_scroll_resync(
+                        force_snap,
+                        jump_index.is_some(),
+                        rendered_offset_y,
+                        chat_scroll_out.state.offset.y,
+                        chat_scroll_out.content_size.y,
+                        chat_scroll_out.inner_rect.height(),
+                    );
+                    if force_snap {
+                        self.force_scroll_to_bottom = false;
+                    }
+                    if let Some(target_y) = resync_y {
+                        sync_chat_scroll_bottom_pass(
+                            ctx,
+                            chat_scroll_out.id,
+                            target_y,
+                            chat_scroll_out.state.offset.x,
+                        );
+                    }
+                    let effective_offset_y = resync_y.unwrap_or(chat_scroll_out.state.offset.y);
                     let dist_from_bottom = (chat_scroll_out.content_size.y
-                        - (chat_scroll_out.state.offset.y + chat_scroll_out.inner_rect.height()))
+                        - (effective_offset_y + chat_scroll_out.inner_rect.height()))
                         .max(0.0);
                     if dist_from_bottom > 180.0 {
                         let btn_size = 36.0;
@@ -7367,6 +7468,12 @@ impl ZaloGuiApp {
                                             .clicked()
                                         {
                                             self.force_scroll_to_bottom = true;
+                                            let mut next_state = egui::scroll_area::State::default();
+                                            next_state.offset = Vec2::new(
+                                                chat_scroll_out.state.offset.x,
+                                                max_scroll_offset,
+                                            );
+                                            next_state.store(ctx, chat_scroll_out.id);
                                             ui.ctx().request_repaint();
                                         }
                                     });
@@ -11051,5 +11158,161 @@ mod quote_navigation_tests {
                 .expect("should replace active mention");
         assert_eq!(new_draft, "Nhắc @Anh Tuấn về báo cáo");
         assert_eq!(next_cursor, "Nhắc @Anh Tuấn".chars().count());
+    }
+
+    #[test]
+    fn group_manage_button_toggles_without_sync_while_dm_syncs() {
+        assert_eq!(resolve_group_manage_click(true, false), (true, true, false));
+        assert_eq!(resolve_group_manage_click(true, true), (false, false, false));
+        assert_eq!(resolve_group_manage_click(false, false), (false, false, true));
+        assert_eq!(resolve_group_manage_click(false, true), (true, false, true));
+    }
+
+    #[test]
+    fn chat_scroll_resync_eliminates_top_flash_and_thumbnail_jump_without_hijacking_scroll_up() {
+        assert_eq!(
+            compute_chat_scroll_resync(true, false, 0.0, 1400.0, 2000.0, 600.0),
+            Some(1400.0)
+        );
+        assert_eq!(
+            compute_chat_scroll_resync(true, false, 300.0, 300.0, 2000.0, 600.0),
+            Some(1400.0)
+        );
+        assert_eq!(
+            compute_chat_scroll_resync(false, false, 1400.0, 2200.0, 2800.0, 600.0),
+            Some(2200.0)
+        );
+        assert_eq!(
+            compute_chat_scroll_resync(false, false, 300.0, 300.0, 2800.0, 600.0),
+            None
+        );
+        assert_eq!(
+            compute_chat_scroll_resync(false, false, 2200.0, 2200.0, 2800.0, 600.0),
+            None
+        );
+        assert_eq!(
+            compute_chat_scroll_resync(true, true, 0.0, 1400.0, 2000.0, 600.0),
+            None
+        );
+    }
+
+    #[test]
+    fn chat_scroll_multipass_discard_snaps_initial_and_expanding_bottom_in_single_frame() {
+        let ctx = egui::Context::default();
+        let scroll_salt = ("chat_scroll", "cloud_test");
+        let mut force_snap = true;
+        let mut content_rows = 40usize;
+        let mut output_offset_y = 0.0_f32;
+        let mut output_max_y = 0.0_f32;
+
+        let out1 = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(420.0, 300.0))),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let scroll_id = ui.make_persistent_id(Id::new(scroll_salt));
+                    let rendered_y = egui::scroll_area::State::load(ctx, scroll_id)
+                        .map_or(0.0, |s| s.offset.y);
+                    let scroll_out = egui::ScrollArea::vertical()
+                        .id_salt(scroll_salt)
+                        .max_height(260.0)
+                        .auto_shrink([false, false])
+                        .scroll_bar_visibility(
+                            egui::scroll_area::ScrollBarVisibility::AlwaysVisible,
+                        )
+                        .animated(!force_snap)
+                        .stick_to_bottom(true)
+                        .show(ui, |ui| {
+                            for idx in 0..content_rows {
+                                ui.allocate_exact_size(Vec2::new(320.0, 24.0), Sense::hover());
+                                if idx + 1 == content_rows {
+                                    ui.add_space(1.0);
+                                }
+                            }
+                        });
+                    assert_eq!(scroll_id, scroll_out.id);
+                    let max_y =
+                        (scroll_out.content_size.y - scroll_out.inner_rect.height()).max(0.0);
+                    if let Some(target_y) = compute_chat_scroll_resync(
+                        force_snap,
+                        false,
+                        rendered_y,
+                        scroll_out.state.offset.y,
+                        scroll_out.content_size.y,
+                        scroll_out.inner_rect.height(),
+                    ) {
+                        sync_chat_scroll_bottom_pass(
+                            ctx,
+                            scroll_out.id,
+                            target_y,
+                            scroll_out.state.offset.x,
+                        );
+                    }
+                    force_snap = false;
+                    output_offset_y = rendered_y;
+                    output_max_y = max_y;
+                });
+            },
+        );
+        assert!(out1.platform_output.num_completed_passes <= 2);
+        assert!(
+            (output_offset_y - output_max_y).abs() <= 1.0 && output_max_y > 100.0,
+            "pass discard should render final frame already at bottom: rendered={output_offset_y}, max={output_max_y}"
+        );
+
+        content_rows = 60;
+        let out2 = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(420.0, 300.0))),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let scroll_id = ui.make_persistent_id(Id::new(scroll_salt));
+                    let rendered_y = egui::scroll_area::State::load(ctx, scroll_id)
+                        .map_or(0.0, |s| s.offset.y);
+                    let scroll_out = egui::ScrollArea::vertical()
+                        .id_salt(scroll_salt)
+                        .max_height(260.0)
+                        .auto_shrink([false, false])
+                        .scroll_bar_visibility(
+                            egui::scroll_area::ScrollBarVisibility::AlwaysVisible,
+                        )
+                        .stick_to_bottom(true)
+                        .show(ui, |ui| {
+                            for _ in 0..content_rows {
+                                ui.allocate_exact_size(Vec2::new(320.0, 24.0), Sense::hover());
+                            }
+                        });
+                    assert_eq!(scroll_id, scroll_out.id);
+                    let max_y =
+                        (scroll_out.content_size.y - scroll_out.inner_rect.height()).max(0.0);
+                    if let Some(target_y) = compute_chat_scroll_resync(
+                        false,
+                        false,
+                        rendered_y,
+                        scroll_out.state.offset.y,
+                        scroll_out.content_size.y,
+                        scroll_out.inner_rect.height(),
+                    ) {
+                        sync_chat_scroll_bottom_pass(
+                            ctx,
+                            scroll_out.id,
+                            target_y,
+                            scroll_out.state.offset.x,
+                        );
+                    }
+                    output_offset_y = rendered_y;
+                    output_max_y = max_y;
+                });
+            },
+        );
+        assert!(out2.platform_output.num_completed_passes <= 2);
+        assert!(
+            (output_offset_y - output_max_y).abs() <= 1.0,
+            "expanding content while stuck must resync before present: rendered={output_offset_y}, max={output_max_y}"
+        );
     }
 }

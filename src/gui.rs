@@ -7,7 +7,7 @@
 //! - Filterable conversation sidebar (`Tất cả`, `Cá nhân`, `Nhóm`), avatar badges, and grouped chat bubbles
 //! - Built-in Zalo Sticker rendering & picker (`[Nhãn dán]`)
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::Duration;
 
@@ -1904,6 +1904,8 @@ pub struct ZaloGuiApp {
     loading_stickers: HashSet<String>,
     /// Tracks sticker/avatar/thumb URLs that failed to download: `(attempts, last_failed_at)`.
     failed_stickers: HashMap<String, (u8, std::time::Instant)>,
+    /// Decoded non-call textures queued for bounded per-frame GPU upload.
+    pending_texture_uploads: VecDeque<(String, egui::ColorImage)>,
     emoji_textures: HashMap<String, TextureHandle>,
     app_logo_texture: Option<TextureHandle>,
     sticker_store_packs: Vec<crate::chat::StickerPackInfo>,
@@ -2316,6 +2318,7 @@ impl ZaloGuiApp {
             last_frame_textures: HashSet::new(),
             loading_stickers: HashSet::new(),
             failed_stickers: HashMap::new(),
+            pending_texture_uploads: VecDeque::new(),
             emoji_textures: load_default_emoji_textures(&cc.egui_ctx),
             app_logo_texture: load_app_logo_texture(&cc.egui_ctx),
             sticker_store_packs: Vec::new(),
@@ -2612,6 +2615,98 @@ pub(crate) fn record_sticker_fetch_failure(
     let entry = failures.entry(key.to_string()).or_insert((0, now));
     entry.0 = entry.0.saturating_add(1);
     entry.1 = now;
+}
+
+/// Maximum decoded non-call textures uploaded per frame so bulk arrivals never hitch the UI thread.
+pub(crate) const MAX_TEXTURE_UPLOADS_PER_FRAME: usize = 12;
+
+/// Returns `true` when `key` belongs to live call video/audio-overlay frames uploaded immediately.
+pub(crate) fn is_call_texture_key(key: &str) -> bool {
+    key.starts_with("call_")
+}
+
+/// Handles a failed download while keeping failed non-call keys inside `loading` until cooldown/cap.
+/// Returns `true` when `key` is a remote call video texture whose cached handle should be removed.
+pub(crate) fn handle_sticker_fetch_failure(
+    loading: &mut HashSet<String>,
+    failures: &mut HashMap<String, (u8, std::time::Instant)>,
+    key: &str,
+    now: std::time::Instant,
+) -> bool {
+    if is_call_texture_key(key) {
+        loading.remove(key);
+        return key.starts_with("call_remote_video");
+    }
+    record_sticker_fetch_failure(failures, key, now);
+    false
+}
+
+/// Releases cooled non-call failed keys from `loading` when retries remain, leaving exhausted keys blocked.
+pub(crate) fn release_cooled_failed_stickers_with_elapsed<F>(
+    loading: &mut HashSet<String>,
+    failures: &HashMap<String, (u8, std::time::Instant)>,
+    mut elapsed_fn: F,
+) where
+    F: FnMut(std::time::Instant) -> Duration,
+{
+    loading.retain(|key| match failures.get(key.as_str()) {
+        None => true,
+        Some(&(attempts, last_fail)) => {
+            attempts >= MAX_STICKER_FETCH_ATTEMPTS || elapsed_fn(last_fail) < STICKER_RETRY_COOLDOWN
+        }
+    });
+}
+
+/// Enqueues a decoded texture upload, replacing any stale queued payload for the same `key`.
+pub(crate) fn push_pending_texture_upload<T>(
+    queue: &mut VecDeque<(String, T)>,
+    key: String,
+    payload: T,
+) {
+    if let Some((_, existing)) = queue.iter_mut().find(|(k, _)| k == &key) {
+        *existing = payload;
+        return;
+    }
+    queue.push_back((key, payload));
+}
+
+/// Drains at most `limit` queued uploads and returns whether additional items remain queued.
+pub(crate) fn take_pending_upload_batch<T>(
+    queue: &mut VecDeque<(String, T)>,
+    limit: usize,
+) -> (Vec<(String, T)>, bool) {
+    let take_n = queue.len().min(limit);
+    let mut batch = Vec::with_capacity(take_n);
+    for _ in 0..take_n {
+        if let Some(item) = queue.pop_front() {
+            batch.push(item);
+        }
+    }
+    (batch, !queue.is_empty())
+}
+
+/// Stores an uploaded texture in the cache and marks it live for the current frame before LRU eviction.
+pub(super) fn install_uploaded_texture<T>(
+    textures: &mut HashMap<String, T>,
+    texture_lru: &mut crate::media_resources::ResourceLru,
+    last_frame_textures: &mut HashSet<String>,
+    loading_stickers: &mut HashSet<String>,
+    key: String,
+    tex: T,
+    bytes: u64,
+    protect_call_frame: bool,
+) {
+    loading_stickers.remove(&key);
+    last_frame_textures.insert(key.clone());
+    insert_texture_with_lru(
+        textures,
+        texture_lru,
+        last_frame_textures,
+        key,
+        tex,
+        bytes,
+        protect_call_frame,
+    );
 }
 
 thread_local! {
@@ -3414,6 +3509,7 @@ impl ZaloGuiApp {
         self.group_jump_pending = None;
         self.saved_items.clear();
         self.scheduled_items.clear();
+        self.clear_pending_texture_uploads();
         self.incoming_popup = None;
         self.reaction_inbox = crate::reactions::ReactionInbox::default();
         self.publish_known_threads();
@@ -3456,7 +3552,62 @@ impl ZaloGuiApp {
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
     }
 
+    /// Drops any pending non-call texture uploads and unblocks their keys in `loading_stickers`.
+    fn clear_pending_texture_uploads(&mut self) {
+        while let Some((key, _)) = self.pending_texture_uploads.pop_front() {
+            self.loading_stickers.remove(&key);
+        }
+    }
+
+    /// Uploads a decoded image to GPU memory and protects it in `last_frame_textures` until rendered.
+    fn upload_decoded_texture(&mut self, ctx: &egui::Context, key: String, image: egui::ColorImage) {
+        let options = if is_call_texture_key(&key) {
+            TextureOptions::LINEAR
+        } else {
+            TextureOptions {
+                mipmap_mode: Some(egui::TextureFilter::Linear),
+                ..TextureOptions::LINEAR
+            }
+        };
+        let bytes = (image.size[0] as u64)
+            .saturating_mul(image.size[1] as u64)
+            .saturating_mul(4);
+        let tex = ctx.load_texture(&key, image, options);
+        install_uploaded_texture(
+            &mut self.sticker_textures,
+            &mut self.texture_lru,
+            &mut self.last_frame_textures,
+            &mut self.loading_stickers,
+            key,
+            tex,
+            bytes,
+            self.active_call.is_some(),
+        );
+    }
+
+    /// Uploads at most `MAX_TEXTURE_UPLOADS_PER_FRAME` pending textures and schedules another frame if more wait.
+    fn drain_pending_texture_uploads(&mut self, ctx: &egui::Context) {
+        if self.pending_texture_uploads.is_empty() {
+            return;
+        }
+        let (batch, has_more) = take_pending_upload_batch(
+            &mut self.pending_texture_uploads,
+            MAX_TEXTURE_UPLOADS_PER_FRAME,
+        );
+        for (key, image) in batch {
+            self.upload_decoded_texture(ctx, key, image);
+        }
+        if has_more {
+            ctx.request_repaint();
+        }
+    }
+
     fn check_events(&mut self, ctx: &egui::Context) {
+        release_cooled_failed_stickers_with_elapsed(
+            &mut self.loading_stickers,
+            &self.failed_stickers,
+            |last_fail| last_fail.elapsed(),
+        );
         while let Ok(event) = self.event_rx.try_recv() {
             match event {
                 GuiEvent::NotificationAuthorization { request_id, result } => {
@@ -3493,6 +3644,7 @@ impl ZaloGuiApp {
                         self.group_stats_loading.clear();
                         self.group_summary_pending = None;
                         self.group_jump_pending = None;
+                        self.clear_pending_texture_uploads();
                     }
                     // Refresh (đã login ĐÚNG cùng tài khoản) thì merge, KHÔNG clear —
                     // đổi sang tài khoản khác PHẢI clear sạch state cũ (#119).
@@ -4670,36 +4822,20 @@ impl ZaloGuiApp {
                     ctx.request_repaint();
                 }
                 GuiEvent::StickerImageReady { key, image } => {
-                    self.loading_stickers.remove(&key);
                     self.failed_stickers.remove(&key);
-                    // Avatars and thumbnails are drawn far below their pixel size; without
-                    // mipmaps the downscale aliases into a grainy image. Live call frames are
-                    // replaced every frame, so they skip the mipmap generation cost.
-                    let options = if key.starts_with("call_") {
-                        TextureOptions::LINEAR
+                    if is_call_texture_key(&key) {
+                        self.upload_decoded_texture(ctx, key, image);
                     } else {
-                        TextureOptions {
-                            mipmap_mode: Some(egui::TextureFilter::Linear),
-                            ..TextureOptions::LINEAR
-                        }
-                    };
-                    let bytes = (image.size[0] as u64)
-                        .saturating_mul(image.size[1] as u64)
-                        .saturating_mul(4);
-                    let tex = ctx.load_texture(&key, image, options);
-                    insert_texture_with_lru(
-                        &mut self.sticker_textures,
-                        &mut self.texture_lru,
-                        &mut self.last_frame_textures,
-                        key,
-                        tex,
-                        bytes,
-                        self.active_call.is_some(),
-                    );
+                        push_pending_texture_upload(&mut self.pending_texture_uploads, key, image);
+                    }
                 }
                 GuiEvent::StickerImageFailed { key } => {
-                    self.loading_stickers.remove(&key);
-                    if key.starts_with("call_remote_video") {
+                    if handle_sticker_fetch_failure(
+                        &mut self.loading_stickers,
+                        &mut self.failed_stickers,
+                        &key,
+                        std::time::Instant::now(),
+                    ) {
                         remove_cached_texture(
                             &mut self.sticker_textures,
                             &mut self.texture_lru,
@@ -4707,12 +4843,6 @@ impl ZaloGuiApp {
                             &key,
                         );
                         ctx.request_repaint();
-                    } else {
-                        record_sticker_fetch_failure(
-                            &mut self.failed_stickers,
-                            &key,
-                            std::time::Instant::now(),
-                        );
                     }
                 }
                 GuiEvent::StickerStoreLoaded(packs) => {
@@ -5727,7 +5857,9 @@ fn file_uri(path: &str) -> String {
 impl eframe::App for ZaloGuiApp {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.update_frame(ctx, frame);
-        self.color_emoji.paint(ctx);
+        if !ctx.will_discard() {
+            self.color_emoji.paint(ctx);
+        }
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
@@ -5842,6 +5974,7 @@ impl ZaloGuiApp {
         );
 
         self.check_events(ctx);
+        self.drain_pending_texture_uploads(ctx);
 
         let now_wall = crate::login::unix_now();
         let wall_delta = now_wall.saturating_sub(self.app_lock_ui.last_frame_wall_unix);
@@ -7169,6 +7302,7 @@ impl ZaloGuiApp {
         crate::account_manager::set_active_uin("");
         self.threads.clear();
         self.selected_thread_index = 0;
+        self.clear_pending_texture_uploads();
         self.qr_texture = None;
         self.login_tab = LoginTab::QrCode;
         self.login_in_progress = true;
@@ -8162,6 +8296,111 @@ mod tests {
         assert_eq!(settings.muted_threads.get("10001"), Some(&-1));
         assert_eq!(settings.muted_threads.get("99999"), Some(&-1));
         assert!(!settings.muted_threads.contains_key("stale_timed"));
+    }
+
+    #[test]
+    fn failed_non_call_stickers_stay_blocked_in_loading_until_cooldown_and_cap() {
+        let t0 = std::time::Instant::now();
+        let mut loading = std::collections::HashSet::from([
+            "avt_broken".to_string(),
+            "thumb_inflight".to_string(),
+            "call_remote_video".to_string(),
+        ]);
+        let mut failures = std::collections::HashMap::new();
+
+        assert!(super::handle_sticker_fetch_failure(
+            &mut loading,
+            &mut failures,
+            "call_remote_video",
+            t0
+        ));
+        assert!(!loading.contains("call_remote_video"));
+
+        assert!(!super::handle_sticker_fetch_failure(
+            &mut loading,
+            &mut failures,
+            "avt_broken",
+            t0
+        ));
+        assert!(loading.contains("avt_broken"));
+        assert!(loading.contains("thumb_inflight"));
+
+        super::release_cooled_failed_stickers_with_elapsed(
+            &mut loading,
+            &failures,
+            |_| std::time::Duration::from_secs(10),
+        );
+        assert!(loading.contains("avt_broken"));
+        assert!(loading.contains("thumb_inflight"));
+
+        super::release_cooled_failed_stickers_with_elapsed(
+            &mut loading,
+            &failures,
+            |_| std::time::Duration::from_secs(30),
+        );
+        assert!(!loading.contains("avt_broken"));
+        assert!(loading.contains("thumb_inflight"));
+
+        loading.insert("avt_broken".to_string());
+        super::handle_sticker_fetch_failure(&mut loading, &mut failures, "avt_broken", t0);
+        super::handle_sticker_fetch_failure(&mut loading, &mut failures, "avt_broken", t0);
+        super::release_cooled_failed_stickers_with_elapsed(
+            &mut loading,
+            &failures,
+            |_| std::time::Duration::from_secs(3600),
+        );
+        assert!(loading.contains("avt_broken"));
+    }
+
+    #[test]
+    fn install_uploaded_texture_protects_batch_from_same_frame_eviction_and_batches_uploads() {
+        let mut queue = std::collections::VecDeque::new();
+        for i in 0..15 {
+            super::push_pending_texture_upload(&mut queue, format!("thumb_{i}"), i);
+        }
+        super::push_pending_texture_upload(&mut queue, "thumb_2".to_string(), 99);
+        assert_eq!(queue.len(), 15);
+        let (batch1, more1) =
+            super::take_pending_upload_batch(&mut queue, super::MAX_TEXTURE_UPLOADS_PER_FRAME);
+        assert!(more1);
+        assert_eq!(batch1.len(), super::MAX_TEXTURE_UPLOADS_PER_FRAME);
+        assert_eq!(batch1[2], ("thumb_2".to_string(), 99));
+        let (batch2, more2) =
+            super::take_pending_upload_batch(&mut queue, super::MAX_TEXTURE_UPLOADS_PER_FRAME);
+        assert!(!more2);
+        assert_eq!(batch2.len(), 3);
+
+        let mut textures = std::collections::HashMap::new();
+        let mut lru = crate::media_resources::ResourceLru::new(100);
+        let mut last_frame = std::collections::HashSet::new();
+        let mut loading =
+            std::collections::HashSet::from(["img_a".to_string(), "img_b".to_string()]);
+
+        super::install_uploaded_texture(
+            &mut textures,
+            &mut lru,
+            &mut last_frame,
+            &mut loading,
+            "img_a".to_string(),
+            (),
+            60,
+            false,
+        );
+        super::install_uploaded_texture(
+            &mut textures,
+            &mut lru,
+            &mut last_frame,
+            &mut loading,
+            "img_b".to_string(),
+            (),
+            60,
+            false,
+        );
+        assert!(loading.is_empty());
+        assert!(textures.contains_key("img_a"));
+        assert!(textures.contains_key("img_b"));
+        assert!(last_frame.contains("img_a"));
+        assert!(last_frame.contains("img_b"));
     }
 }
 
