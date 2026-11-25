@@ -6198,6 +6198,7 @@ impl ZaloGuiApp {
                 });
         } else {
             self.mark_active_thread_read_if_focused(ctx);
+            self.render_app_lock_setup_modal(ctx, &pal);
             self.render_chat_workspace(ctx, &pal);
         }
 
@@ -6809,8 +6810,7 @@ impl ZaloGuiApp {
                                         self.lock_now(ctx);
                                     }
                                 } else if self.is_logged_in {
-                                    self.settings_modal_open = true;
-                                    self.settings_tab = SettingsTab::Privacy;
+                                    self.open_app_lock_setup_modal(ctx);
                                 } else {
                                     self.show_toast("Đăng nhập để thiết lập Khoá ứng dụng");
                                 }

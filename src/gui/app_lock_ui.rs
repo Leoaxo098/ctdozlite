@@ -1270,9 +1270,6 @@ fn render_setup_quick_defaults(
 
 impl ZaloGuiApp {
     /// Open the dedicated centered quick-setup modal for enabling App Lock.
-    ///
-    /// Note for `@coordinator`: remove `#[allow(dead_code)]` once wired to the titlebar lock button in `src/gui.rs`.
-    #[allow(dead_code)]
     pub(super) fn open_app_lock_setup_modal(&mut self, ctx: &egui::Context) {
         self.app_lock_ui.reset_settings_drafts();
         if self.app_lock_config.enabled || self.app_locked {
@@ -1297,9 +1294,6 @@ impl ZaloGuiApp {
     }
 
     /// Render the dedicated frosted-backdrop Quick-Setup Modal when open.
-    ///
-    /// Note for `@coordinator`: remove `#[allow(dead_code)]` once wired in `update_frame` in `src/gui.rs`.
-    #[allow(dead_code)]
     pub(super) fn render_app_lock_setup_modal(
         &mut self,
         ctx: &egui::Context,

@@ -2278,6 +2278,8 @@ impl ZaloGuiApp {
                                             });
                                         }
                                         SettingsTab::Privacy => {
+                                            lock_now_requested |= self.render_privacy_app_lock_section(ui, ctx, pal);
+                                            ui.add_space(14.0);
                                             ui.label(RichText::new("Cá nhân").color(pal.text_primary).size(13.5).strong());
                                             ui.add_space(6.0);
                                             egui::Frame::none()
@@ -2435,7 +2437,6 @@ impl ZaloGuiApp {
                                                     ui.checkbox(&mut self.settings.friend_src_group, "Nhóm chung");
                                                     ui.checkbox(&mut self.settings.friend_src_card, "Danh thiếp Zalo");
                                                 });
-                                            lock_now_requested |= self.render_privacy_app_lock_section(ui, ctx, pal);
                                         }
                                         SettingsTab::Sync => {
                                             ui.label(RichText::new("Đồng bộ tin nhắn từ điện thoại").color(pal.text_primary).size(13.5).strong());
