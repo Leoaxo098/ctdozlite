@@ -2226,7 +2226,6 @@ impl ZaloGuiApp {
             .max_by_key(|(_, t)| t.messages.last().map(|m| m.ts).unwrap_or(0))
             .map(|(idx, _)| idx)
             .unwrap_or(0);
-        let startup_sched_db = crate::store::db_path_for_account(&user_uin);
 
         let app = Self {
             dark_mode,

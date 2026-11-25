@@ -2357,7 +2357,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                             egui_ctx.request_repaint();
                         }
                         WorkerCmd::SwitchAccount { target_uin } => {
-                            QR_LOGIN_ACTIVE.store(false, Ordering::SeqCst);
+                            QR_LOGIN_ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
                             if let Some(task) = current_password_task.take() { task.abort(); }
                             call_bridge.end_call();
                             account_tasks.abort_all();
@@ -4161,8 +4161,6 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                 };
                                 match res {
                                     Ok(resp) if resp_error_code(&resp).is_none() => {
-                                        let uin = s.login.as_ref().map(|l| l.uin.as_str()).unwrap_or_default();
-                                        let db_path = crate::store::db_path_for_account(uin);
                                         let (tid, mid, ts) =
                                             (to_id.clone(), msg.id.clone(), msg.ts);
                                         let uin = s.login.as_ref().map(|l| l.uin.clone()).unwrap_or_default();

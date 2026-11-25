@@ -773,11 +773,6 @@ impl<'a> TuiApp<'a> {
         self.rebuild_filter_prefer(selected_id);
     }
 
-    fn save_threads_cache_prod(&self) {
-        #[cfg(not(test))]
-        chat::save_threads_cache(&self.threads);
-    }
-
     /// Persist threads for the current account, reopening its store if needed.
     fn persist_snapshot(&mut self, threads: &[Thread]) {
         if self.local_reset_pending {

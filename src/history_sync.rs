@@ -1064,34 +1064,62 @@ pub async fn import_mobile_backup_container(
     let mut payload = Vec::new();
     lzma_rs::xz_decompress(&mut cursor, &mut payload)?;
 
-    let noise_body = json!({
-        "fids": fids,
-        "gids": gids
-    });
-    let enc_params = s.encoded_params(&noise_body)?;
-    let znoise_url = format!(
-        "{}/api/znoise?{}",
-        crate::endpoints::ZNOISE,
-        s.common_params()
-    );
-    let resp = s
-        .post_form(&znoise_url, format!("params={enc_params}"))
-        .await?;
-    let dec = s.maybe_decrypt(resp, s.session_key_bytes()).await;
-
-    let mut id_map: HashMap<String, String> = HashMap::new();
-    if let Some(data) = dec.get("data") {
-        if let Some(arr) = data.get("fids").and_then(|v| v.as_array()) {
-            for (fid, thread_id_val) in fids.iter().zip(arr.iter()) {
-                if let Some(tid) = thread_id_val.as_str() {
-                    id_map.insert(format!("{fid}.db"), tid.to_string());
+    // Discover senders present in group databases as well as direct-chat filenames.
+    // The upstream sync path resolves these IDs through the same znoise endpoint.
+    let scan_payload = payload.clone();
+    let scan_toc = toc.clone();
+    let mut all_fids = fids.clone();
+    let discovered = tokio::task::spawn_blocking(move || -> Result<HashSet<i64>> {
+        let temp_dir = std::env::temp_dir().join(format!("ctdozlite_sync_scan_{}", crate::param_cipher::random_hex(8)));
+        std::fs::create_dir_all(&temp_dir)?;
+        let result = (|| -> Result<HashSet<i64>> {
+            let mut ids = HashSet::new();
+            let mut offset = 0usize;
+            for (index, (_, size)) in scan_toc.iter().enumerate() {
+                let Some(end) = offset.checked_add(*size).filter(|end| *end <= scan_payload.len()) else { break; };
+                let path = temp_dir.join(format!("{index}.db"));
+                std::fs::write(&path, &scan_payload[offset..end])?;
+                offset = end;
+                if let Ok(conn) = Connection::open(&path) {
+                    if let Ok(mut stmt) = conn.prepare("SELECT DISTINCT SenderId FROM ChatContent WHERE SenderId > 0") {
+                        if let Ok(rows) = stmt.query_map([], |row| row.get::<_, i64>(0)) {
+                            ids.extend(rows.flatten().filter(|id| *id > 0));
+                        }
+                    }
                 }
             }
-        }
-        if let Some(arr) = data.get("gids").and_then(|v| v.as_array()) {
-            for (gid, thread_id_val) in gids.iter().zip(arr.iter()) {
-                if let Some(tid) = thread_id_val.as_str() {
-                    id_map.insert(format!("group_{gid}.db"), tid.to_string());
+            Ok(ids)
+        })();
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        result
+    }).await??;
+    let mut seen: HashSet<i64> = all_fids.iter().copied().collect();
+    all_fids.extend(discovered.into_iter().filter(|id| seen.insert(*id)));
+    let mut id_map: HashMap<String, String> = HashMap::new();
+    let mut fid_to_uid: HashMap<i64, String> = HashMap::new();
+    let fid_chunks: Vec<_> = all_fids.chunks(200).collect();
+    let gid_chunks: Vec<_> = gids.chunks(200).collect();
+    for index in 0..fid_chunks.len().max(gid_chunks.len()) {
+        let f_slice = fid_chunks.get(index).copied().unwrap_or(&[]);
+        let g_slice = gid_chunks.get(index).copied().unwrap_or(&[]);
+        let enc_params = s.encoded_params(&json!({"fids": f_slice, "gids": g_slice}))?;
+        let znoise_url = format!("{}/api/znoise?{}", crate::endpoints::ZNOISE, s.common_params());
+        let resp = s.post_form(&znoise_url, format!("params={enc_params}")).await?;
+        let dec = s.maybe_decrypt(resp, s.session_key_bytes()).await;
+        if let Some(data) = dec.get("data") {
+            if let Some(arr) = data.get("fids").and_then(|v| v.as_array()) {
+                for (fid, value) in f_slice.iter().zip(arr) {
+                    if let Some(uid) = value.as_str().map(str::trim).filter(|uid| !uid.is_empty()) {
+                        fid_to_uid.insert(*fid, uid.to_string());
+                        id_map.insert(format!("{fid}.db"), uid.to_string());
+                    }
+                }
+            }
+            if let Some(arr) = data.get("gids").and_then(|v| v.as_array()) {
+                for (gid, value) in g_slice.iter().zip(arr) {
+                    if let Some(uid) = value.as_str().map(str::trim).filter(|uid| !uid.is_empty()) {
+                        id_map.insert(format!("group_{gid}.db"), uid.to_string());
+                    }
                 }
             }
         }
@@ -1157,7 +1185,15 @@ pub async fn import_mobile_backup_container(
             for r in rows.flatten() {
                 let (sender_id_num, cli_msg_id, glb_msg_id, _status, msg_type_num, ts, content_opt, bin_net_opt) = r;
                 let is_outgoing = sender_id_num == my_uin;
-                let sender_id = if is_outgoing { my_uid.clone() } else { thread_id.clone() };
+                let sender_id = if is_outgoing {
+                    my_uid.clone()
+                } else if let Some(uid) = fid_to_uid.get(&sender_id_num) {
+                    uid.clone()
+                } else if name.starts_with("group_") {
+                    sender_id_num.to_string()
+                } else {
+                    thread_id.clone()
+                };
                 let sender_name = if is_outgoing { my_name.clone() } else { String::new() };
 
                 let msg_id = if glb_msg_id > 0 {

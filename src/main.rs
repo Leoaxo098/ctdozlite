@@ -305,7 +305,6 @@ fn main() -> Result<()> {
         .map(|l| l.uin.as_str())
         .unwrap_or("")
         .to_string();
-    let cli_db = store::db_path_for_account(&cli_uin);
     if force_mcp {
         let cli_db = authenticated_db_path(&s)?;
         account_manager::set_active_uin(&cli_uin);
