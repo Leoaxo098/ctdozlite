@@ -1866,6 +1866,11 @@ impl Default for MdOptions {
     }
 }
 
+// Reserve the same space before decoding and after eviction so texture changes cannot move the chat.
+fn single_photo_preview_size(max_width: f32) -> Vec2 {
+    Vec2::new(max_width.min(280.0), 150.0)
+}
+
 pub(super) fn render_message_body(
     ui: &mut egui::Ui,
     msg: &ChatMessage,
@@ -2009,159 +2014,65 @@ pub(super) fn render_message_body(
                 .unwrap_or("Hình ảnh")
                 .to_string();
 
-            if let Some(tex) = sticker_textures.get(&key) {
+            let (rect, response) =
+                ui.allocate_exact_size(single_photo_preview_size(max_text_width), Sense::click());
+            let texture = sticker_textures.get(&key);
+            if texture.is_some() {
                 crate::gui::mark_texture_used(&key);
-                let [tw, th] = tex.size();
-                if tw <= 2 || th <= 2 {
-                    // Expired or empty tombstone image on Zalo CDN (e.g. 1x1 jpeg)
-                    let ph_w = max_text_width.min(260.0).max(110.0);
-                    let ph_frame = egui::Frame::none()
-                        .fill(text_col.linear_multiply(0.05))
-                        .stroke(Stroke::new(1.0_f32, pal.border))
-                        .rounding(Rounding::same(12.0))
-                        .inner_margin(Margin::symmetric(16.0, 14.0))
-                        .show(ui, |ui| {
-                            ui.set_min_width(ph_w);
-                            ui.vertical_centered(|ui| {
-                                let (ir, _) =
-                                    ui.allocate_exact_size(Vec2::splat(28.0), Sense::hover());
-                                draw_icon_image(
-                                    ui.painter(),
-                                    ir.center(),
-                                    22.0,
-                                    text_col.linear_multiply(0.4),
-                                );
-                                ui.add_space(4.0);
-                                ui.label(
-                                    RichText::new("Ảnh đã hết hạn trên Zalo")
-                                        .size(12.5)
-                                        .color(text_col.linear_multiply(0.6)),
-                                );
-                            });
-                        });
-                    if ui
-                        .interact(
-                            ph_frame.response.rect,
-                            Id::new(("photo_exp_click", &msg.id, msg.ts)),
-                            Sense::click(),
-                        )
-                        .on_hover_cursor(CursorIcon::PointingHand)
-                        .on_hover_text("Bấm để thử mở liên kết ảnh gốc")
-                        .clicked()
-                    {
-                        let _ = open_external_url(&open_target);
-                    }
-                } else {
-                    let tw_f = tw.max(1) as f32;
-                    let th_f = th.max(1) as f32;
-                    let max_w = max_text_width.min(360.0).max(110.0);
-                    let max_h = 340.0_f32;
-                    let scale = (max_w / tw_f).min(max_h / th_f).min(1.0);
-                    let disp_w = (tw_f * scale).clamp(max_w.min(140.0), max_w);
-                    let disp_h = (th_f * scale).clamp(90.0_f32.min(max_h), max_h);
-                    let img = egui::Image::new(tex)
-                        .fit_to_exact_size(Vec2::new(disp_w, disp_h))
-                        .maintain_aspect_ratio(false)
-                        .rounding(Rounding::same(12.0))
-                        .sense(Sense::click());
-                    let resp = ui
-                        .add(img)
-                        .on_hover_cursor(CursorIcon::PointingHand)
-                        .on_hover_text("Bấm để xem ảnh phóng to trong ứng dụng");
-                    ui.painter().rect_stroke(
-                        resp.rect,
-                        Rounding::same(12.0),
-                        Stroke::new(
-                            if resp.hovered() { 1.6_f32 } else { 1.0_f32 },
-                            if resp.hovered() {
-                                pal.primary
-                            } else {
-                                pal.border
-                            },
-                        ),
-                    );
-                    // Pointer-in-rect rather than `hovered()`: the save button on top steals
-                    // hover, and the dimmed overlay should not flicker off under it.
-                    if ui.rect_contains_pointer(resp.rect) {
-                        ui.painter().rect_filled(
-                            resp.rect,
-                            Rounding::same(12.0),
-                            Color32::from_rgba_unmultiplied(6, 10, 20, 88),
-                        );
-                        let pill_r =
-                            Rect::from_center_size(resp.rect.center(), Vec2::new(108.0, 26.0));
-                        ui.painter().rect_filled(
-                            pill_r,
-                            Rounding::same(13.0),
-                            Color32::from_rgba_unmultiplied(15, 23, 42, 225),
-                        );
-                        ui.painter().text(
-                            pill_r.center(),
-                            egui::Align2::CENTER_CENTER,
-                            "Phóng to ảnh",
-                            FontId::proportional(11.5),
-                            Color32::WHITE,
-                        );
-                    }
-                    if media_save_overlay(ui, resp.rect, Id::new(("photo_save", &msg.id, msg.ts)))
-                    {
-                        body_action = Some(BubbleAction::SaveMedia {
-                            url: open_target.clone(),
-                            file_name: title_label.clone(),
-                        });
-                    } else if resp.clicked() {
-                        body_action = Some(BubbleAction::OpenImagePopup {
-                            tex_key: key,
-                            full_url: open_target,
-                            title: title_label,
-                            sender: sender_label,
-                            time: msg.time.clone(),
-                        });
-                    }
-                }
+            }
+            let rounding = Rounding::same(12.0);
+            let stroke_col = if response.hovered() {
+                pal.primary
             } else {
-                // Loading / Placeholder frame with visual image icon and loading feedback
-                let disp_w = max_text_width.min(280.0).max(110.0);
-                let disp_h = 150.0_f32;
-                let (rect, resp) =
-                    ui.allocate_exact_size(Vec2::new(disp_w, disp_h), Sense::click());
-                let is_hover = resp.hovered();
-                let bg_col = if is_hover {
-                    text_col.linear_multiply(0.09)
-                } else {
-                    text_col.linear_multiply(0.05)
-                };
-                let stroke_col = if is_hover { pal.primary } else { pal.border };
-                ui.painter().rect_filled(rect, Rounding::same(12.0), bg_col);
-                ui.painter().rect_stroke(
-                    rect,
-                    Rounding::same(12.0),
-                    Stroke::new(1.0_f32, stroke_col),
-                );
+                pal.border
+            };
+            let stroke = Stroke::new(1.0_f32, stroke_col);
 
-                let icon_center = rect.center() - Vec2::new(0.0, 14.0);
-                draw_icon_image(
-                    ui.painter(),
-                    icon_center,
-                    26.0,
-                    text_col.linear_multiply(0.45),
-                );
-                let label_text = if title_label != "Hình ảnh" {
-                    title_label.clone()
-                } else {
-                    "Đang tải hình ảnh...".to_string()
-                };
-                ui.painter().text(
-                    rect.center() + Vec2::new(0.0, 20.0),
-                    egui::Align2::CENTER_CENTER,
-                    label_text,
-                    FontId::proportional(12.5),
-                    text_col.linear_multiply(0.7),
-                );
+            if let Some(tex) = texture.filter(|tex| tex.size().iter().all(|&side| side > 2)) {
+                let native_size = tex.size_vec2();
+                let scale = (rect.width() / native_size.x)
+                    .min(rect.height() / native_size.y)
+                    .min(1.0);
+                let image_rect = Rect::from_center_size(rect.center(), native_size * scale);
+                if ui.is_rect_visible(rect) {
+                    egui::Image::new(tex)
+                        .rounding(rounding)
+                        .paint_at(ui, image_rect);
+                    ui.painter().rect_stroke(image_rect, rounding, stroke);
+                }
 
-                if resp
+                // The save button also claims hover, so keep the overlay visible under it.
+                if ui.rect_contains_pointer(rect) {
+                    ui.painter().rect_filled(
+                        image_rect,
+                        rounding,
+                        Color32::from_rgba_unmultiplied(6, 10, 20, 88),
+                    );
+                    let pill_rect = Rect::from_center_size(
+                        rect.center(),
+                        Vec2::new(rect.width().min(108.0), 26.0),
+                    );
+                    ui.painter().rect_filled(
+                        pill_rect,
+                        Rounding::same(13.0),
+                        Color32::from_rgba_unmultiplied(15, 23, 42, 225),
+                    );
+                    ui.painter().text(
+                        pill_rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "Phóng to ảnh",
+                        FontId::proportional(11.5),
+                        Color32::WHITE,
+                    );
+                }
+                if media_save_overlay(ui, rect, Id::new(("photo_save", &msg.id, msg.ts))) {
+                    body_action = Some(BubbleAction::SaveMedia {
+                        url: open_target.clone(),
+                        file_name: title_label.clone(),
+                    });
+                } else if response
                     .on_hover_cursor(CursorIcon::PointingHand)
-                    .on_hover_text("Đang tải ảnh · Bấm để xem ảnh phóng to")
+                    .on_hover_text("Bấm để xem ảnh phóng to trong ứng dụng")
                     .clicked()
                 {
                     body_action = Some(BubbleAction::OpenImagePopup {
@@ -2171,6 +2082,65 @@ pub(super) fn render_message_body(
                         sender: sender_label,
                         time: msg.time.clone(),
                     });
+                }
+            } else {
+                let expired = texture.is_some();
+                let bg_col = if response.hovered() {
+                    text_col.linear_multiply(0.09)
+                } else {
+                    text_col.linear_multiply(0.05)
+                };
+                ui.painter().rect_filled(rect, rounding, bg_col);
+                ui.painter().rect_stroke(rect, rounding, stroke);
+
+                let painter = ui.painter().with_clip_rect(rect);
+                draw_icon_image(
+                    &painter,
+                    rect.center() - Vec2::new(0.0, 14.0),
+                    26.0,
+                    text_col.linear_multiply(0.45),
+                );
+                let label_text = if expired {
+                    "Ảnh đã hết hạn trên Zalo"
+                } else if title_label != "Hình ảnh" {
+                    &title_label
+                } else {
+                    "Đang tải hình ảnh..."
+                };
+                let label_color = text_col.linear_multiply(0.7);
+                let label = painter.layout(
+                    label_text.to_owned(),
+                    FontId::proportional(12.5),
+                    label_color,
+                    rect.width() - 12.0,
+                );
+                painter.galley(
+                    rect.center() + Vec2::new(0.0, 20.0) - label.size() * 0.5,
+                    label,
+                    label_color,
+                );
+
+                let tooltip = if expired {
+                    "Bấm để thử mở liên kết ảnh gốc"
+                } else {
+                    "Đang tải ảnh · Bấm để xem ảnh phóng to"
+                };
+                if response
+                    .on_hover_cursor(CursorIcon::PointingHand)
+                    .on_hover_text(tooltip)
+                    .clicked()
+                {
+                    if expired {
+                        let _ = open_external_url(&open_target);
+                    } else {
+                        body_action = Some(BubbleAction::OpenImagePopup {
+                            tex_key: key,
+                            full_url: open_target,
+                            title: title_label,
+                            sender: sender_label,
+                            time: msg.time.clone(),
+                        });
+                    }
                 }
             }
             if let Some(cap) = extract_photo_user_caption(msg) {
@@ -4545,24 +4515,7 @@ pub(super) fn render_chat_bubble(
     } else if is_photo_card && album.len() >= 2 {
         album_rendered_width(album.len(), max_text_width)
     } else if is_photo_card {
-        let thumb_u = photo_primary_url(msg).unwrap_or("");
-        let tkey = format!("thumb_{}", crate::crypto::md5_hex(thumb_u));
-        let photo_w = if let Some(tex) = sticker_textures.get(&tkey) {
-            crate::gui::mark_texture_used(&tkey);
-            let [tw, th] = tex.size();
-            if tw <= 2 || th <= 2 {
-                max_text_width.min(260.0).max(110.0)
-            } else {
-                let tw_f = tw as f32;
-                let th_f = th as f32;
-                let max_w = max_text_width.min(360.0).max(110.0);
-                let max_h = 340.0_f32;
-                let scale = (max_w / tw_f).min(max_h / th_f).min(1.0);
-                (tw_f * scale).clamp(max_w.min(140.0), max_w).ceil()
-            }
-        } else {
-            max_text_width.min(280.0).max(110.0)
-        };
+        let photo_w = single_photo_preview_size(max_text_width).x;
         if let Some(cap_str) = photo_caption {
             let cap_w = ui.fonts(|f| {
                 f.layout(
@@ -6714,6 +6667,113 @@ mod album_grid_tests {
             link_url: Some(format!("https://b-f17-zpcloud.zdn.vn/1/{id}.jpg")),
             media_group: group.map(|(g, i)| crate::chat::MediaGroupLayout::new(g, i, 3)),
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn chat_layout_stays_stable_when_photo_textures_change() {
+        let mut photo = album_photo("photo-1", None, false);
+        photo.text = "[Hình ảnh] Chú thích của ảnh trong cuộc trò chuyện".into();
+        photo.reply_to_text = Some("Tin nhắn được trích dẫn để kiểm tra xuống dòng".into());
+        photo.reply_to_sender = Some("An".into());
+        let key = format!(
+            "thumb_{}",
+            crate::crypto::md5_hex(photo_primary_url(&photo).unwrap_or_default())
+        );
+        let palette = ThemePalette::light();
+
+        for at_bottom in [true, false] {
+            let ctx = egui::Context::default();
+            let portrait = ctx.load_texture(
+                "portrait",
+                egui::ColorImage::new([64, 384], Color32::WHITE),
+                egui::TextureOptions::LINEAR,
+            );
+            let expired = ctx.load_texture(
+                "expired",
+                egui::ColorImage::new([1, 1], Color32::WHITE),
+                egui::TextureOptions::LINEAR,
+            );
+            let render_frame = |texture: Option<&TextureHandle>, initial_frame: bool| {
+                let textures = texture
+                    .map(|tex| HashMap::from([(key.clone(), tex.clone())]))
+                    .unwrap_or_default();
+                let mut loading = HashSet::from([key.clone()]);
+                let mut layout = (Vec2::ZERO, 0.0, 0.0);
+                let _ = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(640.0, 360.0))),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            let mut scroll = egui::ScrollArea::vertical()
+                                .auto_shrink([false, false])
+                                .stick_to_bottom(at_bottom || !initial_frame);
+                            if !at_bottom && initial_frame {
+                                scroll = scroll.vertical_scroll_offset(230.0);
+                            }
+                            let result = scroll.show(ui, |ui| {
+                                ui.add_space(280.0);
+                                let photo_row = ui.scope(|ui| {
+                                    render_chat_bubble(
+                                        ui,
+                                        &photo,
+                                        false,
+                                        false,
+                                        false,
+                                        false,
+                                        "An",
+                                        None,
+                                        &palette,
+                                        &textures,
+                                        &mut loading,
+                                        &HashMap::new(),
+                                        &HashMap::new(),
+                                        0,
+                                        &[],
+                                        None,
+                                        false,
+                                        None,
+                                        false,
+                                        None,
+                                        MdOptions {
+                                            enabled: false,
+                                            zalo_bold: false,
+                                        },
+                                    );
+                                });
+                                let next = ui.label("Tin nhắn tiếp theo");
+                                ui.add_space(200.0);
+                                (photo_row.response.rect.size(), next.rect.top())
+                            });
+                            layout = (result.inner.0, result.inner.1, result.state.offset.y);
+                        });
+                    },
+                );
+                layout
+            };
+
+            render_frame(None, true);
+            render_frame(None, false);
+            let baseline = render_frame(None, false);
+            assert!(baseline.2 > 0.0, "the fixture must scroll");
+            if !at_bottom {
+                assert_eq!(baseline.2, 230.0, "the fixture must stay in history");
+            }
+            for (state, texture) in [
+                ("loaded", Some(&portrait)),
+                ("expired", Some(&expired)),
+                ("evicted", None),
+            ] {
+                for _ in 0..2 {
+                    assert_eq!(
+                        render_frame(texture, false),
+                        baseline,
+                        "photo row size, following message y, or scroll offset changed in {state} state (at_bottom={at_bottom})"
+                    );
+                }
+            }
         }
     }
 
