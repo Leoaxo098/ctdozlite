@@ -32,6 +32,8 @@ mod stickers;
 mod theme;
 #[cfg(target_os = "linux")]
 mod tray;
+#[cfg(windows)]
+mod windows_tray;
 pub(crate) mod worker;
 pub(crate) mod workspace;
 
@@ -703,6 +705,14 @@ pub enum GuiEvent {
     },
     LoginFailed(String),
     ThreadsUpdated(Vec<Thread>),
+    /// A batch received directly from a live message transport.
+    LiveThreadsUpdated(Vec<Thread>),
+    /// The Windows settings worker completed the queued write.
+    #[cfg(windows)]
+    SettingsSaveFailed,
+    /// The Windows settings worker finished processing queued writes before exit.
+    #[cfg(windows)]
+    SettingsFlushed,
     MessageSent {
         client_message_id: String,
         thread_id: String,
@@ -1267,6 +1277,7 @@ pub(crate) struct AppSettings {
     show_all_contacts: bool,
     language: String,
     autostart_on_boot: bool,
+    close_to_tray: bool,
     remember_login: bool,
     download_dir: String,
     /// Mã ngôn ngữ đích cho dịch tin nhắn (vi/en/zh/ja/ko...). Mặc định vi.
@@ -1370,6 +1381,7 @@ impl Default for AppSettings {
             show_all_contacts: false,
             language: "Tiếng Việt".into(),
             autostart_on_boot: true,
+            close_to_tray: false,
             remember_login: true,
             download_dir: default_dl,
             translate_target: "vi".into(),
@@ -1475,6 +1487,9 @@ impl AppSettings {
 
     fn save(&self) {
         if let Ok(json) = serde_json::to_string_pretty(self) {
+            #[cfg(windows)]
+            worker::save_app_settings(json);
+            #[cfg(not(windows))]
             let _ = std::fs::write("app_settings.json", json);
         }
     }
@@ -2008,6 +2023,12 @@ pub struct ZaloGuiApp {
     doc_viewer: Option<(String, String, String)>,
     user_online_map: HashMap<String, (bool, String)>,
     allow_quit: bool,
+    #[cfg(windows)]
+    windows_tray: Option<windows_tray::Tray>,
+    #[cfg(windows)]
+    windows_quit_deadline: Option<std::time::Instant>,
+    #[cfg(windows)]
+    windows_quit_ready: bool,
     settings_modal_open: bool,
     settings_tab: SettingsTab,
     notification_authorization: crate::native_notifications::AuthorizationState,
@@ -2398,6 +2419,12 @@ impl ZaloGuiApp {
             doc_viewer: None,
             user_online_map: HashMap::new(),
             allow_quit: false,
+            #[cfg(windows)]
+            windows_tray: None,
+            #[cfg(windows)]
+            windows_quit_deadline: None,
+            #[cfg(windows)]
+            windows_quit_ready: false,
             settings_modal_open: false,
             settings_tab: SettingsTab::General,
             notification_authorization: Default::default(),
@@ -3609,6 +3636,7 @@ impl ZaloGuiApp {
             |last_fail| last_fail.elapsed(),
         );
         while let Ok(event) = self.event_rx.try_recv() {
+            let live_delivery = matches!(&event, GuiEvent::LiveThreadsUpdated(_));
             match event {
                 GuiEvent::NotificationAuthorization { request_id, result } => {
                     self.notification_authorization.finish(request_id, result);
@@ -3689,11 +3717,28 @@ impl ZaloGuiApp {
                     self.login_status_msg = format!("Lỗi đăng nhập: {err}");
                     self.qr_status = format!("⚠️ {err}");
                 }
-                GuiEvent::ThreadsUpdated(updates) => {
-                    ensure_cjk_font(ctx, thread_texts(&updates));
+                #[cfg(windows)]
+                GuiEvent::SettingsSaveFailed => self.show_toast("Không thể lưu cài đặt."),
+                #[cfg(windows)]
+                GuiEvent::SettingsFlushed => self.finish_windows_quit(ctx),
+                GuiEvent::ThreadsUpdated(updates) | GuiEvent::LiveThreadsUpdated(updates) => {
+                    let parked = self.is_parked_in_windows_tray();
+                    #[cfg(windows)]
+                    let tray_since = self
+                        .windows_tray
+                        .as_ref()
+                        .filter(|_| live_delivery)
+                        .map(windows_tray::Tray::parked_since_ms);
+                    #[cfg(not(windows))]
+                    let tray_since = {
+                        let _ = live_delivery;
+                        None
+                    };
+                    if !parked {
+                        ensure_cjk_font(ctx, thread_texts(&updates));
+                    }
                     if self.is_logged_in && !updates.is_empty() {
-                        // Group Workspace: flush ghi chú đang treo (debounce) trước khi merge —
-                        // đổi nhóm nhanh (drawer chưa mở/đóng) không mất chữ đã gõ.
+                        // Preserve pending notes if merging changes the selected group.
                         self.flush_group_note_pending();
                         let prev_selected = self.threads.get(self.selected_thread_index).cloned();
                         let live_ids: HashSet<String> = self
@@ -3713,14 +3758,11 @@ impl ZaloGuiApp {
                             .as_ref()
                             .map(|t| t.id.clone())
                             .unwrap_or_default();
-                        let is_focused = self.effective_window_focused(ctx);
+                        let is_focused = !parked && self.effective_window_focused(ctx);
                         let mask_notifications = self.should_mask_notifications();
                         let mut new_incoming_alert = false;
                         let mut chat_banners: Vec<(String, String)> = Vec::new();
-                        // Group Workspace: toast khớp keyword gom ở đây để bắn sau merge
-                        // (tránh borrow `existing` + `self` cùng lúc trong vòng lặp).
                         let mut watch_toasts: Vec<String> = Vec::new();
-                        // Script on_message: (thread_id, tin mới) chờ chạy sau merge (tránh borrow).
                         let mut script_msg_pending: Vec<(String, Vec<ChatMessage>)> = Vec::new();
                         let now_ts = crate::login::unix_now() as i64;
                         for mut nt in updates {
@@ -3773,18 +3815,28 @@ impl ZaloGuiApp {
                                     existing.unread.muted = false;
                                     existing.unread.muted_until = None;
                                 }
-                                if was_empty && existing.unread.last_seen_id.is_none() {
+                                if was_empty
+                                    && existing.unread.last_seen_id.is_none()
+                                    && tray_since.is_none()
+                                {
                                     // Empty thread receiving its initial history snapshot must not fire alerts.
                                     let _ = advance_thread_read_point(existing);
                                 } else {
                                     let seen = existing.unread.last_seen_id.as_deref().unwrap_or("");
                                     let fresh_unread_ids: Vec<(String, String, String)> =
-                                        collect_fresh_incoming_unread(
-                                            &existing.messages,
-                                            seen,
-                                            &old_ids,
-                                            old_max_ts,
-                                        )
+                                        if let Some(since) = tray_since {
+                                            existing.messages.iter().filter(|m| {
+                                                !old_ids.contains(&m.id)
+                                                    && incoming_tray_message(m, since)
+                                                    && (seen.is_empty()
+                                                        || crate::unread::compare_ids(&m.id, seen)
+                                                            == Some(std::cmp::Ordering::Greater))
+                                            }).collect()
+                                        } else {
+                                            collect_fresh_incoming_unread(
+                                                &existing.messages, seen, &old_ids, old_max_ts,
+                                            )
+                                        }
                                         .into_iter()
                                         .map(|m| (m.id.clone(), m.sender.clone(), m.text.clone()))
                                         .collect();
@@ -3824,9 +3876,9 @@ impl ZaloGuiApp {
                                                     .entry(existing.id.clone())
                                                     .or_insert(0) += inc_cnt;
                                                 if !is_thread_muted {
-                                                    new_incoming_alert = true;
+                                                    new_incoming_alert |= !parked || tray_since.is_some();
                                                     if let Some((_, sender_raw, text_raw)) =
-                                                        notify_items.last()
+                                                        notify_items.last().filter(|_| !parked)
                                                     {
                                                         let unread_for_thread = self
                                                             .unread_counts
@@ -3941,7 +3993,7 @@ impl ZaloGuiApp {
                                     now_ts,
                                 );
                                 let seen = nt.unread.last_seen_id.as_deref().unwrap_or("");
-                                if seen.is_empty() {
+                                if seen.is_empty() && tray_since.is_none() {
                                     let _ = advance_thread_read_point(&mut nt);
                                     self.threads.push(nt);
                                     continue;
@@ -3953,8 +4005,10 @@ impl ZaloGuiApp {
                                         !m.is_outgoing
                                             && m.kind != crate::message_model::MessageKind::System
                                             && m.unread_policy.counts_unread()
-                                            && crate::unread::compare_ids(&m.id, seen)
-                                                == Some(std::cmp::Ordering::Greater)
+                                            && (seen.is_empty()
+                                                || crate::unread::compare_ids(&m.id, seen)
+                                                    == Some(std::cmp::Ordering::Greater))
+                                            && tray_since.is_none_or(|since| incoming_tray_message(m, since))
                                             && (m.id.is_empty()
                                                 || self.notified_msg_ids.insert(m.id.clone()))
                                     })
@@ -3969,8 +4023,10 @@ impl ZaloGuiApp {
                                     && inc_cnt > 0
                                     && (nt.id != active_tid || !is_focused)
                                 {
-                                    new_incoming_alert = true;
-                                    if let Some((_, sender_raw, text_raw)) = unseen_items.last() {
+                                    new_incoming_alert |= !parked || tray_since.is_some();
+                                    if let Some((_, sender_raw, text_raw)) =
+                                        unseen_items.last().filter(|_| !parked)
+                                    {
                                         push_thread_chat_notification(
                                             &nt,
                                             sender_raw,
@@ -4007,7 +4063,7 @@ impl ZaloGuiApp {
                             #[cfg(not(target_os = "windows"))]
                             crate::os_notify::notify_chat_batch(&chat_banners);
                             #[cfg(target_os = "windows")]
-                            let _ = &chat_banners;
+                            self.notify_windows_tray();
                             ctx.request_repaint();
                             let total_unread: usize = self.unread_counts.values().sum();
                             let title = if total_unread > 0 {
@@ -4016,7 +4072,7 @@ impl ZaloGuiApp {
                                 "ctdozlite".to_string()
                             };
                             ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
-                            if !is_focused {
+                            if !is_focused && !self.is_parked_in_windows_tray() {
                                 ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
                                     egui::UserAttentionType::Informational,
                                 ));
@@ -4558,6 +4614,14 @@ impl ZaloGuiApp {
                         });
                     }
                     if !reaction_banners.is_empty() && reactions_notify_on {
+                        #[cfg(windows)]
+                        if self.is_parked_in_windows_tray() {
+                            if reactions_sound_on {
+                                crate::media::play_notification_chime();
+                            }
+                            self.notify_windows_tray_with_body("Bạn có lượt bày tỏ cảm xúc mới");
+                            continue;
+                        }
                         let masked_reactions: Vec<(String, String, Option<String>, bool, String)> =
                             reaction_banners
                                 .into_iter()
@@ -5099,6 +5163,8 @@ impl ZaloGuiApp {
                     is_video,
                     is_group,
                 } => {
+                    #[cfg(windows)]
+                    self.restore_windows_tray(ctx);
                     let resolved_name = self
                         .threads
                         .iter()
@@ -5857,7 +5923,7 @@ fn file_uri(path: &str) -> String {
 impl eframe::App for ZaloGuiApp {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.update_frame(ctx, frame);
-        if !ctx.will_discard() {
+        if !ctx.will_discard() && !self.is_parked_in_windows_tray() {
             self.color_emoji.paint(ctx);
         }
     }
@@ -5880,33 +5946,41 @@ impl eframe::App for ZaloGuiApp {
                 );
             }
         }
-        let _ = self.settings.save();
+        #[cfg(windows)]
+        drop(self.windows_tray.take());
+        #[cfg(not(windows))]
+        self.settings.save();
         std::process::exit(0);
     }
 }
 
 impl ZaloGuiApp {
     fn update_frame(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.ensure_windows_frameless_subclass(ctx);
-
-        // Ctrl+Q and the tray's "Thoát" quit; closing the window only hides it to the
-        // tray while a tray icon is shown, so the app keeps receiving messages.
-        let quit_now = ctx.input(|i| i.modifiers.ctrl && i.key_pressed(Key::Q))
-            || self.take_tray_quit_request();
-        if quit_now {
-            self.allow_quit = true;
+        #[cfg(windows)]
+        self.update_windows_close(ctx);
+        if !self.is_parked_in_windows_tray() {
+            self.ensure_windows_frameless_subclass(ctx);
         }
-        let close_requested = ctx.input(|i| i.viewport().close_requested());
-        if close_requested && !self.allow_quit && self.hides_to_tray() {
-            self.try_trigger_lock(ctx);
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-        } else if quit_now || close_requested {
-            self.allow_quit = true;
-            if let Some(tx) = WORKER_TX.get() {
-                let _ = tx.send(WorkerCmd::EndCall);
+
+        #[cfg(not(windows))]
+        {
+            let quit_now = ctx.input(|i| i.modifiers.ctrl && i.key_pressed(Key::Q))
+                || self.take_tray_quit_request();
+            if quit_now {
+                self.allow_quit = true;
             }
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            let close_requested = ctx.input(|i| i.viewport().close_requested());
+            if close_requested && !self.allow_quit && self.hides_to_tray() {
+                self.try_trigger_lock(ctx);
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            } else if quit_now || close_requested {
+                self.allow_quit = true;
+                if let Some(tx) = WORKER_TX.get() {
+                    let _ = tx.send(WorkerCmd::EndCall);
+                }
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
         }
         #[cfg(target_os = "linux")]
         if let Some(tray) = self.tray.as_mut() {
@@ -5974,7 +6048,10 @@ impl ZaloGuiApp {
         );
 
         self.check_events(ctx);
-        self.drain_pending_texture_uploads(ctx);
+        let parked = self.is_parked_in_windows_tray();
+        if !parked {
+            self.drain_pending_texture_uploads(ctx);
+        }
 
         let now_wall = crate::login::unix_now();
         let wall_delta = now_wall.saturating_sub(self.app_lock_ui.last_frame_wall_unix);
@@ -5995,6 +6072,11 @@ impl ZaloGuiApp {
             if sleep_jumped || idle_expired {
                 self.try_trigger_lock(ctx);
             }
+        }
+
+        #[cfg(windows)]
+        if parked || self.allow_quit {
+            return;
         }
 
         let scr_check = ctx.screen_rect();
@@ -6196,6 +6278,8 @@ impl ZaloGuiApp {
                 .show(ctx, |ui| {
                     self.render_login_screen(ui, &pal);
                 });
+            #[cfg(windows)]
+            self.render_toast_overlay(ctx, &pal);
         } else {
             self.mark_active_thread_read_if_focused(ctx);
             self.render_app_lock_setup_modal(ctx, &pal);
@@ -6634,6 +6718,9 @@ impl ZaloGuiApp {
                             "Đóng ứng dụng (Ctrl+Q)"
                         });
                         if close_resp.clicked() {
+                            #[cfg(windows)]
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                            #[cfg(not(windows))]
                             if to_tray {
                                 self.try_trigger_lock(ctx);
                                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
@@ -7241,6 +7328,11 @@ impl ZaloGuiApp {
                 crate::media::play_notification_chime();
             }
             #[cfg(target_os = "windows")]
+            if self.is_parked_in_windows_tray() {
+                self.notify_windows_tray();
+                return;
+            }
+            #[cfg(target_os = "windows")]
             if let Some((title, body)) = banners.last().cloned() {
                 self.incoming_popup = Some(IncomingPopupState::new(
                     String::new(),
@@ -7582,6 +7674,14 @@ fn collect_fresh_incoming_unread<'a>(
             }
         })
         .collect()
+}
+
+fn incoming_tray_message(message: &ChatMessage, since_ms: i64) -> bool {
+    crate::clock::normalize_ts_ms(message.ts) >= since_ms
+        && !message.id.is_empty()
+        && !message.is_outgoing
+        && message.kind != crate::message_model::MessageKind::System
+        && message.unread_policy.counts_unread()
 }
 
 /// Count incoming messages newer than each thread's read-point.
@@ -8405,6 +8505,133 @@ mod tests {
 }
 
 impl ZaloGuiApp {
+    #[cfg(windows)]
+    fn notify_windows_tray(&self) {
+        self.notify_windows_tray_with_body("Bạn có tin nhắn mới");
+    }
+
+    #[cfg(windows)]
+    fn notify_windows_tray_with_body(&self, body: &str) {
+        // The existing application chime handles the sound preference.
+        if let Some(tray) = &self.windows_tray {
+            let body = if self.should_mask_notifications() {
+                "Bạn có thông báo mới"
+            } else {
+                body
+            };
+            if !tray.notify(body) {
+                eprintln!("Windows did not accept the tray notification");
+            }
+        }
+    }
+
+    fn is_parked_in_windows_tray(&self) -> bool {
+        #[cfg(windows)]
+        {
+            self.windows_tray.is_some()
+        }
+        #[cfg(not(windows))]
+        {
+            false
+        }
+    }
+
+    #[cfg(windows)]
+    fn restore_windows_tray(&mut self, ctx: &egui::Context) {
+        if let Some(tray) = self.windows_tray.take() {
+            tray.restore_window();
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            ensure_cjk_font(ctx, thread_texts(&self.threads));
+        }
+    }
+
+    #[cfg(windows)]
+    fn update_windows_close(&mut self, ctx: &egui::Context) {
+        use windows_tray::Action;
+        let action = self
+            .windows_tray
+            .as_ref()
+            .and_then(windows_tray::Tray::take_action);
+        match action {
+            Some(Action::Open) if !self.allow_quit => self.restore_windows_tray(ctx),
+            Some(Action::ExplorerRestarted)
+                if !self.allow_quit
+                    && !self.windows_tray.as_ref().is_some_and(windows_tray::Tray::register) =>
+            {
+                self.restore_windows_tray(ctx);
+                self.show_toast("Không thể khôi phục biểu tượng khay hệ thống.");
+            }
+            _ => {}
+        }
+
+        let close_requested = ctx.input(|i| i.viewport().close_requested());
+        let quit = self.allow_quit
+            || action == Some(Action::Quit)
+            || ctx.input(|i| i.modifiers.ctrl && i.key_pressed(Key::Q));
+        if close_requested && !self.windows_quit_ready {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        }
+        if !self.windows_quit_ready && (quit || close_requested) {
+            match windows_close_action(quit, self.settings.close_to_tray, self.active_call.is_some())
+            {
+                WindowsCloseAction::Quit => self.begin_windows_quit(ctx),
+                WindowsCloseAction::Minimize => {
+                    self.try_trigger_lock(ctx);
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                }
+                WindowsCloseAction::Park if self.windows_tray.is_none() => {
+                    let hwnd = self.resolve_windows_hwnd();
+                    match windows_tray::Tray::new(ctx, hwnd) {
+                        Ok(tray) => {
+                            self.windows_tray = Some(tray);
+                            self.incoming_popup = None;
+                            self.try_trigger_lock(ctx);
+                        }
+                        Err(err) => {
+                            eprintln!("Could not create Windows tray icon: {err}");
+                            self.show_toast("Không thể tạo biểu tượng khay hệ thống.");
+                        }
+                    }
+                }
+                WindowsCloseAction::Park => {}
+            }
+        }
+        if self
+            .windows_quit_deadline
+            .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+        {
+            self.finish_windows_quit(ctx);
+        }
+    }
+
+    #[cfg(windows)]
+    fn begin_windows_quit(&mut self, ctx: &egui::Context) {
+        if self.windows_quit_deadline.is_some() {
+            return;
+        }
+        self.allow_quit = true;
+        if let Some(tx) = WORKER_TX.get() {
+            // Call cleanup is best-effort during process shutdown.
+            let _ = tx.send(WorkerCmd::EndCall);
+        }
+        self.settings.save();
+        if worker::flush_app_settings() {
+            let timeout = Duration::from_secs(2);
+            self.windows_quit_deadline = Some(std::time::Instant::now() + timeout);
+            ctx.request_repaint_after(timeout);
+        } else {
+            self.finish_windows_quit(ctx);
+        }
+    }
+
+    #[cfg(windows)]
+    fn finish_windows_quit(&mut self, ctx: &egui::Context) {
+        self.windows_quit_deadline = None;
+        self.windows_quit_ready = true;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        ctx.request_repaint();
+    }
+
     /// Closing the window hides it to the tray instead of quitting (Linux, tray shown).
     fn hides_to_tray(&self) -> bool {
         #[cfg(target_os = "linux")]
@@ -8414,13 +8641,18 @@ impl ZaloGuiApp {
                 && tray::host_online()
                 && std::env::var_os("WAYLAND_DISPLAY").is_none()
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(windows)]
+        {
+            self.settings.close_to_tray && self.active_call.is_none()
+        }
+        #[cfg(not(any(target_os = "linux", windows)))]
         {
             false
         }
     }
 
     /// A pending "Thoát" from the tray menu.
+    #[cfg(not(windows))]
     fn take_tray_quit_request(&self) -> bool {
         #[cfg(target_os = "linux")]
         {
@@ -8719,5 +8951,73 @@ mod app_lock_state_tests {
         call_overlay.error_reason = Some("Kết thúc".to_string());
         assert!(!is_live_active_call(Some(&call_overlay)));
         assert!(!is_live_active_call(None));
+    }
+}
+
+#[cfg(any(windows, test))]
+#[derive(Debug, PartialEq, Eq)]
+enum WindowsCloseAction {
+    Quit,
+    Minimize,
+    Park,
+}
+
+#[cfg(any(windows, test))]
+fn windows_close_action(quit: bool, close_to_tray: bool, active_call: bool) -> WindowsCloseAction {
+    if quit || !close_to_tray {
+        WindowsCloseAction::Quit
+    } else if active_call {
+        WindowsCloseAction::Minimize
+    } else {
+        WindowsCloseAction::Park
+    }
+}
+
+#[cfg(test)]
+mod windows_close_tests {
+    use super::{incoming_tray_message, windows_close_action, AppSettings, WindowsCloseAction::*};
+
+    #[test]
+    fn close_to_tray_defaults_off_and_round_trips() {
+        let old: AppSettings = serde_json::from_str("{}").unwrap();
+        assert!(!old.close_to_tray);
+        let enabled: AppSettings = serde_json::from_str(r#"{"close_to_tray":true}"#).unwrap();
+        assert_eq!(serde_json::to_value(enabled).unwrap()["close_to_tray"], true);
+    }
+
+    #[test]
+    fn close_to_tray_keeps_calls_accessible_and_explicit_quit_available() {
+        assert_eq!(windows_close_action(false, false, false), Quit);
+        assert_eq!(windows_close_action(false, true, false), Park);
+        assert_eq!(windows_close_action(false, true, true), Minimize);
+        assert_eq!(windows_close_action(true, true, true), Quit);
+    }
+
+    #[test]
+    fn tray_alerts_accept_new_incoming_messages_and_skip_history() {
+        let mut message = crate::chat::ChatMessage {
+            id: "123".into(),
+            ts: 1_799_000_000,
+            unread_policy: crate::message_model::UnreadPolicy::from_raw(
+                &serde_json::json!({"paramsExt": {"countUnread": 1}}),
+            ),
+            ..Default::default()
+        };
+        let cutoff = 1_799_000_000_000;
+        assert!(incoming_tray_message(&message, cutoff));
+        assert!(!incoming_tray_message(&message, cutoff + 1));
+        message.is_outgoing = true;
+        assert!(!incoming_tray_message(&message, cutoff));
+    }
+
+    #[test]
+    fn an_expired_mute_allows_tray_alerts() {
+        let settings = std::collections::HashMap::new();
+        let mut thread = crate::chat::Thread::default();
+        thread.presentation.muted = true;
+        thread.unread.muted = true;
+        assert!(crate::unread::is_thread_muted(&settings, &thread, 2));
+        thread.unread.muted_until = Some(1);
+        assert!(!crate::unread::is_thread_muted(&settings, &thread, 2));
     }
 }

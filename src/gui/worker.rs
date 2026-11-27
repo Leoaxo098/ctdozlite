@@ -1034,9 +1034,66 @@ async fn forget_lock_and_sign_out_all(
     .await;
 }
 
+#[cfg(windows)]
+enum SettingsRequest {
+    Save(String),
+    Flush,
+}
+
+#[cfg(windows)]
+static SETTINGS_TX: std::sync::OnceLock<tokio::sync::mpsc::UnboundedSender<SettingsRequest>> =
+    std::sync::OnceLock::new();
+
+/// Queue a complete settings snapshot for ordered persistence on Windows.
+#[cfg(windows)]
+pub(super) fn save_app_settings(json: String) {
+    if !SETTINGS_TX.get().is_some_and(|tx| tx.send(SettingsRequest::Save(json)).is_ok()) {
+        eprintln!("Windows settings writer is unavailable");
+    }
+}
+
+/// Request an acknowledgment after the settings writer drains its queued saves.
+#[cfg(windows)]
+pub(super) fn flush_app_settings() -> bool {
+    SETTINGS_TX.get().is_some_and(|tx| tx.send(SettingsRequest::Flush).is_ok())
+}
+
+#[cfg(windows)]
+async fn write_app_settings(
+    mut requests: tokio::sync::mpsc::UnboundedReceiver<SettingsRequest>,
+    gui_tx: GuiTx,
+) {
+    while let Some(request) = requests.recv().await {
+        match request {
+            SettingsRequest::Save(json) => {
+                let saved = tokio::task::spawn_blocking(move || {
+                    crate::data_dir::write_private_atomic(
+                        std::path::Path::new("app_settings.json"),
+                        json.as_bytes(),
+                    )
+                })
+                .await;
+                if !matches!(saved, Ok(Ok(()))) {
+                    crate::logger::log_error("gui::save_app_settings", "Could not persist settings");
+                    let _ = gui_tx.send(GuiEvent::SettingsSaveFailed);
+                }
+            }
+            SettingsRequest::Flush => {
+                let _ = gui_tx.send(GuiEvent::SettingsFlushed);
+            }
+        }
+    }
+}
+
 pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: egui::Context) {
     let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<WorkerCmd>();
     let _ = WORKER_TX.set(cmd_tx);
+    #[cfg(windows)]
+    let settings_rx = {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let _ = SETTINGS_TX.set(tx);
+        rx
+    };
 
     let session = std::sync::Arc::new(tokio::sync::Mutex::new(session));
     let poll_state =
@@ -1064,6 +1121,8 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
             };
 
             rt.block_on(async move {
+                #[cfg(windows)]
+                tokio::spawn(write_app_settings(settings_rx, gui_tx.clone()));
                 {
                     let s = session.lock().await.clone();
                     if let Some(li) = s.login.as_ref() {
@@ -1611,7 +1670,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                                 if !ws_threads.is_empty() && session_matches_active(&s_snap) {
                                                     // Deliver incoming messages to UI immediately (0ms network wait)
                                                     let _ = gui_tx_ws.send(
-                                                        GuiEvent::ThreadsUpdated(ws_threads.clone()),
+                                                        GuiEvent::LiveThreadsUpdated(ws_threads.clone()),
                                                     );
                                                     ctx_ws.request_repaint();
                                                     let needs_resolve = ws_threads.iter().any(|t| {
@@ -2983,7 +3042,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                                 if is_fresh && session_matches_active(&s) {
                                                     // Deliver polled messages to UI immediately without blocking on profile HTTP
                                                     let _ = gui_tx_clone
-                                                        .send(GuiEvent::ThreadsUpdated(temp_threads.clone()));
+                                                        .send(GuiEvent::LiveThreadsUpdated(temp_threads.clone()));
                                                     ctx_clone.request_repaint();
                                                 }
                                                 let needs_resolve = temp_threads.iter().any(|t| {
