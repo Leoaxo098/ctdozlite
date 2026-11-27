@@ -11,9 +11,10 @@
 use anyhow::Result;
 use session::Session;
 pub use zalo_rust::{
-    account_manager, agent, api_mcp, auth, audio, call, chat, clock, crypto, data_dir, endpoints, feed,
-    gui, history_sync, llm, logger, login, media, media_resources, message_model, param_cipher,
-    qr, reactions, scheduler, session, socket, store, tg_bridge, tui, ui, unread, updater, voip_log,
+    account_manager, agent, api_mcp, audio, auth, call, chat, clock, crypto, data_dir, endpoints,
+    feed, gui, history_sync, llm, logger, login, media, media_resources, message_model,
+    param_cipher, qr, reactions, scheduler, session, single_instance, socket, store, tg_bridge,
+    tui, ui, unread, updater, voip_log,
 };
 
 pub const POLL_SECS: u64 = 4;
@@ -197,6 +198,52 @@ fn main() -> Result<()> {
                 .find_map(|a| a.strip_prefix("--proxy=").map(str::to_string))
         });
 
+    // Only flips a flag; set early so single-instance errors below are logged in dev mode.
+    logger::init(dev_mode);
+
+    // Checked before `--logout` so a second launch cannot delete the running GUI's session.
+    let launches_gui = LaunchFlags {
+        gui: force_gui,
+        tui: force_tui,
+        qr: force_qr,
+        logout: force_logout,
+        mcp: force_mcp,
+        agent: agent_mode,
+        tg_bridge,
+        headless_api: api_port.is_some() && args.iter().any(|a| a == "--api-only"),
+        phone: args.iter().any(|a| a.starts_with("--phone")),
+    }
+    .launches_gui();
+    // Held until exit; the kernel releases the lock when this process ends.
+    let mut instance_guard = None;
+    // `--logout` also probes the lock, even in a headless mode, so it never deletes the
+    // session of a GUI that is running on the same data folder.
+    if launches_gui || force_logout {
+        let here = std::path::Path::new(".");
+        match single_instance::acquire(here) {
+            // A probe-only launch drops the guard at once, releasing the lock.
+            Ok(single_instance::Acquired::Primary(guard)) => {
+                if launches_gui {
+                    instance_guard = Some(guard);
+                }
+            }
+            Ok(single_instance::Acquired::AlreadyRunning) if !launches_gui => {
+                eprintln!("ctdozlite đang chạy: hãy thoát ứng dụng trước khi đăng xuất.");
+                return Ok(());
+            }
+            Ok(single_instance::Acquired::AlreadyRunning) => {
+                // This process exits right away, so the in-memory log would lose it.
+                if let Err(err) = single_instance::notify_running(here) {
+                    eprintln!("ctdozlite: không gọi được cửa sổ đang chạy: {err}");
+                }
+                println!("ℹ️ ctdozlite đang chạy, đã mở lại cửa sổ hiện có.");
+                return Ok(());
+            }
+            // Fail open: a broken lock file must not keep the app from starting.
+            Err(err) => logger::log_error("main::single_instance", &err.to_string()),
+        }
+    }
+
     if force_logout {
         let _ = std::fs::remove_file("session.json");
         let _ = std::fs::remove_file("threads_cache.json");
@@ -205,8 +252,6 @@ fn main() -> Result<()> {
             return Ok(());
         }
     }
-
-    logger::init(dev_mode);
 
     // MCP stdio mode: stdout is JSON-RPC only — human logs go to stderr.
     macro_rules! user_msg {
@@ -366,10 +411,16 @@ fn main() -> Result<()> {
         );
 
         let app_session = s;
+        // Borrowed, not moved: the guard (and its lock) must outlive the creator closure.
+        let show_target = instance_guard.as_mut();
         let res = eframe::run_native(
             "ctdozlite",
             native_options,
             Box::new(move |cc| {
+                if let Some(guard) = show_target {
+                    let ctx = cc.egui_ctx.clone();
+                    guard.spawn_show_listener(move || single_instance::show_window(&ctx));
+                }
                 Ok(Box::new(gui::ZaloGuiApp::new(
                     cc,
                     app_session,
@@ -559,4 +610,81 @@ fn main() -> Result<()> {
 
     Ok(())
     })
+}
+
+/// Command-line modes that decide whether this launch ends in the GUI.
+#[derive(Debug, Default, Clone, Copy)]
+struct LaunchFlags {
+    gui: bool,
+    tui: bool,
+    qr: bool,
+    logout: bool,
+    mcp: bool,
+    agent: bool,
+    tg_bridge: bool,
+    /// `--api-only` with a port: the headless REST server, which returns before the GUI.
+    headless_api: bool,
+    phone: bool,
+}
+
+impl LaunchFlags {
+    /// Whether `main` reaches the GUI branch, so this launch must hold the single-instance
+    /// lock. Mirrors the early returns in `main`: agent, Telegram bridge, MCP and the
+    /// headless API server return first whatever `--gui` says; a bare `--logout` returns
+    /// after deleting the session.
+    fn launches_gui(self) -> bool {
+        if self.agent || self.tg_bridge || self.mcp || self.headless_api {
+            return false;
+        }
+        if self.logout && !self.gui && !self.tui && !self.qr {
+            return false;
+        }
+        self.gui || !(self.tui || self.qr || self.phone)
+    }
+}
+
+#[cfg(test)]
+mod launch_tests {
+    use super::LaunchFlags;
+
+    #[test]
+    fn only_launches_that_reach_the_gui_take_the_instance_lock() {
+        let gui = LaunchFlags {
+            gui: true,
+            ..Default::default()
+        };
+        assert!(LaunchFlags::default().launches_gui(), "no flags opens the GUI");
+        assert!(gui.launches_gui());
+        // Headless modes return before the GUI even with `--gui`.
+        for headless in [
+            LaunchFlags { mcp: true, ..gui },
+            LaunchFlags { agent: true, ..gui },
+            LaunchFlags { tg_bridge: true, ..gui },
+            LaunchFlags { headless_api: true, ..gui },
+        ] {
+            assert!(!headless.launches_gui(), "{headless:?}");
+        }
+        // `--api-only` without a port falls through to the GUI and keeps the lock.
+        assert!(LaunchFlags {
+            headless_api: false,
+            ..gui
+        }
+        .launches_gui());
+        // `--logout` alone exits; with `--gui` it continues into the GUI.
+        assert!(!LaunchFlags {
+            logout: true,
+            ..Default::default()
+        }
+        .launches_gui());
+        assert!(LaunchFlags { logout: true, ..gui }.launches_gui());
+        // TUI, QR and phone login do not open the GUI unless `--gui` is given.
+        for other in [
+            LaunchFlags { tui: true, ..Default::default() },
+            LaunchFlags { qr: true, ..Default::default() },
+            LaunchFlags { phone: true, ..Default::default() },
+        ] {
+            assert!(!other.launches_gui(), "{other:?}");
+        }
+        assert!(LaunchFlags { tui: true, ..gui }.launches_gui());
+    }
 }
