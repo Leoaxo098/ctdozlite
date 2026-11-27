@@ -37,6 +37,10 @@ mod windows_tray;
 pub(crate) mod worker;
 pub(crate) mod workspace;
 
+pub use messages::{
+    compute_video_thumb_size, cover_uv_for, image_file_preview_size, media_source_size,
+    parse_inline_md_runs, parse_inline_md_runs_for_message, photo_display_size, InlineMdRun,
+};
 use messages::*;
 use poll_card::*;
 use stickers::*;
@@ -7766,7 +7770,7 @@ fn unread_counts_from_read_points(threads: &[Thread]) -> HashMap<String, usize> 
 
 
 #[cfg(any(windows, test))]
-fn tray_notification_body(mask_notifications: bool, body: &str) -> &str {
+pub fn tray_notification_body(mask_notifications: bool, body: &str) -> &str {
     if mask_notifications {
         "Bạn có thông báo mới"
     } else {
@@ -7942,14 +7946,14 @@ impl ZaloGuiApp {
 
 #[cfg(any(windows, test))]
 #[derive(Debug, PartialEq, Eq)]
-enum WindowsCloseAction {
+pub enum WindowsCloseAction {
     Quit,
     Minimize,
     Park,
 }
 
 #[cfg(any(windows, test))]
-fn windows_close_action(quit: bool, close_to_tray: bool, active_call: bool) -> WindowsCloseAction {
+pub fn windows_close_action(quit: bool, close_to_tray: bool, active_call: bool) -> WindowsCloseAction {
     if quit || !close_to_tray {
         WindowsCloseAction::Quit
     } else if active_call {

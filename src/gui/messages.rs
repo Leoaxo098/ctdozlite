@@ -1202,7 +1202,7 @@ fn parse_ordered_item(line: &str) -> Option<(String, usize, String)> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum InlineMdRun {
+pub enum InlineMdRun {
     Plain(String),
     Bold(String),
     Underline(String),
@@ -1302,6 +1302,65 @@ fn find_next_bare_url(s: &str) -> Option<usize> {
         }
     }
     best
+}
+
+thread_local! {
+    /// Exact display names tagged in the message currently being rendered (from the wire
+    /// `mentions` pos/len). Lets the inline parser underline only the name, not the words after.
+    static MENTION_NAMES: std::cell::RefCell<Option<Vec<String>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Names tagged in `msg`, taken from `mentions` (live) or `meta/mentionsList` (history).
+/// `pos`/`len` are UTF-16 offsets into the text, as produced by the Zalo web client.
+/// `None` when the message carries no mention data.
+fn mention_names(msg: &ChatMessage, text: &str) -> Option<Vec<String>> {
+    let raw = msg.wire_ref.fields.get("mentions").or_else(|| {
+        msg.history_source
+            .as_ref()
+            .and_then(|s| s.pointer("/meta/mentionsList"))
+    })?;
+    let list: Vec<serde_json::Value> = match raw {
+        serde_json::Value::Array(a) => a.clone(),
+        serde_json::Value::String(s) => serde_json::from_str(s).ok()?,
+        _ => return None,
+    };
+    let utf16: Vec<u16> = text.encode_utf16().collect();
+    let num = |v: Option<&serde_json::Value>| {
+        v.and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+            .map(|n| n as usize)
+    };
+    let mut names: Vec<String> = list
+        .iter()
+        .filter_map(|m| {
+            let pos = num(m.get("pos"))?;
+            let len = num(m.get("len"))?;
+            let slice = utf16.get(pos..pos.checked_add(len)?)?;
+            let name = String::from_utf16(slice).ok()?;
+            let name = name.trim().trim_start_matches('@').trim().to_string();
+            (!name.is_empty()).then_some(name)
+        })
+        .collect();
+    names.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+    names.dedup();
+    Some(names)
+}
+
+/// Render `f` with the tagged names of `msg` available to the inline parser.
+fn with_mention_names<R>(msg: &ChatMessage, text: &str, f: impl FnOnce() -> R) -> R {
+    let names = mention_names(msg, text);
+    MENTION_NAMES.with(|m| *m.borrow_mut() = names);
+    let out = f();
+    MENTION_NAMES.with(|m| *m.borrow_mut() = None);
+    out
+}
+
+pub fn parse_inline_md_runs_for_message(
+    msg: &ChatMessage,
+    text: &str,
+    zalo_bold: bool,
+) -> Vec<InlineMdRun> {
+    with_mention_names(msg, text, || parse_inline_md_runs(text, zalo_bold))
 }
 
 pub fn parse_inline_md_runs(text: &str, zalo_bold: bool) -> Vec<InlineMdRun> {
@@ -1405,6 +1464,23 @@ pub fn parse_inline_md_runs(text: &str, zalo_bold: bool) -> Vec<InlineMdRun> {
                 }
             }
 
+            let known = MENTION_NAMES.with(|m| m.borrow().clone());
+            if let Some(names) = &known {
+                if let Some(name) = names.iter().find(|n| {
+                    after.starts_with(n.as_str())
+                        && after[n.len()..]
+                            .chars()
+                            .next()
+                            .is_none_or(|ch| !ch.is_alphanumeric() && ch != '_')
+                }) {
+                    let mention_len = 1 + name.len();
+                    runs.push(InlineMdRun::Mention(rest[..mention_len].to_string()));
+                    rest = &rest[mention_len..];
+                    continue;
+                }
+            }
+            let max_words = if known.is_some() { 0 } else { 5 };
+
             let mut end_idx = 0;
             let mut word_count = 0;
             let mut prev_is_space = false;
@@ -1433,7 +1509,7 @@ pub fn parse_inline_md_runs(text: &str, zalo_bold: bool) -> Vec<InlineMdRun> {
                 }
                 if ch.is_whitespace() {
                     word_count += 1;
-                    if word_count >= 5 || prev_is_space {
+                    if word_count >= max_words || prev_is_space {
                         break;
                     }
                     prev_is_space = true;
@@ -1446,7 +1522,8 @@ pub fn parse_inline_md_runs(text: &str, zalo_bold: bool) -> Vec<InlineMdRun> {
                 end_idx = idx + ch.len_utf8();
             }
             let candidate_name = after[..end_idx].trim_end();
-            if !candidate_name.is_empty()
+            if max_words > 0
+                && !candidate_name.is_empty()
                 && candidate_name.chars().next().is_some_and(char::is_alphanumeric)
             {
                 let mention_len = 1 + candidate_name.len();
@@ -2312,8 +2389,10 @@ pub(super) fn render_message_body(
         } else {
             &msg.text
         };
-        let display_text = crate::chat::text_emoticons_to_emoji(display_text);
-        render_chat_markdown_block_opts(ui, &display_text, text_col, pal, md.enabled, md.zalo_bold);
+        let shown = crate::chat::text_emoticons_to_emoji(display_text);
+        with_mention_names(msg, display_text, || {
+            render_chat_markdown_block_opts(ui, &shown, text_col, pal, md.enabled, md.zalo_bold)
+        });
         return None;
     };
 
@@ -3455,7 +3534,7 @@ fn render_image_file_card(
     )
 }
 
-pub(crate) fn compute_video_thumb_size(tw: usize, th: usize, max_text_width: f32) -> (f32, f32) {
+pub fn compute_video_thumb_size(tw: usize, th: usize, max_text_width: f32) -> (f32, f32) {
     let tw_f = (tw.max(1)) as f32;
     let th_f = (th.max(1)) as f32;
     if th_f > tw_f {
@@ -6414,7 +6493,7 @@ pub(super) fn render_hover_reaction_bar(
     idx: usize,
     outgoing: bool,
     pal: &ThemePalette,
-    _emoji_textures: &HashMap<String, TextureHandle>,
+    emoji_textures: &HashMap<String, TextureHandle>,
 ) -> Option<BubbleAction> {
     let hover_id = Id::new("active_hover_reaction_bubble");
     let hover_state_id = hover_id.with("state");
@@ -6435,7 +6514,7 @@ pub(super) fn render_hover_reaction_bar(
         return None;
     }
 
-    let bar_w = 92.0_f32;
+    let bar_w = 119.0_f32;
     let bar_h = 28.0_f32;
 
     let clip_right = ui.clip_rect().right();
@@ -6561,6 +6640,39 @@ pub(super) fn render_hover_reaction_bar(
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing = Vec2::new(3.0, 0.0);
+
+                        let (h_rect, h_resp) =
+                            ui.allocate_exact_size(Vec2::splat(24.0), Sense::click());
+                        if h_resp.hovered() {
+                            ui.painter().rect_filled(h_rect, Rounding::same(6.0), pal.bg_hover);
+                        }
+                        if let Some(tex) = emoji_textures.get("heart") {
+                            let icon = Rect::from_center_size(
+                                h_rect.center(),
+                                Vec2::splat(if h_resp.hovered() { 16.0 } else { 14.0 }),
+                            );
+                            ui.painter().image(
+                                tex.id(),
+                                icon,
+                                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                                Color32::WHITE,
+                            );
+                        } else {
+                            ui.painter().text(
+                                h_rect.center(),
+                                egui::Align2::CENTER_CENTER,
+                                "❤",
+                                FontId::proportional(13.0),
+                                pal.danger,
+                            );
+                        }
+                        if h_resp
+                            .on_hover_cursor(CursorIcon::PointingHand)
+                            .on_hover_text("Thả tim · chuột phải vào tin để chọn cảm xúc khác")
+                            .clicked()
+                        {
+                            action = Some(BubbleAction::React("❤️"));
+                        }
 
                         let (r_rect, r_resp) =
                             ui.allocate_exact_size(Vec2::splat(24.0), Sense::click());
