@@ -47,6 +47,11 @@ use stickers::*;
 use theme::*;
 pub use theme::{emoji_to_tex_key, load_app_icon, lucide, REACTION_LIST};
 pub use worker::WorkerCmd;
+#[cfg(windows)]
+pub use worker::{
+    flush_app_settings_with, save_app_settings_with, start_settings_writer_with,
+    write_app_settings, SettingsRequest,
+};
 use worker::*;
 
 fn merge_sent_message(thread: &mut Thread, message: ChatMessage) {

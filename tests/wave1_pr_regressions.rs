@@ -169,19 +169,11 @@ fn pr174_exact_mention_uses_utf16_wire_offsets_and_word_boundary() {
     );
 
     // Must not match "@An" as a prefix of "@Anh".
-    let text_prefix = "@Anh đi ăn cơm";
     let mut msg_prefix = ChatMessage {
         id: "m-mention-boundary".into(),
-        text: text_prefix.into(),
+        text: "@Anh ơi".into(),
         ..Default::default()
     };
-    msg_prefix.wire_ref.fields.insert(
-        "mentions".into(),
-        json!([{"pos": 3, "len": 3, "uid": "u1"}]),
-    );
-    // Feed message referencing "@An" inside wire mentions while text has "@Anh":
-    msg_prefix.history_source = Some(json!({"meta": {"mentionsList": []}}));
-    msg_prefix.wire_ref.fields.clear();
     msg_prefix.wire_ref.fields.insert(
         "mentions".into(),
         json!([{"pos": 0, "len": 3}]),
@@ -234,4 +226,95 @@ fn pr213_tray_masking_and_windows_close_action() {
         windows_close_action(false, true, false),
         WindowsCloseAction::Park
     );
+}
+
+#[cfg(windows)]
+#[test]
+fn pr213_settings_flush_persists_latest_snapshot_without_session_runtime() {
+    use zalo_rust::gui::{write_app_settings, GuiEvent, GuiTx, SettingsRequest};
+
+    let path = std::env::temp_dir().join(format!(
+        "ctdozlite-settings-writer-{}.json",
+        std::process::id(),
+    ));
+    let (requests_tx, requests_rx) = std::sync::mpsc::channel();
+    let (events_tx, events_rx) = std::sync::mpsc::channel();
+    assert!(requests_tx.send(SettingsRequest::Save("{}".into())).is_ok());
+    let final_snapshot = r#"{"close_to_tray":true}"#;
+    assert!(requests_tx
+        .send(SettingsRequest::Save(final_snapshot.into()))
+        .is_ok());
+    assert!(requests_tx.send(SettingsRequest::Flush).is_ok());
+    write_app_settings(
+        requests_rx,
+        GuiTx::new(events_tx, eframe::egui::Context::default()),
+        &path,
+    );
+    let saved = std::fs::read_to_string(&path);
+    assert!(std::fs::remove_file(path).is_ok());
+    assert_eq!(saved.as_deref().ok(), Some(final_snapshot));
+    assert!(matches!(
+        events_rx.try_recv(),
+        Ok(GuiEvent::SettingsFlushed)
+    ));
+    assert!(requests_tx.send(SettingsRequest::Save("{}".into())).is_err());
+}
+
+#[cfg(windows)]
+#[test]
+fn pr213_save_app_settings_persists_before_writer_start_and_is_idempotent_across_restarts() {
+    use zalo_rust::gui::{
+        flush_app_settings_with, save_app_settings_with, start_settings_writer_with, GuiEvent,
+        GuiTx, SettingsRequest,
+    };
+
+    let path = std::env::temp_dir().join(format!(
+        "ctdozlite-settings-prelogin-{}.json",
+        std::process::id(),
+    ));
+    let _ = std::fs::remove_file(&path);
+    let slot: std::sync::OnceLock<std::sync::mpsc::Sender<SettingsRequest>> =
+        std::sync::OnceLock::new();
+
+    let pre_login_snapshot = r#"{"close_to_tray":true,"stage":"pre_login"}"#;
+    save_app_settings_with(&slot, pre_login_snapshot.into(), &path);
+    assert_eq!(
+        std::fs::read_to_string(&path).as_deref().ok(),
+        Some(pre_login_snapshot)
+    );
+
+    let (events_tx, events_rx) = std::sync::mpsc::channel();
+    let gui_tx = GuiTx::new(events_tx, eframe::egui::Context::default());
+    start_settings_writer_with(&slot, &gui_tx, path.clone());
+    let Some(first_sender) = slot.get().cloned() else {
+        panic!("writer sender initialized");
+    };
+    start_settings_writer_with(&slot, &gui_tx, path.clone());
+    let Some(second_sender) = slot.get().cloned() else {
+        panic!("writer sender kept");
+    };
+    assert!(first_sender
+        .send(SettingsRequest::Save(r#"{"stage":"active"}"#.into()))
+        .is_ok());
+
+    let queued_snapshot = r#"{"close_to_tray":false,"stage":"relogin"}"#;
+    save_app_settings_with(&slot, queued_snapshot.into(), &path);
+    assert!(flush_app_settings_with(&slot));
+    assert!(matches!(
+        events_rx.recv_timeout(std::time::Duration::from_secs(2)),
+        Ok(GuiEvent::SettingsFlushed)
+    ));
+    assert_eq!(
+        std::fs::read_to_string(&path).as_deref().ok(),
+        Some(queued_snapshot)
+    );
+    assert!(second_sender.send(SettingsRequest::Flush).is_err());
+
+    let post_flush_snapshot = r#"{"close_to_tray":true,"stage":"post_flush"}"#;
+    save_app_settings_with(&slot, post_flush_snapshot.into(), &path);
+    assert_eq!(
+        std::fs::read_to_string(&path).as_deref().ok(),
+        Some(post_flush_snapshot)
+    );
+    let _ = std::fs::remove_file(&path);
 }
