@@ -926,37 +926,40 @@ fn render_pin4_entry(
         ..Default::default()
     };
 
-    ui.allocate_new_ui(egui::UiBuilder::new().max_rect(backing_rect), |ui| {
-        ui.visuals_mut().text_cursor.stroke = Stroke::NONE;
-        ui.visuals_mut().selection = egui::style::Selection::default();
-        if any_box_clicked {
-            sync_pin4_cursor_to_end(ui.ctx(), field_id, buf);
+    let mut backing_ui = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(backing_rect)
+            .id_salt((id_salt, "pin4_backing")),
+    );
+    backing_ui.visuals_mut().text_cursor.stroke = Stroke::NONE;
+    backing_ui.visuals_mut().selection = egui::style::Selection::default();
+    if any_box_clicked {
+        sync_pin4_cursor_to_end(backing_ui.ctx(), field_id, buf);
+    }
+    let r = backing_ui.add(
+        egui::TextEdit::singleline(buf)
+            .id(field_id)
+            .frame(false)
+            .password(!*show_pin)
+            .text_color(Color32::TRANSPARENT)
+            .desired_width(2.0),
+    );
+    if request_focus || any_box_clicked {
+        r.request_focus();
+        sync_pin4_cursor_to_end(backing_ui.ctx(), field_id, buf);
+        backing_ui.ctx().request_repaint();
+    }
+    if r.changed() {
+        let cleaned = sanitize_pin4_input(buf);
+        if cleaned != *buf {
+            *buf = cleaned;
         }
-        let r = ui.add(
-            egui::TextEdit::singleline(buf)
-                .id(field_id)
-                .frame(false)
-                .password(!*show_pin)
-                .text_color(Color32::TRANSPARENT)
-                .desired_width(2.0),
-        );
-        if request_focus || any_box_clicked {
-            r.request_focus();
-            sync_pin4_cursor_to_end(ui.ctx(), field_id, buf);
-            ui.ctx().request_repaint();
-        }
-        if r.changed() {
-            let cleaned = sanitize_pin4_input(buf);
-            if cleaned != *buf {
-                *buf = cleaned;
-            }
-            out.changed = true;
-        }
-        if r.lost_focus() && enter_in_frame {
-            out.enter_pressed = true;
-        }
-        out.has_focus = r.has_focus() || request_focus || any_box_clicked;
-    });
+        out.changed = true;
+    }
+    if r.lost_focus() && enter_in_frame {
+        out.enter_pressed = true;
+    }
+    out.has_focus = r.has_focus() || request_focus || any_box_clicked;
 
     out
 }
@@ -3258,5 +3261,68 @@ mod tests {
         assert!(!after.open);
         assert!(after.new_passcode.is_empty());
         assert!(!after.show_passcode);
+    }
+
+    #[test]
+    fn pin4_entry_preserves_parent_cursor_below_boxes_and_helper_strip() {
+        let ctx = egui::Context::default();
+        crate::gui::theme::build_fonts(&ctx, "default", false);
+        let pal = ThemePalette::dark();
+
+        let mut pin_lock = String::new();
+        let mut show_lock = false;
+        let mut first_box_lock = egui::Rect::NOTHING;
+        let mut forgot_rect = egui::Rect::NOTHING;
+        let _ = ctx.run(RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.vertical_centered(|ui| {
+                    let out = render_pin4_entry(
+                        ui,
+                        &pal,
+                        "test_cursor_lock",
+                        &mut pin_lock,
+                        &mut show_lock,
+                        true,
+                        true,
+                    );
+                    first_box_lock = out.first_box_rect.unwrap();
+                    ui.add_space(12.0);
+                    forgot_rect = ui.button("Quên mã khoá? Đăng xuất").rect;
+                });
+            });
+        });
+        assert!(
+            forgot_rect.top() >= first_box_lock.bottom() + 28.0,
+            "forgot link ({:?}) overlapped PIN4 boxes/strip ({:?})",
+            forgot_rect,
+            first_box_lock
+        );
+
+        let mut pin_form = String::new();
+        let mut show_form = false;
+        let mut first_box_form = egui::Rect::NOTHING;
+        let mut next_rect = egui::Rect::NOTHING;
+        let _ = ctx.run(RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let out = render_pin4_entry(
+                    ui,
+                    &pal,
+                    "test_cursor_form",
+                    &mut pin_form,
+                    &mut show_form,
+                    true,
+                    false,
+                );
+                first_box_form = out.first_box_rect.unwrap();
+                ui.add_space(9.0);
+                next_rect = ui.label("Xác nhận mã PIN").rect;
+            });
+        });
+        assert!(
+            next_rect.top() >= first_box_form.bottom() + 8.0,
+            "confirm label ({:?}) overlapped PIN4 form boxes ({:?})",
+            next_rect,
+            first_box_form
+        );
     }
 }
