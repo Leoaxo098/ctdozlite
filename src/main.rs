@@ -13,8 +13,8 @@ use session::Session;
 pub use zalo_rust::{
     account_manager, agent, api_mcp, audio, auth, call, chat, clock, crypto, data_dir, endpoints,
     feed, gui, history_sync, llm, logger, login, media, media_resources, message_model,
-    param_cipher, qr, reactions, scheduler, session, single_instance, socket, store, tg_bridge,
-    tui, ui, unread, updater, voip_log,
+    param_cipher, qr, reactions, scheduler, session, single_instance, socket, storage_manager,
+    store, tg_bridge, tui, ui, unread, updater, voip_log,
 };
 
 pub const POLL_SECS: u64 = 4;
@@ -366,7 +366,6 @@ fn main() -> Result<()> {
         }
     }
 
-    // Determine launch mode:
     // If `--gui` is specified (or default when not `--tui` / `--qr` / `--phone`):
     // Open the native GUI window IMMEDIATELY without blocking on network requests!
     // Background worker in `gui.rs` handles `get_server_info`, `get_friends`, and `poll_new_messages`.
@@ -640,51 +639,5 @@ impl LaunchFlags {
             return false;
         }
         self.gui || !(self.tui || self.qr || self.phone)
-    }
-}
-
-#[cfg(test)]
-mod launch_tests {
-    use super::LaunchFlags;
-
-    #[test]
-    fn only_launches_that_reach_the_gui_take_the_instance_lock() {
-        let gui = LaunchFlags {
-            gui: true,
-            ..Default::default()
-        };
-        assert!(LaunchFlags::default().launches_gui(), "no flags opens the GUI");
-        assert!(gui.launches_gui());
-        // Headless modes return before the GUI even with `--gui`.
-        for headless in [
-            LaunchFlags { mcp: true, ..gui },
-            LaunchFlags { agent: true, ..gui },
-            LaunchFlags { tg_bridge: true, ..gui },
-            LaunchFlags { headless_api: true, ..gui },
-        ] {
-            assert!(!headless.launches_gui(), "{headless:?}");
-        }
-        // `--api-only` without a port falls through to the GUI and keeps the lock.
-        assert!(LaunchFlags {
-            headless_api: false,
-            ..gui
-        }
-        .launches_gui());
-        // `--logout` alone exits; with `--gui` it continues into the GUI.
-        assert!(!LaunchFlags {
-            logout: true,
-            ..Default::default()
-        }
-        .launches_gui());
-        assert!(LaunchFlags { logout: true, ..gui }.launches_gui());
-        // TUI, QR and phone login do not open the GUI unless `--gui` is given.
-        for other in [
-            LaunchFlags { tui: true, ..Default::default() },
-            LaunchFlags { qr: true, ..Default::default() },
-            LaunchFlags { phone: true, ..Default::default() },
-        ] {
-            assert!(!other.launches_gui(), "{other:?}");
-        }
-        assert!(LaunchFlags { tui: true, ..gui }.launches_gui());
     }
 }

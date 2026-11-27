@@ -145,7 +145,7 @@ mod win32_frameless {
 
     // winit 0.30 keeps WS_CAPTION | WS_THICKFRAME and WS_EX_WINDOWEDGE even for undecorated
     // windows. Intel/hybrid WGL drivers use AdjustWindowRectEx on those bits and shift rendering,
-    // leaving an unrendered black border on the top/left edges.
+    /// leaving an unrendered black border on the top/left edges.
     const WS_BORDER: u32 = 0x0080_0000;
     const WS_DLGFRAME: u32 = 0x0040_0000;
     const WS_CAPTION: u32 = WS_BORDER | WS_DLGFRAME;
@@ -538,7 +538,7 @@ mod win32_frameless {
         }
         let (newly_subclassed, style_changed) = install_frameless_subclass(matched);
         if rounded_corners && (newly_subclassed || style_changed) {
-            // Enable hardware-clipped rounded corners on Windows 11; Windows 10 ignores safely.
+            /// Enable hardware-clipped rounded corners on Windows 11; Windows 10 ignores safely.
             const DWMWA_WINDOW_CORNER_PREFERENCE: u32 = 33;
             const DWMWCP_ROUND: u32 = 2;
             let pref = DWMWCP_ROUND;
@@ -1208,6 +1208,7 @@ enum SettingsTab {
     Account,
     Privacy,
     Sync,
+    DataStorage,
     Appearance,
     Notifications,
     Messages,
@@ -1273,16 +1274,16 @@ pub(crate) struct EditingMessage {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub(crate) struct AppSettings {
-    // 1. Cài đặt chung
     show_all_contacts: bool,
     language: String,
     autostart_on_boot: bool,
     close_to_tray: bool,
     remember_login: bool,
     download_dir: String,
+    #[serde(default)]
+    pub(crate) storage_root: String,
     /// Mã ngôn ngữ đích cho dịch tin nhắn (vi/en/zh/ja/ko...). Mặc định vi.
     translate_target: String,
-    // 2. Quyền riêng tư
     show_birthday: String,
     show_online_status: bool,
     show_seen_status: bool,
@@ -1295,7 +1296,6 @@ pub(crate) struct AppSettings {
     friend_src_qr: bool,
     friend_src_group: bool,
     friend_src_card: bool,
-    // 3. Giao diện
     pub(crate) theme_mode: String, // "light" | "dark" | "system"
     pub(crate) use_avatar_as_wallpaper: bool,
     pub(crate) font_family: String,
@@ -1310,10 +1310,8 @@ pub(crate) struct AppSettings {
     pub(crate) custom_accent_color: Option<String>,
     pub(crate) custom_bubble_out_bg: Option<String>,
     pub(crate) custom_bubble_in_bg: Option<String>,
-    // 4. Thông báo
     enable_notifications: bool,
     play_notification_sound: bool,
-    // 5. Tin nhắn
     quick_messages_enabled: bool,
     quick_reply_enabled: bool,
     quick_reply_items: Vec<String>,
@@ -1329,12 +1327,10 @@ pub(crate) struct AppSettings {
     double_click_to_reply: bool,
     show_typing_indicator: bool,
     send_message_key: String, // "enter" | "cmd_enter"
-    // 6. Tiện ích
     suggest_stickers_while_typing: bool,
     suggest_mentions: bool,
     enable_gif_search: bool,
     enable_sticker_keyword_search: bool,
-    // 7. Thiết bị cuộc gọi (Mic & Camera)
     selected_mic_device: String,
     selected_camera_device: String,
     mic_gain_percent: u32,
@@ -1342,7 +1338,7 @@ pub(crate) struct AppSettings {
     pinned_threads: Vec<String>,
     muted_threads: HashMap<String, i64>,
     hidden_threads: HashSet<String>,
-    // Nhãn phân loại thread (WaveA3 gán tay chuột phải). Sibling đang dùng nhưng thiếu khai báo.
+    /// Nhãn phân loại thread (WaveA3 gán tay chuột phải). Sibling đang dùng nhưng thiếu khai báo.
     #[serde(default)]
     thread_labels: HashMap<String, String>,
     #[serde(default)]
@@ -1350,10 +1346,8 @@ pub(crate) struct AppSettings {
     /// Folder đang active ("" = Tất cả). Lưu cùng settings.
     #[serde(default)]
     active_chat_folder: String,
-    // 9. Cập nhật tự động qua GitHub Releases API
     auto_check_updates: bool,
     skipped_update_version: String,
-    // 10. Proxy & Đa tài khoản (#64)
     proxy_url: String,
     multi_profile_name: String,
     /// LLM endpoint (OpenAI-compatible). Trống = resolve từ opencode.json / Ollama local.
@@ -1384,6 +1378,7 @@ impl Default for AppSettings {
             close_to_tray: false,
             remember_login: true,
             download_dir: default_dl,
+            storage_root: String::new(),
             translate_target: "vi".into(),
             show_birthday: "Không hiện".into(),
             show_online_status: true,
@@ -1482,6 +1477,7 @@ impl AppSettings {
             .and_then(|s| serde_json::from_str::<Self>(&s).ok())
             .unwrap_or_default();
         settings.normalize_muted_threads_at(crate::login::unix_now() as i64);
+        crate::storage_manager::set_storage_root(&settings.storage_root);
         settings
     }
 
@@ -1823,12 +1819,10 @@ fn title_bar_controls_reserve_width(shows_lock_btn: bool) -> f32 {
 }
 
 pub struct ZaloGuiApp {
-    // Theme state
     dark_mode: bool,
     theme_dirty: bool,
     cached_palette: ThemePalette,
 
-    // Session state
     is_logged_in: bool,
     user_name: String,
     user_uin: String,
@@ -1844,18 +1838,15 @@ pub struct ZaloGuiApp {
     /// Cached flag indicating saved session credentials exist on disk, avoiding per-frame scans.
     has_saved_credentials_cached: bool,
 
-    // Login screen state
     login_tab: LoginTab,
     phone_input: String,
     password_input: String,
     login_in_progress: bool,
     login_status_msg: String,
 
-    // QR state
     qr_texture: Option<TextureHandle>,
     qr_status: String,
 
-    // Chat screen state
     threads: Vec<Thread>,
     /// Event ledger for reaction counts (see `reactions::ReactionInbox`).
     reaction_inbox: crate::reactions::ReactionInbox,
@@ -1866,7 +1857,6 @@ pub struct ZaloGuiApp {
     status_msg: String,
     pub(crate) voice_recorder: Option<crate::audio::VoiceRecorder>,
 
-    // Reply / forward state
     replying_to: Option<ChatMessage>,
     forward_msg: Option<ChatMessage>,
     forward_filter: String,
@@ -2031,6 +2021,7 @@ pub struct ZaloGuiApp {
     windows_quit_ready: bool,
     settings_modal_open: bool,
     settings_tab: SettingsTab,
+    storage_media_expanded: bool,
     notification_authorization: crate::native_notifications::AuthorizationState,
     settings: AppSettings,
     update_checking: bool,
@@ -2106,7 +2097,6 @@ pub struct ZaloGuiApp {
     /// System-tray icon with an unread dot; `None` when the tray thread could not start.
     #[cfg(target_os = "linux")]
     tray: Option<tray::TrayHandle>,
-    // Background channels
     event_rx: Receiver<GuiEvent>,
     #[allow(dead_code)]
     event_tx: Sender<GuiEvent>,
@@ -2427,6 +2417,7 @@ impl ZaloGuiApp {
             windows_quit_ready: false,
             settings_modal_open: false,
             settings_tab: SettingsTab::General,
+            storage_media_expanded: false,
             notification_authorization: Default::default(),
             settings: loaded_settings,
             update_checking: false,
@@ -5957,13 +5948,9 @@ fn file_uri(path: &str) -> String {
     out
 }
 
-// ---------------------------------------------------------------------------
 // Lightweight Background Session Worker (2-thread Tokio pool, off-UI disk I/O)
-// ---------------------------------------------------------------------------
 
-// ---------------------------------------------------------------------------
 // Main eframe::App Implementation
-// ---------------------------------------------------------------------------
 
 impl eframe::App for ZaloGuiApp {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
@@ -6267,7 +6254,6 @@ impl ZaloGuiApp {
 
         self.handle_frameless_resize(ctx);
         self.render_custom_title_bar(ctx, &pal);
-        // Dev Inspector Panel
         if !self.app_locked && self.dev_mode && self.dev_panel_open {
             egui::TopBottomPanel::bottom("dev_inspector")
                 .resizable(true)
@@ -6311,7 +6297,6 @@ impl ZaloGuiApp {
                 });
         }
 
-        // Main Workspace
         if self.app_locked {
             self.render_lock_screen(ctx, &pal);
             if self.incoming_popup.is_some() && self.settings.enable_notifications {
@@ -6356,9 +6341,6 @@ impl ZaloGuiApp {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Screen Renderers
-// ---------------------------------------------------------------------------
 
 impl ZaloGuiApp {
     fn resize_cursor_for(dir: egui::ResizeDirection) -> CursorIcon {
@@ -6680,7 +6662,6 @@ impl ZaloGuiApp {
                 let mut buttons_left_x = bar_rect.right();
 
                 ui.horizontal_centered(|ui| {
-                    // 1. App Logo (20x20)
                     let (logo_rect, _) =
                         ui.allocate_exact_size(Vec2::new(20.0, 20.0), Sense::hover());
                     if let Some(tex) = &self.app_logo_texture {
@@ -6727,11 +6708,9 @@ impl ZaloGuiApp {
                         );
                     }
 
-                    // 2. Right-side Window Control Buttons
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.spacing_mut().item_spacing.x = 0.0;
 
-                        // Close Button (46x32)
                         let (close_rect, close_resp) =
                             ui.allocate_exact_size(Vec2::new(46.0, 32.0), Sense::click());
                         if close_resp.hovered() {
@@ -6778,7 +6757,6 @@ impl ZaloGuiApp {
                             }
                         }
 
-                        // Maximize / Restore Button (46x32)
                         let (max_rect, max_resp) =
                             ui.allocate_exact_size(Vec2::new(46.0, 32.0), Sense::click());
                         if max_resp.hovered() {
@@ -6829,7 +6807,6 @@ impl ZaloGuiApp {
                             toggle_max_requested = true;
                         }
 
-                        // Minimize Button (46x32)
                         let (min_rect, min_resp) =
                             ui.allocate_exact_size(Vec2::new(46.0, 32.0), Sense::click());
                         if min_resp.hovered() {
@@ -6850,7 +6827,6 @@ impl ZaloGuiApp {
                             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
                         }
 
-                        // Quick Theme Toggle (36x32)
                         let (th_rect, th_resp) =
                             ui.allocate_exact_size(Vec2::new(36.0, 32.0), Sense::click());
                         if th_resp.hovered() {
@@ -7622,7 +7598,7 @@ pub(super) fn resolve_dark_mode(theme_mode: &str, ctx: &egui::Context) -> bool {
 
 #[cfg(target_os = "windows")]
 fn detect_windows_os_dark_mode() -> Option<bool> {
-    // Query HKCU\...\Personalize\AppsUseLightTheme without extra crate deps (0 = dark, 1 = light).
+    /// Query HKCU\...\Personalize\AppsUseLightTheme without extra crate deps (0 = dark, 1 = light).
     type Hkey = isize;
     const HKEY_CURRENT_USER: Hkey = -0x7FFF_FFFF_isize; // 0x80000001
     const RRF_RT_REG_DWORD: u32 = 0x0000_0010;
@@ -7788,799 +7764,6 @@ fn unread_counts_from_read_points(threads: &[Thread]) -> HashMap<String, usize> 
     counts
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{is_newer_semver, phone_sync_completion_message};
-
-    #[test]
-    fn file_uri_percent_encodes_spaces_unicode_and_quotes() {
-        assert_eq!(
-            super::file_uri("/home/u/Tải về/a b'c.jpg"),
-            "file:///home/u/T%E1%BA%A3i%20v%E1%BB%81/a%20b%27c.jpg"
-        );
-    }
-
-    fn unread_fixture(seen: Option<&str>, ids: &[(&str, bool)]) -> crate::chat::Thread {
-        let mut thread = crate::chat::Thread {
-            presentation: Default::default(),
-            unread: Default::default(),
-            id: "thread-1".into(),
-            name: "Thread 1".into(),
-            preview: String::new(),
-            time: String::new(),
-            avatar: None,
-            is_group: false,
-            messages: Vec::new(),
-            vanish: None,
-        };
-        thread.unread.last_seen_id = seen.map(str::to_string);
-        for (id, outgoing) in ids {
-            thread.messages.push(crate::chat::ChatMessage {
-                id: (*id).to_string(),
-                is_outgoing: *outgoing,
-                ..Default::default()
-            });
-        }
-        thread
-    }
-
-    #[test]
-    fn unread_rebuild_counts_incoming_messages_after_read_point() {
-        let thread = unread_fixture(Some("100"), &[("99", false), ("101", false), ("102", true), ("103", false)]);
-        let counts = super::unread_counts_from_read_points(&[thread]);
-        assert_eq!(counts.get("thread-1"), Some(&2));
-    }
-
-    #[test]
-    fn unread_rebuild_skips_threads_without_read_point() {
-        let thread = unread_fixture(None, &[("101", false)]);
-        assert!(super::unread_counts_from_read_points(&[thread]).is_empty());
-    }
-
-    #[test]
-    fn collect_fresh_incoming_unread_filters_read_backfill_and_non_numeric() {
-        let mut old_ids = std::collections::HashSet::new();
-        old_ids.insert("199".to_string());
-        let msgs = vec![
-            crate::chat::ChatMessage {
-                id: "190".into(),
-                is_outgoing: false,
-                ts: 900,
-                ..Default::default()
-            },
-            crate::chat::ChatMessage {
-                id: "199".into(),
-                is_outgoing: false,
-                ts: 1000,
-                ..Default::default()
-            },
-            crate::chat::ChatMessage {
-                id: "200".into(),
-                is_outgoing: false,
-                ts: 1000,
-                ..Default::default()
-            },
-            crate::chat::ChatMessage {
-                id: "msg_1050".into(),
-                is_outgoing: false,
-                ts: 1050,
-                ..Default::default()
-            },
-            crate::chat::ChatMessage {
-                id: "205".into(),
-                is_outgoing: false,
-                ts: 950, // backfilled older ts than old_max_ts=1000
-                ..Default::default()
-            },
-            crate::chat::ChatMessage {
-                id: "210".into(),
-                is_outgoing: true,
-                ts: 1100,
-                ..Default::default()
-            },
-            crate::chat::ChatMessage {
-                id: "215".into(),
-                is_outgoing: false,
-                ts: 1150,
-                ..Default::default()
-            },
-        ];
-        let fresh = super::collect_fresh_incoming_unread(&msgs, "200", &old_ids, 1000);
-        let ids: Vec<&str> = fresh.iter().map(|m| m.id.as_str()).collect();
-        assert_eq!(ids, vec!["215"]);
-
-        let mut thread = unread_fixture(Some("200"), &[("199", false), ("215", false)]);
-        thread.messages.push(crate::chat::ChatMessage {
-            id: "out_1234".into(),
-            is_outgoing: true,
-            ..Default::default()
-        });
-        assert_eq!(
-            super::advance_thread_read_point(&mut thread).as_deref(),
-            Some("215")
-        );
-    }
-
-    #[test]
-    fn sent_message_reconciles_when_server_push_arrives_first() {
-        let mut thread = crate::chat::Thread::default();
-        let server = crate::chat::ChatMessage {
-            id: "server-a".into(),
-            client_message_id: "client-a".into(),
-            text: "Server push".into(),
-            is_outgoing: true,
-            delivery: crate::message_model::DeliveryState::Delivered,
-            ..Default::default()
-        };
-        super::merge_sent_message(&mut thread, server.clone());
-        for local_id in ["out_client-a", "server-a"] {
-            super::merge_sent_message(
-                &mut thread,
-                crate::chat::ChatMessage {
-                    id: local_id.into(),
-                    client_message_id: "client-a".into(),
-                    text: "Local echo".into(),
-                    is_outgoing: true,
-                    ..Default::default()
-                },
-            );
-            assert_eq!(thread.messages.len(), 1);
-            assert_eq!(thread.messages[0].id, "server-a");
-            assert_eq!(thread.messages[0].delivery, server.delivery);
-        }
-    }
-
-    #[test]
-    fn delayed_local_ack_preserves_server_chronology() {
-        let mut thread = crate::chat::Thread::default();
-        for (id, client, ts) in [
-            ("server-a", "client-a", 1000),
-            ("server-b", "client-b", 2000),
-        ] {
-            thread.messages.push(crate::chat::ChatMessage {
-                id: id.into(),
-                client_message_id: client.into(),
-                ts,
-                time: ts.to_string(),
-                is_outgoing: true,
-                ..Default::default()
-            });
-        }
-        for ack_id in ["out_client-a", "server-a"] {
-            super::merge_sent_message(
-                &mut thread,
-                crate::chat::ChatMessage {
-                    id: ack_id.into(),
-                    client_message_id: "client-a".into(),
-                    ts: 3000,
-                    time: "3000".into(),
-                    is_outgoing: true,
-                    ..Default::default()
-                },
-            );
-            let chronology: Vec<_> = thread
-                .messages
-                .iter()
-                .map(|message| (message.id.as_str(), message.ts, message.time.as_str()))
-                .collect();
-            assert_eq!(
-                chronology,
-                [("server-a", 1000, "1000"), ("server-b", 2000, "2000")]
-            );
-        }
-    }
-
-    #[test]
-    fn semver_comparison_handles_v_prefix_and_prerelease() {
-        assert!(is_newer_semver("v0.0.2", "0.0.1"));
-        assert!(is_newer_semver("0.1.0", "0.0.9"));
-        assert!(is_newer_semver("V1.0.0-beta.1", "0.9.9"));
-        assert!(!is_newer_semver("v0.0.1", "0.0.1"));
-        assert!(!is_newer_semver("0.0.1", "0.0.2"));
-    }
-
-    #[test]
-    fn phone_sync_completion_does_not_claim_phone_messages_were_imported() {
-        let none = phone_sync_completion_message(0, 0, false, None, None, &[]);
-        assert!(none.contains("Lịch sử điện thoại chưa được tải vào ứng dụng"));
-        assert!(none.contains("0 tin mới từ Cloud/Nhóm"));
-
-        let cloud = phone_sync_completion_message(12, 3, false, None, None, &[]);
-        assert!(cloud.contains("12 tin mới từ Cloud/Nhóm (3 hội thoại)"));
-        assert!(cloud.contains("Lịch sử điện thoại chưa được tải vào ứng dụng"));
-
-        let failed = phone_sync_completion_message(0, 0, false, Some("network"), None, &[]);
-        assert!(failed.contains("Đồng bộ thất bại: network"));
-    }
-
-    #[test]
-    fn phone_sync_completion_keeps_phone_step_error_visible() {
-        let msg = phone_sync_completion_message(
-            5,
-            2,
-            false,
-            None,
-            Some("Không tìm thấy Zalo PC trên máy này"),
-            &[],
-        );
-        assert!(msg.contains("5 tin mới từ Cloud/Nhóm (2 hội thoại)"));
-        assert!(
-            msg.contains("Không đồng bộ được từ điện thoại: Không tìm thấy Zalo PC trên máy này")
-        );
-        assert!(!msg.contains("Lịch sử điện thoại chưa được tải"));
-    }
-
-    #[test]
-    fn phone_sync_completion_marks_partial_fetch_failures() {
-        let warnings = vec!["Tải lịch sử Cloud/Nhóm: lỗi kết nối đến Zalo".into()];
-        let msg = phone_sync_completion_message(2, 1, false, None, None, &warnings);
-
-        assert!(msg.contains("Đồng bộ chưa đầy đủ"));
-        assert!(msg.contains("1 lỗi tải dữ liệu"));
-        assert!(msg.contains("lỗi kết nối đến Zalo"));
-        assert!(!msg.contains("Đã hoàn tất"));
-    }
-
-    #[test]
-    fn test_app_settings_font_and_color_defaults_and_serde() {
-        let default_settings = super::AppSettings::default();
-        assert_eq!(default_settings.font_family, "default");
-        assert_eq!(default_settings.font_scale, 1.0);
-        assert!(default_settings.animations_enabled);
-        assert_eq!(default_settings.animation_speed, 1.0);
-        assert_eq!(default_settings.custom_primary_color, None);
-        assert_eq!(default_settings.custom_accent_color, None);
-        assert_eq!(default_settings.custom_bubble_out_bg, None);
-        assert_eq!(default_settings.custom_bubble_in_bg, None);
-
-        let mut custom = default_settings.clone();
-        custom.font_family = "segoe_ui".into();
-        custom.font_scale = 1.15;
-        custom.animations_enabled = false;
-        custom.animation_speed = 1.5;
-        custom.custom_primary_color = Some("#0068FF".into());
-        custom.custom_accent_color = Some("#059669".into());
-        custom.custom_bubble_out_bg = Some("#25374D".into());
-        custom.custom_bubble_in_bg = Some("#323842".into());
-
-        let json = serde_json::to_string(&custom).expect("serialize settings");
-        let loaded: super::AppSettings = serde_json::from_str(&json).expect("deserialize settings");
-        assert_eq!(loaded.font_family, "segoe_ui");
-        assert_eq!(loaded.font_scale, 1.15);
-        assert!(!loaded.animations_enabled);
-        assert_eq!(loaded.animation_speed, 1.5);
-        assert_eq!(loaded.custom_primary_color.as_deref(), Some("#0068FF"));
-        assert_eq!(loaded.custom_accent_color.as_deref(), Some("#059669"));
-        assert_eq!(loaded.custom_bubble_out_bg.as_deref(), Some("#25374D"));
-        assert_eq!(loaded.custom_bubble_in_bg.as_deref(), Some("#323842"));
-    }
-
-    #[test]
-    fn compute_resized_rect_handles_edges_and_clamps_minimums() {
-        let base = super::WinRect {
-            left: 100,
-            top: 100,
-            right: 1100,
-            bottom: 800,
-        };
-        assert_eq!(base.width(), 1000);
-        assert_eq!(base.height(), 700);
-
-        let expanded = super::compute_resized_rect(
-            base,
-            eframe::egui::ResizeDirection::NorthWest,
-            -40,
-            -20,
-            480,
-            360,
-        );
-        assert_eq!(
-            expanded,
-            super::WinRect {
-                left: 60,
-                top: 80,
-                right: 1100,
-                bottom: 800,
-            }
-        );
-
-        let clamped_nw = super::compute_resized_rect(
-            base,
-            eframe::egui::ResizeDirection::NorthWest,
-            900,
-            600,
-            480,
-            360,
-        );
-        assert_eq!(clamped_nw.width(), 480);
-        assert_eq!(clamped_nw.height(), 360);
-        assert_eq!(clamped_nw.right, 1100);
-        assert_eq!(clamped_nw.bottom, 800);
-
-        let clamped_se = super::compute_resized_rect(
-            base,
-            eframe::egui::ResizeDirection::SouthEast,
-            -900,
-            -600,
-            480,
-            360,
-        );
-        assert_eq!(clamped_se.width(), 480);
-        assert_eq!(clamped_se.height(), 360);
-        assert_eq!(clamped_se.left, 100);
-        assert_eq!(clamped_se.top, 100);
-    }
-
-    #[test]
-    fn sticker_fetch_retry_respects_cooldown_and_max_attempts() {
-        let mut failures = std::collections::HashMap::new();
-        let t0 = std::time::Instant::now();
-        assert!(super::can_attempt_sticker_fetch(&failures, "stk_1", t0));
-
-        // 1st failure -> blocked during 30s cooldown, allowed after 30s.
-        super::record_sticker_fetch_failure(&mut failures, "stk_1", t0);
-        assert!(!super::can_attempt_sticker_fetch(
-            &failures,
-            "stk_1",
-            t0 + std::time::Duration::from_secs(10)
-        ));
-        let t1 = t0 + std::time::Duration::from_secs(30);
-        assert!(super::can_attempt_sticker_fetch(&failures, "stk_1", t1));
-
-        // 2nd failure -> allowed once more after cooldown.
-        super::record_sticker_fetch_failure(&mut failures, "stk_1", t1);
-        let t2 = t1 + std::time::Duration::from_secs(30);
-        assert!(super::can_attempt_sticker_fetch(&failures, "stk_1", t2));
-
-        // 3rd failure reaches MAX_STICKER_FETCH_ATTEMPTS -> permanently stops auto-retry.
-        super::record_sticker_fetch_failure(&mut failures, "stk_1", t2);
-        assert!(!super::can_attempt_sticker_fetch(
-            &failures,
-            "stk_1",
-            t2 + std::time::Duration::from_secs(3600)
-        ));
-    }
-
-    #[test]
-    fn truncate_chars_vietnamese_utf8_safety() {
-        let s = "Nguyễn Thị Hồng Nhung — Tiếng Việt có dấu";
-        let cut = super::truncate_chars(s, 16);
-        assert_eq!(cut.chars().count(), 17);
-        assert!(cut.ends_with('…'));
-        assert!(cut.starts_with("Nguyễn Thị Hồng"));
-        assert_eq!(super::truncate_chars("Ngắn", 16).as_ref(), "Ngắn");
-    }
-
-    #[test]
-    fn app_settings_animations_serde_defaults_and_clamping() {
-        let legacy: super::AppSettings = serde_json::from_str("{}").unwrap();
-        assert!(legacy.animations_enabled);
-        assert!((legacy.animation_speed - 1.0).abs() < f32::EPSILON);
-        assert!((legacy.normalized_animation_speed() - 1.0).abs() < f32::EPSILON);
-
-        let mut custom = super::AppSettings {
-            animations_enabled: false,
-            animation_speed: 3.5,
-            ..Default::default()
-        };
-        assert!((custom.normalized_animation_speed() - 2.0).abs() < f32::EPSILON);
-        custom.animation_speed = 0.1;
-        assert!((custom.normalized_animation_speed() - 0.5).abs() < f32::EPSILON);
-
-        let roundtrip: super::AppSettings =
-            serde_json::from_str(&serde_json::to_string(&custom).unwrap()).unwrap();
-        assert!(!roundtrip.animations_enabled);
-        assert!((roundtrip.animation_speed - 0.1).abs() < 1e-4);
-        assert!((legacy.normalized_scroll_speed() - 2.2).abs() < f32::EPSILON);
-
-        let mut fast_scroll = super::AppSettings {
-            scroll_speed: 9.0,
-            ..Default::default()
-        };
-        assert!((fast_scroll.normalized_scroll_speed() - 4.0).abs() < f32::EPSILON);
-        fast_scroll.scroll_speed = -1.0;
-        assert!((fast_scroll.normalized_scroll_speed() - 2.2).abs() < f32::EPSILON);
-    }
-
-    #[test]
-    fn call_video_textures_stay_protected_under_lru_pressure_and_clear_accounting() {
-        let _ = super::drain_frame_touched_textures();
-        let mut textures: std::collections::HashMap<String, ()> =
-            std::collections::HashMap::new();
-        let mut lru = crate::media_resources::ResourceLru::new(100);
-        let mut last_frame = std::collections::HashSet::new();
-
-        super::insert_texture_with_lru(
-            &mut textures,
-            &mut lru,
-            &mut last_frame,
-            "call_remote_video".to_string(),
-            (),
-            55,
-            true,
-        );
-        super::insert_texture_with_lru(
-            &mut textures,
-            &mut lru,
-            &mut last_frame,
-            "call_local_video".to_string(),
-            (),
-            40,
-            true,
-        );
-        assert!(textures.contains_key("call_remote_video"));
-        assert!(textures.contains_key("call_local_video"));
-        assert_eq!(lru.used(), 95);
-
-        let touched_frame1 = super::drain_frame_touched_textures();
-        assert!(touched_frame1.contains("call_remote_video"));
-        assert!(touched_frame1.contains("call_local_video"));
-        last_frame = touched_frame1;
-
-        super::insert_texture_with_lru(
-            &mut textures,
-            &mut lru,
-            &mut last_frame,
-            "old_avatar".to_string(),
-            (),
-            30,
-            false,
-        );
-        assert!(textures.contains_key("old_avatar"));
-        assert!(textures.contains_key("call_remote_video"));
-        assert!(textures.contains_key("call_local_video"));
-        assert_eq!(lru.used(), 125);
-
-        super::insert_texture_with_lru(
-            &mut textures,
-            &mut lru,
-            &mut last_frame,
-            "new_sticker".to_string(),
-            (),
-            20,
-            false,
-        );
-        assert!(textures.contains_key("call_remote_video"));
-        assert!(textures.contains_key("call_local_video"));
-        assert!(!textures.contains_key("old_avatar"));
-        assert!(textures.contains_key("new_sticker"));
-        assert_eq!(lru.used(), 115);
-
-        super::remove_cached_texture(
-            &mut textures,
-            &mut lru,
-            &mut last_frame,
-            "new_sticker",
-        );
-        assert_eq!(lru.used(), 95);
-
-        super::mark_texture_used("call_remote_video");
-        super::mark_texture_used("call_local_video");
-        let touched_frame2 = super::drain_frame_touched_textures();
-        for k in &touched_frame2 {
-            lru.touch(k);
-        }
-        last_frame = touched_frame2;
-
-        super::insert_texture_with_lru(
-            &mut textures,
-            &mut lru,
-            &mut last_frame,
-            "call_remote_video_1".to_string(),
-            (),
-            30,
-            true,
-        );
-        assert!(textures.contains_key("call_remote_video"));
-        assert!(textures.contains_key("call_local_video"));
-        assert!(textures.contains_key("call_remote_video_1"));
-        assert_eq!(lru.used(), 125);
-
-        super::remove_cached_texture(
-            &mut textures,
-            &mut lru,
-            &mut last_frame,
-            "call_local_video",
-        );
-        assert!(!textures.contains_key("call_local_video"));
-        assert!(!last_frame.contains("call_local_video"));
-        assert_eq!(lru.used(), 85);
-
-        super::clear_call_video_textures(&mut textures, &mut lru, &mut last_frame, true);
-        assert!(textures.is_empty());
-        assert!(last_frame.is_empty());
-        assert_eq!(lru.used(), 0);
-    }
-
-    #[test]
-    fn camera_readiness_toggle_and_label_helpers_handle_missing_ffmpeg_and_empty_devices() {
-        let no_cams: Vec<String> = Vec::new();
-        let cams = vec!["Integrated Webcam".to_string()];
-
-        assert_eq!(
-            super::evaluate_camera_readiness(false, &cams),
-            super::CameraReadiness::MissingFfmpeg
-        );
-        assert_eq!(
-            super::evaluate_camera_readiness(true, &no_cams),
-            super::CameraReadiness::NoCameraDevice
-        );
-        assert_eq!(
-            super::evaluate_camera_readiness(true, &cams),
-            super::CameraReadiness::Ready
-        );
-
-        assert_eq!(
-            super::next_camera_toggle_state(false, super::CameraReadiness::MissingFfmpeg),
-            (false, Some(super::CameraReadiness::MissingFfmpeg))
-        );
-        assert_eq!(
-            super::next_camera_toggle_state(false, super::CameraReadiness::NoCameraDevice),
-            (false, Some(super::CameraReadiness::NoCameraDevice))
-        );
-        assert_eq!(
-            super::next_camera_toggle_state(false, super::CameraReadiness::Ready),
-            (true, None)
-        );
-        assert_eq!(
-            super::next_camera_toggle_state(true, super::CameraReadiness::MissingFfmpeg),
-            (false, None)
-        );
-
-        assert!(!super::incoming_initial_cam_enabled(true, false, &cams, false));
-        assert!(!super::incoming_initial_cam_enabled(true, true, &no_cams, false));
-        assert!(super::incoming_initial_cam_enabled(true, true, &no_cams, true));
-        assert!(super::incoming_initial_cam_enabled(true, true, &cams, false));
-        assert!(!super::incoming_initial_cam_enabled(false, true, &cams, false));
-
-        assert_eq!(
-            super::format_call_camera_label("", &no_cams, true),
-            "Đang quét…"
-        );
-        assert_eq!(
-            super::format_call_camera_label("", &no_cams, false),
-            "Không có camera"
-        );
-        assert_eq!(
-            super::format_call_camera_label("", &cams, false),
-            "Integrated Webcam"
-        );
-        assert_eq!(
-            super::format_call_camera_label("USB Cam", &cams, false),
-            "USB Cam"
-        );
-    }
-
-    fn mute_test_thread(id: &str, is_group: bool) -> crate::chat::Thread {
-        crate::chat::Thread {
-            presentation: Default::default(),
-            unread: Default::default(),
-            id: id.into(),
-            name: String::new(),
-            preview: String::new(),
-            time: String::new(),
-            avatar: None,
-            is_group,
-            messages: Vec::new(),
-            vanish: None,
-        }
-    }
-
-    #[test]
-    fn mute_snapshot_synced_preserves_all_muted_groups_across_id_formats() {
-        let now = 1_700_000_100_i64;
-        let mut settings_muted = std::collections::HashMap::from([
-            ("20002".to_string(), -1),
-            ("group_30003".to_string(), -1),
-        ]);
-        let mut threads = vec![
-            mute_test_thread("20002", true),
-            mute_test_thread("group_30003", true),
-            mute_test_thread("g40004", true),
-            mute_test_thread("20002", false),
-            mute_test_thread("10001", false),
-        ];
-        let server_snapshot = std::collections::HashMap::from([
-            ("g20002".to_string(), -1),
-            ("g30003".to_string(), -1),
-            ("g40004".to_string(), now + 3600),
-            ("10001".to_string(), -1),
-        ]);
-
-        super::apply_mute_snapshot_to_state(&mut settings_muted, &mut threads, server_snapshot, now);
-
-        assert!(threads[0].presentation.muted);
-        assert!(threads[0].unread.is_muted_at(now));
-        assert!(threads[1].presentation.muted);
-        assert!(threads[1].unread.is_muted_at(now));
-        assert!(threads[2].presentation.muted);
-        assert!(threads[2].unread.is_muted_at(now));
-        assert!(!threads[3].presentation.muted);
-        assert!(!threads[3].unread.is_muted_at(now));
-        assert!(threads[4].presentation.muted);
-        assert!(threads[4].unread.is_muted_at(now));
-        assert!(crate::unread::is_thread_muted(
-            &settings_muted,
-            &threads[0],
-            now
-        ));
-        assert!(!crate::unread::is_thread_muted(
-            &settings_muted,
-            &threads[3],
-            now
-        ));
-    }
-
-    #[test]
-    fn mute_events_received_updates_canonical_settings_and_unadorned_groups() {
-        let now = 1_700_000_100_i64;
-        let mut settings_muted = std::collections::HashMap::from([
-            ("20002".to_string(), -1),
-            ("g30003".to_string(), -1),
-        ]);
-        let mut threads = vec![
-            mute_test_thread("20002", true),
-            mute_test_thread("30003", true),
-        ];
-
-        assert!(super::apply_mute_events_to_state(
-            &mut settings_muted,
-            &mut threads,
-            vec![crate::chat::MuteControlEvent {
-                thread_id: "g20002".into(),
-                is_group: true,
-                muted: true,
-                muted_until: Some(now + 3600),
-                settings_until: Some(now + 3600),
-            }],
-        ));
-        assert!(threads[0].presentation.muted);
-        assert_eq!(threads[0].unread.muted_until, Some(now + 3600));
-        assert_eq!(settings_muted.get("g20002"), Some(&(now + 3600)));
-        assert!(!settings_muted.contains_key("20002"));
-
-        assert!(super::apply_mute_events_to_state(
-            &mut settings_muted,
-            &mut threads,
-            vec![crate::chat::MuteControlEvent {
-                thread_id: "g20002".into(),
-                is_group: true,
-                muted: false,
-                muted_until: None,
-                settings_until: None,
-            }],
-        ));
-        assert!(!threads[0].presentation.muted);
-        assert!(!threads[0].unread.muted);
-        assert!(crate::unread::active_mute_until(&settings_muted, "20002", true, now).is_none());
-        assert_eq!(settings_muted.get("g30003"), Some(&-1));
-    }
-
-    #[test]
-    fn app_settings_normalize_muted_threads_preserves_legacy_entries() {
-        let json = r#"{
-            "muted_threads": {
-                "group_20002": -1,
-                "G30003": 4000000000,
-                "u10001": -1,
-                "99999": -1,
-                "stale_timed": 100
-            }
-        }"#;
-        let mut settings: super::AppSettings = serde_json::from_str(json).unwrap();
-        settings.normalize_muted_threads_at(1_700_000_000);
-        assert_eq!(settings.muted_threads.get("g20002"), Some(&-1));
-        assert_eq!(settings.muted_threads.get("g30003"), Some(&4_000_000_000));
-        assert_eq!(settings.muted_threads.get("10001"), Some(&-1));
-        assert_eq!(settings.muted_threads.get("99999"), Some(&-1));
-        assert!(!settings.muted_threads.contains_key("stale_timed"));
-    }
-
-    #[test]
-    fn failed_non_call_stickers_stay_blocked_in_loading_until_cooldown_and_cap() {
-        let t0 = std::time::Instant::now();
-        let mut loading = std::collections::HashSet::from([
-            "avt_broken".to_string(),
-            "thumb_inflight".to_string(),
-            "call_remote_video".to_string(),
-        ]);
-        let mut failures = std::collections::HashMap::new();
-
-        assert!(super::handle_sticker_fetch_failure(
-            &mut loading,
-            &mut failures,
-            "call_remote_video",
-            t0
-        ));
-        assert!(!loading.contains("call_remote_video"));
-
-        assert!(!super::handle_sticker_fetch_failure(
-            &mut loading,
-            &mut failures,
-            "avt_broken",
-            t0
-        ));
-        assert!(loading.contains("avt_broken"));
-        assert!(loading.contains("thumb_inflight"));
-
-        super::release_cooled_failed_stickers_with_elapsed(
-            &mut loading,
-            &failures,
-            |_| std::time::Duration::from_secs(10),
-        );
-        assert!(loading.contains("avt_broken"));
-        assert!(loading.contains("thumb_inflight"));
-
-        super::release_cooled_failed_stickers_with_elapsed(
-            &mut loading,
-            &failures,
-            |_| std::time::Duration::from_secs(30),
-        );
-        assert!(!loading.contains("avt_broken"));
-        assert!(loading.contains("thumb_inflight"));
-
-        loading.insert("avt_broken".to_string());
-        super::handle_sticker_fetch_failure(&mut loading, &mut failures, "avt_broken", t0);
-        super::handle_sticker_fetch_failure(&mut loading, &mut failures, "avt_broken", t0);
-        super::release_cooled_failed_stickers_with_elapsed(
-            &mut loading,
-            &failures,
-            |_| std::time::Duration::from_secs(3600),
-        );
-        assert!(loading.contains("avt_broken"));
-    }
-
-    #[test]
-    fn install_uploaded_texture_protects_batch_from_same_frame_eviction_and_batches_uploads() {
-        let mut queue = std::collections::VecDeque::new();
-        for i in 0..15 {
-            super::push_pending_texture_upload(&mut queue, format!("thumb_{i}"), i);
-        }
-        super::push_pending_texture_upload(&mut queue, "thumb_2".to_string(), 99);
-        assert_eq!(queue.len(), 15);
-        let (batch1, more1) =
-            super::take_pending_upload_batch(&mut queue, super::MAX_TEXTURE_UPLOADS_PER_FRAME);
-        assert!(more1);
-        assert_eq!(batch1.len(), super::MAX_TEXTURE_UPLOADS_PER_FRAME);
-        assert_eq!(batch1[2], ("thumb_2".to_string(), 99));
-        let (batch2, more2) =
-            super::take_pending_upload_batch(&mut queue, super::MAX_TEXTURE_UPLOADS_PER_FRAME);
-        assert!(!more2);
-        assert_eq!(batch2.len(), 3);
-
-        let mut textures = std::collections::HashMap::new();
-        let mut lru = crate::media_resources::ResourceLru::new(100);
-        let mut last_frame = std::collections::HashSet::new();
-        let mut loading =
-            std::collections::HashSet::from(["img_a".to_string(), "img_b".to_string()]);
-
-        super::install_uploaded_texture(
-            &mut textures,
-            &mut lru,
-            &mut last_frame,
-            &mut loading,
-            "img_a".to_string(),
-            (),
-            60,
-            false,
-        );
-        super::install_uploaded_texture(
-            &mut textures,
-            &mut lru,
-            &mut last_frame,
-            &mut loading,
-            "img_b".to_string(),
-            (),
-            60,
-            false,
-        );
-        assert!(loading.is_empty());
-        assert!(textures.contains_key("img_a"));
-        assert!(textures.contains_key("img_b"));
-        assert!(last_frame.contains("img_a"));
-        assert!(last_frame.contains("img_b"));
-    }
-}
 
 #[cfg(any(windows, test))]
 fn tray_notification_body(mask_notifications: bool, body: &str) -> &str {
@@ -8756,294 +7939,6 @@ impl ZaloGuiApp {
     }
 }
 
-#[cfg(test)]
-mod app_lock_state_tests {
-    use super::*;
-
-    #[test]
-    fn startup_lock_state_fails_closed_on_corrupted_config() {
-        let dir = std::env::temp_dir().join(format!("zalo_gui_lock_test_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let cfg_path = dir.join(crate::app_lock::APP_LOCK_FILE);
-        std::fs::write(&cfg_path, "{not-valid-json").unwrap();
-        let loaded = crate::app_lock::AppLockConfig::load_from_path(&cfg_path);
-        assert_eq!(
-            crate::app_lock::should_lock_on_startup(&loaded, true),
-            (true, true)
-        );
-        assert_eq!(
-            crate::app_lock::should_lock_on_startup(&loaded, false),
-            (false, true)
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn effective_window_focused_is_false_while_locked() {
-        assert!(!combine_effective_focus(true, true));
-        assert!(!combine_effective_focus(false, true));
-        assert!(combine_effective_focus(true, false));
-        assert!(!combine_effective_focus(false, false));
-    }
-
-    #[test]
-    fn normal_logout_keeps_app_lock_enabled_for_next_trigger() {
-        let cfg = crate::app_lock::AppLockConfig::create_enabled(
-            crate::app_lock::PasscodeMode::Pin4,
-            "4242",
-        )
-        .unwrap();
-        assert!(should_trigger_lock_with_creds(&cfg, false, true));
-        assert!(!should_trigger_lock_with_creds(&cfg, true, true));
-        assert!(!should_trigger_lock_with_creds(&cfg, false, false));
-    }
-
-    #[test]
-    fn title_bar_hides_sensitive_widgets_while_locked() {
-        assert!(!title_bar_shows_user_name(false, true, true, "Alice"));
-        assert!(title_bar_shows_user_name(false, true, false, "Alice"));
-        assert!(!title_bar_shows_saved_history_btn(true, false, true));
-        assert!(title_bar_shows_saved_history_btn(false, false, true));
-        assert!(!title_bar_shows_update_pill(true, true, false));
-        assert!(title_bar_shows_update_pill(false, true, false));
-    }
-
-    #[test]
-    fn title_bar_lock_button_and_resize_reserve_track_lock_visibility() {
-        assert!(!title_bar_shows_lock_button(true, true, true));
-        assert!(!title_bar_shows_lock_button(false, false, false));
-        assert!(title_bar_shows_lock_button(false, true, false));
-        assert!(!title_bar_shows_lock_button(false, false, true));
-        assert!(title_bar_shows_lock_button(false, true, true));
-
-        assert_eq!(title_bar_controls_reserve_width(false), 180.0);
-        assert_eq!(title_bar_controls_reserve_width(true), 216.0);
-    }
-
-    #[test]
-    fn lock_scrubs_ephemeral_inputs_and_settings_drafts() {
-        let mut ui = AppLockUiState {
-            unlock_input: "1234".into(),
-            unlock_error: Some("Sai".into()),
-            focus_requested: false,
-            confirm_forgot_open: true,
-            corrupted_config: true,
-            settings_action: AppLockSettingsAction::Changing,
-            draft_mode: crate::app_lock::PasscodeMode::Custom,
-            draft_current: "old-pass".into(),
-            draft_new: "new-pass".into(),
-            draft_confirm: "new-pass".into(),
-            settings_error: Some("Mismatch".into()),
-            last_activity_ui_time: 42.0,
-            last_frame_wall_unix: 100,
-            last_frame_ui_time: 42.0,
-        };
-        ui.clear_sensitive_on_lock();
-        assert!(ui.unlock_input.is_empty());
-        assert_eq!(ui.unlock_error, None);
-        assert!(!ui.confirm_forgot_open);
-        assert!(ui.focus_requested);
-        assert_eq!(ui.settings_action, AppLockSettingsAction::Idle);
-        assert!(ui.draft_current.is_empty());
-        assert!(ui.draft_new.is_empty());
-        assert!(ui.draft_confirm.is_empty());
-        assert_eq!(ui.settings_error, None);
-        assert!(ui.corrupted_config);
-        assert_eq!(ui.last_activity_ui_time, 42.0);
-    }
-
-    #[test]
-    fn user_input_refreshes_activity_before_watchdog_tick() {
-        let mut last_activity = 10.0;
-        let now_ui = 320.0;
-        record_activity_if_input(&mut last_activity, now_ui, true);
-        assert_eq!(last_activity, 320.0);
-        assert!(!crate::app_lock::is_idle_expired(
-            last_activity,
-            now_ui,
-            300,
-            false
-        ));
-    }
-
-    #[test]
-    fn locked_popup_and_notification_masking_invariants() {
-        use crate::app_lock::{
-            mask_notification_content, mask_toast_text, popup_allows_interaction,
-        };
-
-        assert_eq!(
-            mask_notification_content(true, true, "Alice", "Secret message", 0),
-            ("ctdozlite".to_string(), "Bạn có tin nhắn mới".to_string())
-        );
-        assert_eq!(
-            mask_notification_content(true, true, "Alice", "Secret message", 1),
-            ("ctdozlite".to_string(), "Bạn có 1 tin nhắn mới".to_string())
-        );
-        assert_eq!(
-            mask_notification_content(true, true, "Alice", "Secret message", 5),
-            ("ctdozlite".to_string(), "Bạn có 5 tin nhắn mới".to_string())
-        );
-        assert_eq!(
-            mask_chat_notification_payload(
-                true,
-                "Alice",
-                "Secret message",
-                Some("https://example.test/avatar.png".to_string()),
-                5,
-            ),
-            (
-                "ctdozlite".to_string(),
-                "Bạn có 5 tin nhắn mới".to_string(),
-                None
-            )
-        );
-        assert_eq!(
-            mask_toast_text(
-                true,
-                true,
-                "🔔 Bạn có thông báo mới",
-                "🔔 [otp] Bob: 999111".to_string(),
-            ),
-            "🔔 Bạn có thông báo mới"
-        );
-        assert_eq!(
-            mask_toast_text(
-                true,
-                true,
-                "⏰ Bạn có nhắc hẹn đến hạn",
-                "⏰ Nhắc tin: Bí mật".to_string(),
-            ),
-            "⏰ Bạn có nhắc hẹn đến hạn"
-        );
-        assert_eq!(
-            mask_toast_text(
-                true,
-                true,
-                "Thông báo mới",
-                "Script secret payload".to_string(),
-            ),
-            "Thông báo mới"
-        );
-        assert!(!popup_allows_interaction(true));
-        assert_eq!(super::modals::popup_layout_height(popup_allows_interaction(true)), 118.0);
-
-        assert_eq!(
-            mask_notification_content(true, false, "Alice", "Secret message", 3),
-            ("Alice".to_string(), "Secret message".to_string())
-        );
-        assert_eq!(
-            mask_toast_text(
-                true,
-                false,
-                "Thông báo mới",
-                "Visible locked toast".to_string(),
-            ),
-            "Visible locked toast"
-        );
-        assert_eq!(
-            mask_chat_notification_payload(
-                false,
-                "Alice",
-                "Secret message",
-                Some("https://example.test/avatar.png".to_string()),
-                3,
-            ),
-            (
-                "Alice".to_string(),
-                "Secret message".to_string(),
-                Some("https://example.test/avatar.png".to_string()),
-            )
-        );
-        assert!(!popup_allows_interaction(true));
-        assert_eq!(super::modals::popup_layout_height(false), 118.0);
-        assert_eq!(
-            incoming_call_status_text(true, "Alice", true),
-            "📲 Cuộc gọi đến — mở khoá để xem & trả lời"
-        );
-
-        for hide in [true, false] {
-            assert!(popup_allows_interaction(false));
-            assert_eq!(
-                super::modals::popup_layout_height(popup_allows_interaction(false)),
-                164.0
-            );
-            assert_eq!(
-                mask_notification_content(false, hide, "Alice", "Hello", 2),
-                ("Alice".to_string(), "Hello".to_string())
-            );
-            assert_eq!(
-                mask_toast_text(false, hide, "Fallback", "Real toast".to_string()),
-                "Real toast"
-            );
-        }
-        assert_eq!(
-            incoming_call_status_text(false, "Alice", true),
-            "📲 Cuộc gọi video đến từ Alice…"
-        );
-
-        assert_eq!(
-            prepare_toast_payload(
-                true,
-                true,
-                "✅ Đã lưu tập tin \"secret.pdf\" tại C:\\secret\\secret.pdf".to_string(),
-                Some("C:\\secret\\secret.pdf".to_string()),
-            ),
-            ("Thông báo mới".to_string(), None)
-        );
-        assert_eq!(
-            prepare_toast_payload(
-                false,
-                true,
-                "✅ Đã lưu tập tin \"ok.pdf\"".to_string(),
-                Some("C:\\Downloads\\ok.pdf".to_string()),
-            ),
-            (
-                "✅ Đã lưu tập tin \"ok.pdf\"".to_string(),
-                Some("C:\\Downloads\\ok.pdf".to_string()),
-            )
-        );
-        assert!(!toast_overlay_allows_standard_toast(true));
-        assert!(toast_overlay_allows_standard_toast(false));
-
-        let reactions = vec![
-            (
-                "100".to_string(),
-                "Alice".to_string(),
-                None,
-                false,
-                "❤️ Đã thả cảm xúc".to_string(),
-            ),
-            (
-                "200".to_string(),
-                "Bob".to_string(),
-                None,
-                true,
-                "👍 Đã thả cảm xúc".to_string(),
-            ),
-        ];
-        assert_eq!(
-            reaction_os_notify_payloads(true, &reactions),
-            vec![("ctdozlite".to_string(), "Bạn có 2 tin nhắn mới".to_string())]
-        );
-        assert_eq!(reaction_os_notify_payloads(false, &reactions).len(), 2);
-
-        let mut call_overlay = ActiveCallOverlay::new(
-            "100".to_string(),
-            "Alice".to_string(),
-            false,
-            false,
-            "Đang gọi".to_string(),
-            false,
-            false,
-        );
-        assert!(is_live_active_call(Some(&call_overlay)));
-        call_overlay.error_reason = Some("Kết thúc".to_string());
-        assert!(!is_live_active_call(Some(&call_overlay)));
-        assert!(!is_live_active_call(None));
-    }
-}
 
 #[cfg(any(windows, test))]
 #[derive(Debug, PartialEq, Eq)]
@@ -9061,87 +7956,5 @@ fn windows_close_action(quit: bool, close_to_tray: bool, active_call: bool) -> W
         WindowsCloseAction::Minimize
     } else {
         WindowsCloseAction::Park
-    }
-}
-
-#[cfg(test)]
-mod windows_close_tests {
-    use super::{windows_close_action, AppSettings, TrayMessageAlerts, WindowsCloseAction::*};
-
-    #[test]
-    fn close_to_tray_defaults_off_and_round_trips() {
-        let old: AppSettings = serde_json::from_str("{}").unwrap();
-        assert!(!old.close_to_tray);
-        let enabled: AppSettings = serde_json::from_str(r#"{"close_to_tray":true}"#).unwrap();
-        assert_eq!(serde_json::to_value(enabled).unwrap()["close_to_tray"], true);
-    }
-
-    #[test]
-    fn close_to_tray_keeps_calls_accessible_and_explicit_quit_available() {
-        assert_eq!(windows_close_action(false, false, false), Quit);
-        assert_eq!(windows_close_action(false, true, false), Park);
-        assert_eq!(windows_close_action(false, true, true), Minimize);
-        assert_eq!(windows_close_action(true, true, true), Quit);
-    }
-
-    #[test]
-    fn tray_alerts_accept_new_incoming_messages_and_skip_history() {
-        let mut message = crate::chat::ChatMessage {
-            id: "123".into(),
-            ts: 1_799_000_000,
-            unread_policy: crate::message_model::UnreadPolicy::from_raw(
-                &serde_json::json!({"paramsExt": {"countUnread": 1}}),
-            ),
-            ..Default::default()
-        };
-        let cutoff = 1_799_000_000_000;
-        let mut alerts = TrayMessageAlerts::default();
-        assert!(alerts.record("account", "thread", std::slice::from_ref(&message), "", cutoff));
-        assert!(!alerts.record("account", "thread-2", std::slice::from_ref(&message), "", cutoff + 1));
-        message.is_outgoing = true;
-        assert!(!alerts.record("account", "thread-3", &[message], "", cutoff));
-    }
-
-    #[test]
-    fn tray_alert_delivery_is_independent_of_an_earlier_unread_count() {
-        let message = crate::chat::ChatMessage {
-            id: "101".into(),
-            ts: 1_799_000_000,
-            ..Default::default()
-        };
-        let mut alerts = super::TrayMessageAlerts::default();
-        let cutoff = 1_799_000_000_000;
-        assert!(super::tray_unread_message(&message, "100"));
-        assert!(alerts.record("account", "thread", std::slice::from_ref(&message), "100", cutoff));
-        assert!(!alerts.record("account", "thread", std::slice::from_ref(&message), "100", cutoff));
-        assert!(!alerts.record("account", "thread-2", std::slice::from_ref(&message), "100", cutoff + 1));
-        assert!(super::tray_unread_message(&message, "100"));
-    }
-
-    #[test]
-    fn an_expired_mute_allows_tray_alerts() {
-        let settings = std::collections::HashMap::new();
-        let mut thread = crate::chat::Thread::default();
-        thread.presentation.muted = true;
-        thread.unread.muted = true;
-        assert!(crate::unread::is_thread_muted(&settings, &thread, 2));
-        thread.unread.muted_until = Some(1);
-        assert!(!crate::unread::is_thread_muted(&settings, &thread, 2));
-    }
-
-    #[test]
-    fn tray_notification_body_masks_content_when_app_locked() {
-        assert_eq!(
-            super::tray_notification_body(false, "Bạn có tin nhắn mới"),
-            "Bạn có tin nhắn mới"
-        );
-        assert_eq!(
-            super::tray_notification_body(true, "Bạn có tin nhắn mới"),
-            "Bạn có thông báo mới"
-        );
-        assert_eq!(
-            super::tray_notification_body(true, "Bạn có lượt bày tỏ cảm xúc mới"),
-            "Bạn có thông báo mới"
-        );
     }
 }

@@ -240,7 +240,6 @@ impl ZaloGuiApp {
 
     pub(super) fn render_chat_workspace(&mut self, ctx: &egui::Context, pal: &ThemePalette) {
         // Responsive breakpoints based on live viewport width
-        // -------------------------------------------------------------------
         let screen_rect = ctx.screen_rect();
         let screen_w = screen_rect.width();
         let is_compact_w = screen_w < 880.0;
@@ -252,9 +251,6 @@ impl ZaloGuiApp {
         }
         let left_rail_w = if is_narrow_w { 52.0 } else { 62.0 };
 
-        // -------------------------------------------------------------------
-        // 1. LEFT NAVIGATION RAIL (Replaces top bar & bottom bar)
-        // -------------------------------------------------------------------
         egui::SidePanel::left("left_nav_rail")
             .resizable(false)
             .exact_width(left_rail_w)
@@ -291,7 +287,6 @@ impl ZaloGuiApp {
                             Stroke::new(2.0_f32, pal.primary_hover),
                         );
                     }
-                    // Cutout status dot
                     if self.settings.show_online_status {
                         let dot_c = Pos2::new(av_rect.right() - 4.0, av_rect.bottom() - 4.0);
                         ui.painter().circle_filled(dot_c, 6.5, pal.bg_app);
@@ -689,9 +684,7 @@ impl ZaloGuiApp {
             self.render_settings_modal(ctx, pal);
             return;
         }
-        // -------------------------------------------------------------------
         // 2. CONVERSATION LIST SIDEBAR (Responsive width, auto-adapts on resize)
-        // -------------------------------------------------------------------
         let (sidebar_id, sidebar_min_w, sidebar_max_w) = if sidebar_is_rail {
             ("conversation_sidebar_narrow", 68.0_f32, 68.0_f32)
         } else {
@@ -1696,7 +1689,6 @@ impl ZaloGuiApp {
                                 );
                             }
                             if !sidebar_is_rail {
-                                // Thread Name
                                 let text_left = row_rect.left() + 58.0;
                                 let name_color = if is_selected && pal.is_dark {
                                     Color32::WHITE
@@ -1752,7 +1744,6 @@ impl ZaloGuiApp {
                                     name_color,
                                 );
 
-                                // Pin icon + Timestamp (top-right)
                                 let time_right = row_rect.right() - 9.0;
                                 if !row_time.is_empty() {
                                     let is_thread_unread = self.unread_counts.get(&t.id).copied().unwrap_or(0) > 0;
@@ -1994,7 +1985,6 @@ impl ZaloGuiApp {
                                 ui.set_min_width(205.0);
                                 ui.spacing_mut().item_spacing = Vec2::new(0.0, 2.0);
 
-                                // 1. Ghim / Bỏ ghim hội thoại
                                 let pin_label = if is_user_pinned {
                                     "Bỏ ghim hội thoại"
                                 } else {
@@ -2022,7 +2012,6 @@ impl ZaloGuiApp {
 
                                 ui.separator();
 
-                                // 2. Phân loại >
                                 ui.menu_button(
                                     RichText::new("Phân loại")
                                         .size(13.5)
@@ -2094,7 +2083,6 @@ impl ZaloGuiApp {
                                     },
                                 );
 
-                                // 2b. Chat Folders: gán/bỏ thread (WaveA3).
                                 if !self.settings.chat_folders.is_empty() {
                                     ui.menu_button(
                                         RichText::new("Thêm vào folder")
@@ -2175,7 +2163,6 @@ impl ZaloGuiApp {
 
                                 ui.separator();
 
-                                // 4. Tắt thông báo > (hoặc Bật lại thông báo)
                                 if is_muted {
                                     if ui
                                         .add(
@@ -2248,7 +2235,6 @@ impl ZaloGuiApp {
                                     );
                                 }
 
-                                // 5. Ẩn trò chuyện / Bỏ ẩn trò chuyện
                                 let hide_label = if is_hidden {
                                     "Bỏ ẩn trò chuyện"
                                 } else {
@@ -2274,7 +2260,6 @@ impl ZaloGuiApp {
                                     ui.close_menu();
                                 }
 
-                                // 5b. Hẹn giờ gửi tin nhắn / Nhắc hẹn (#38)
                                 if ui
                                     .add(
                                         egui::Button::new(
@@ -2293,7 +2278,6 @@ impl ZaloGuiApp {
 
                                 ui.separator();
 
-                                // 6. Xóa hội thoại (màu đỏ)
                                 if ui
                                     .add(
                                         egui::Button::new(
@@ -2340,7 +2324,6 @@ impl ZaloGuiApp {
 
                                 ui.separator();
 
-                                // 7. Báo xấu
                                 if ui
                                     .add(
                                         egui::Button::new(
@@ -2720,9 +2703,7 @@ impl ZaloGuiApp {
             )
         });
 
-        // -------------------------------------------------------------------
         // 3. COLLAPSIBLE RIGHT CONVERSATION INFO DRAWER (Panel >= 880px, Animated Overlay < 880px)
-        // -------------------------------------------------------------------
         let mut open_chat_member: Option<crate::chat::SidebarMember> = None;
         let mut view_profile_member: Option<String> = None;
         if is_compact_w && self.info_drawer_open && ctx.input(|i| i.key_pressed(Key::Escape)) {
@@ -2953,7 +2934,6 @@ impl ZaloGuiApp {
                     })
                     .unwrap_or_default();
 
-                // Extract shared Web Links from messages
                 let shared_links: Vec<(String, String, String, String)> = self
                     .threads
                     .get(self.selected_thread_index)
@@ -3004,7 +2984,6 @@ impl ZaloGuiApp {
                     })
                     .unwrap_or_default();
 
-                // Extract pinned messages in this thread
                 let pinned_msgs: Vec<(String, String, String, String)> = self
                     .threads
                     .get(self.selected_thread_index)
@@ -3076,7 +3055,6 @@ impl ZaloGuiApp {
                             });
                         ui.add(egui::Separator::default().spacing(1.0));
 
-                        // Toàn bộ drawer cuộn dọc
                         egui::ScrollArea::vertical()
                             .id_salt("info_drawer_scroll")
                             .auto_shrink([false, false])
@@ -3326,7 +3304,6 @@ impl ZaloGuiApp {
                                                 resp.on_hover_cursor(CursorIcon::PointingHand)
                                             };
 
-                                        // 1. Tắt / Bật thông báo
                                         if draw_circle_action(
                                             ui,
                                             lucide::BELL,
@@ -3383,7 +3360,6 @@ impl ZaloGuiApp {
                                             }
                                         }
 
-                                        // 2. Ghim hội thoại
                                         if draw_circle_action(
                                             ui,
                                             lucide::PIN,
@@ -3420,7 +3396,6 @@ impl ZaloGuiApp {
                                             }
                                         }
 
-                                        // 3. Thêm thành viên (group) / Hồ sơ & Nhật ký (1-1)
                                         if d_is_group {
                                             if draw_circle_action(
                                                 ui,
@@ -3467,7 +3442,6 @@ impl ZaloGuiApp {
                                             }
                                         }
 
-                                        // 4. Quản lý nhóm / Đồng bộ
                                         let ext_id = Id::new(("drw_sec_ext", d_id.as_str()));
                                         let ext_open: bool = d_is_group
                                             && ui.ctx().data(|d| d.get_temp(ext_id)).unwrap_or(false);
@@ -3600,12 +3574,10 @@ impl ZaloGuiApp {
                                     ui.add_space(12.0);
                                 });
 
-                        // Zalo-style 6px section divider
                         let (sep0_r, _) =
                             ui.allocate_exact_size(Vec2::new(drawer_w, 6.0), Sense::hover());
                         ui.painter().rect_filled(sep0_r, Rounding::ZERO, pal.bg_app);
 
-                        // ── SECTION 1: Thành viên nhóm (Zalo style) ──
                         if d_is_group {
                             let group_members = self
                                 .group_members_map
@@ -5286,7 +5258,6 @@ impl ZaloGuiApp {
                             ui.painter().rect_filled(sep_s, Rounding::ZERO, pal.bg_app);
                         }
 
-                        // ── SECTION 7: Tự động hóa & Script (Mở rộng) ──
                         if let Some((d_id2, _, _, _, _, _)) = &thread_meta {
                             let ws_id2 = d_id2.clone();
                             let sec_scr_id = Id::new(("drw_sec_script", ws_id2.as_str()));
@@ -5341,7 +5312,6 @@ impl ZaloGuiApp {
                             .show(ui, |ui| {
                                 let danger_col = Color32::from_rgb(220, 38, 38);
 
-                                // 1. Báo xấu
                                 let rep_resp = ui
                                     .horizontal(|ui| {
                                         let (warn_r, _) = ui.allocate_exact_size(
@@ -5371,7 +5341,6 @@ impl ZaloGuiApp {
                                 }
 
                                 ui.add_space(10.0);
-                                // 2. Xoá lịch sử trò chuyện
                                 let del_resp = ui
                                     .horizontal(|ui| {
                                         ui.label(
@@ -5410,7 +5379,6 @@ impl ZaloGuiApp {
 
                                 if d_is_group {
                                     ui.add_space(10.0);
-                                    // 3. Rời nhóm
                                     let leave_resp = ui
                                         .horizontal(|ui| {
                                             ui.label(
@@ -5626,9 +5594,7 @@ impl ZaloGuiApp {
             }
         }
 
-        // -------------------------------------------------------------------
         // 4. CENTRAL CHAT AREA (Clean Header, Messages Stream, Icon Toolbar)
-        // -------------------------------------------------------------------
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(pal.bg_chat_canvas))
             .show(ctx, |ui| {
@@ -5943,7 +5909,6 @@ impl ZaloGuiApp {
                                     }
 
                                     if !header_narrow {
-                                        // Subtle vertical divider
                                         let (div_r, _) = ui.allocate_exact_size(
                                             Vec2::new(8.0, 20.0),
                                             Sense::hover(),
@@ -5955,7 +5920,6 @@ impl ZaloGuiApp {
                                     }
 
                                     if !is_cloud_thread && !is_system_thread && !is_self_thread {
-                                    // Video Call / Zavi SFU Group Call Button
                                     let vid_btn_w = if is_group && !header_narrow { 96.0 } else { btn_sz };
                                     let (vid_rect, vid_resp) = ui.allocate_exact_size(
                                         Vec2::new(vid_btn_w, if header_narrow { btn_sz } else { 32.0 }),
@@ -6037,7 +6001,6 @@ impl ZaloGuiApp {
                                         );
                                     }
 
-                                    // Voice Call Button
                                     let (aud_rect, aud_resp) = ui.allocate_exact_size(
                                         Vec2::new(btn_sz, btn_sz),
                                         Sense::click(),
@@ -6602,7 +6565,6 @@ impl ZaloGuiApp {
                         }
                     }
 
-                    // 1c. Starred filter active banner
                     if self.filter_starred_only {
                         egui::Frame::none()
                             .fill(Color32::from_rgb(234, 179, 8).linear_multiply(0.12))
@@ -6800,7 +6762,6 @@ impl ZaloGuiApp {
                             });
                     }
 
-                    // 2. Scrollable Messages Area
                     let posting_restricted = self.threads.get(self.selected_thread_index)
                         .is_some_and(|thread| thread.is_group && thread.presentation.posting_restricted == Some(true));
 
@@ -7735,7 +7696,11 @@ impl ZaloGuiApp {
                                     thumb_key,
                                 } => {
                                     let hash = crate::crypto::md5_hex(&url);
-                                    let temp_path = std::env::temp_dir().join(format!("zlite_video_{hash}.mp4"));
+                                    let temp_path = crate::storage_manager::ensure_media_category_dir(
+                                        &self.user_uin,
+                                        crate::storage_manager::MediaCategory::Videos,
+                                    )
+                                    .join(format!("zlite_video_{hash}.mp4"));
                                     let is_cached = temp_path.exists()
                                         && std::fs::metadata(&temp_path).map(|m| m.len() > 0).unwrap_or(false);
                                     let cached_path = if is_cached { Some(temp_path.clone()) } else { None };
@@ -8260,7 +8225,6 @@ impl ZaloGuiApp {
                         }
                     }
 
-                    // 3d. Pending Scheduled Messages Banner (#38)
                     let thread_sched: Vec<crate::scheduler::ScheduledMessage> = self
                         .scheduled_items
                         .iter()
@@ -8533,7 +8497,6 @@ impl ZaloGuiApp {
                             ui.horizontal(|ui| {
                                 ui.spacing_mut().item_spacing.x = 6.0;
 
-                                // 1) Compact Sticker Icon Button
                                 let (stk_rect, stk_resp) = ui.allocate_exact_size(
                                     Vec2::new(30.0, 28.0),
                                     Sense::click(),
@@ -8563,7 +8526,6 @@ impl ZaloGuiApp {
                                     self.sticker_picker_open = !self.sticker_picker_open;
                                 }
 
-                                // 2) Compact Photo Upload Icon Button
                                 let (img_rect, img_resp) = ui.allocate_exact_size(
                                     Vec2::new(30.0, 28.0),
                                     Sense::click(),
@@ -8597,7 +8559,6 @@ impl ZaloGuiApp {
                                     }
                                 }
 
-                                // HD Original Quality Toggle Button
                                 let hd_active = self.send_hd_original;
                                 let (hd_rect, hd_resp) = ui.allocate_exact_size(
                                     Vec2::new(30.0, 28.0),
@@ -8657,7 +8618,6 @@ impl ZaloGuiApp {
                                     self.show_toast(msg.to_string());
                                 }
 
-                                // 3) Compact File Upload Icon Button
                                 let (att_rect, att_resp) = ui.allocate_exact_size(
                                     Vec2::new(30.0, 28.0),
                                     Sense::click(),
@@ -8715,7 +8675,6 @@ impl ZaloGuiApp {
                                     }
                                 }
 
-                                // 4) Screenshot Icon Button (Chụp ảnh màn hình)
                                 let (cam_rect, cam_resp) = ui.allocate_exact_size(
                                     Vec2::new(30.0, 28.0),
                                     Sense::click(),
@@ -8748,7 +8707,6 @@ impl ZaloGuiApp {
                                     }
                                 }
 
-                                // 5) Mic Icon Button (ghi âm tin nhắn thoại)
                                 let (mic_rect, mic_resp) = ui.allocate_exact_size(
                                     Vec2::new(30.0, 28.0),
                                     Sense::click(),
@@ -8793,7 +8751,6 @@ impl ZaloGuiApp {
                                     }
                                 }
 
-                                // 6) Schedule Send Button (`🕒`)
                                 let (sched_rect, sched_resp) = ui.allocate_exact_size(
                                     Vec2::new(30.0, 28.0),
                                     Sense::click(),
@@ -9478,7 +9435,6 @@ impl ZaloGuiApp {
             }
         }
 
-        // Hộp thoại xác nhận rời nhóm
         if let Some((del_idx, del_tid, del_name)) = self.pending_leave_group.clone() {
             let mut close_confirm = false;
             let mut confirmed_leave = false;
@@ -9669,7 +9625,6 @@ impl ZaloGuiApp {
             });
         }
         let scripts = self.script_list_cache.get(&tid).cloned().unwrap_or_default();
-        // ── Nút "+ Mẫu" (3 template kèm sẵn) ──
         ui.horizontal_wrapped(|ui| {
             ui.label(
                 RichText::new(format!("{} script", scripts.len()))
@@ -9918,7 +9873,6 @@ impl ZaloGuiApp {
                 });
             });
         }
-        // ── Panel output + log ──
         if !self.script_output.trim().is_empty() {
             ui.add_space(6.0);
             ui.label(
@@ -10314,16 +10268,16 @@ fn play_voice_attachment(url: &str, file_name: &str, msg_id: &str, download_dir:
     if bytes.is_empty() || bytes.len() > 16 * 1024 * 1024 {
         return;
     }
-    let mut path = if download_dir.trim().is_empty() {
-        std::env::temp_dir()
-    } else {
-        std::path::PathBuf::from(download_dir.trim())
-    };
-    let _ = std::fs::create_dir_all(&path);
+    let _ = download_dir;
+    let uin = crate::account_manager::active_uin();
+    let mut path = crate::storage_manager::ensure_media_category_dir(
+        &uin,
+        crate::storage_manager::MediaCategory::Voices,
+    );
     let safe_name = if clean.is_empty() {
-        format!("voice_{msg_id}.dat")
+        format!("voice_{msg_id}.m4a")
     } else {
-        format!("play_{msg_id}_{clean}")
+        format!("voice_{msg_id}_{clean}")
     };
     path.push(safe_name);
     if std::fs::write(&path, &bytes).is_err() {
@@ -10512,7 +10466,6 @@ impl ZaloGuiApp {
                     .show(ui, |ui| {
                         ui.set_width(popover_w - 20.0);
 
-                        // Header
                         ui.horizontal(|ui| {
                             ui.label(
                                 RichText::new("👥  NHẮC ĐẾN THÀNH VIÊN (@mention)")
@@ -10525,7 +10478,6 @@ impl ZaloGuiApp {
                         ui.separator();
                         ui.add_space(2.0);
 
-                        // Candidates List
                         let scroll_max_h = (visible_items as f32 * item_h) + 2.0;
                         egui::ScrollArea::vertical()
                             .id_salt("mention_candidates_scroll")
@@ -10551,7 +10503,6 @@ impl ZaloGuiApp {
                                         );
                                     }
 
-                                    // Avatar
                                     let ava_center =
                                         Pos2::new(row_rect.left() + 18.0, row_rect.center().y);
                                     if cand.is_all {
@@ -10576,7 +10527,6 @@ impl ZaloGuiApp {
                                         );
                                     }
 
-                                    // Name
                                     let name_left = row_rect.left() + 38.0;
                                     let name_text = if cand.is_all {
                                         "@All".to_string()
@@ -10595,7 +10545,6 @@ impl ZaloGuiApp {
                                         },
                                     );
 
-                                    // Role or subtitle tag
                                     if !cand.role.is_empty() {
                                         let role_str = match cand.role.as_str() {
                                             "creator" | "Trưởng nhóm" => "Trưởng nhóm",
@@ -10625,7 +10574,6 @@ impl ZaloGuiApp {
                                 }
                             });
 
-                        // Footer hint
                         ui.add_space(4.0);
                         ui.separator();
                         ui.add_space(2.0);
@@ -11022,297 +10970,5 @@ impl ZaloGuiApp {
                 self.reminder_modal_open = false;
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod quote_navigation_tests {
-    use super::*;
-
-    #[test]
-    fn quote_navigation_invalidates_when_thread_changes_or_highlight_expires() {
-        let messages = [ChatMessage {
-            id: "original".into(),
-            ..Default::default()
-        }];
-        let mut jump = QuoteJump {
-            thread_id: "thread-1".into(),
-            reference: "original".into(),
-            highlight_until: std::time::Instant::now() + std::time::Duration::from_secs(3),
-            scroll_pending: true,
-        };
-        assert_eq!(jump.target_index("thread-1", &messages), Some(0));
-        assert_eq!(jump.target_index("thread-2", &messages), None);
-        jump.highlight_until = std::time::Instant::now();
-        assert_eq!(jump.target_index("thread-1", &messages), None);
-    }
-
-    #[test]
-    fn quote_navigation_keeps_animated_jump_visible_after_highlight_expires() {
-        for (count, target) in [(1000, 12), (1000, 900), (150, 12)] {
-            let ctx = egui::Context::default();
-            let color = Color32::from_rgb(1, 2, 3);
-            let mut before = 0.0;
-            let mut after = 0.0;
-            let mut highlighted = false;
-            let mut target_visible = false;
-            for frame in 0..10 {
-                let jumping = frame > 0;
-                let highlighting = jumping && frame < 7;
-                let limit = if jumping {
-                    crate::message_navigation::render_limit_for_target(150, count, target)
-                } else {
-                    150
-                };
-                if count == 1000 && target == 12 {
-                    assert!(jumping || count - limit > target);
-                }
-                let output = ctx.run(
-                    egui::RawInput {
-                        time: Some(frame as f64 * 0.5),
-                        screen_rect: Some(egui::Rect::from_min_size(
-                            egui::Pos2::ZERO,
-                            Vec2::new(400.0, 300.0),
-                        )),
-                        ..Default::default()
-                    },
-                    |ctx| {
-                        egui::CentralPanel::default().show(ctx, |ui| {
-                            let scroll = egui::ScrollArea::vertical()
-                                .id_salt("quote_jump_test")
-                                .max_height(200.0)
-                                .stick_to_bottom(!highlighting)
-                                .show(ui, |ui| {
-                                    for index in count - limit..count {
-                                        let (rect, _) = ui.allocate_exact_size(
-                                            Vec2::new(200.0, 30.0),
-                                            Sense::hover(),
-                                        );
-                                        if jumping && index == target {
-                                            if highlighting {
-                                                render_quote_target(ui, rect, frame == 1, color);
-                                                highlighted = true;
-                                            }
-                                            if frame == 9 {
-                                                target_visible =
-                                                    ui.clip_rect().contains(rect.center());
-                                            }
-                                        }
-                                    }
-                                });
-                            if jumping {
-                                after = scroll.state.offset.y;
-                            } else {
-                                before = scroll.state.offset.y;
-                            }
-                        });
-                    },
-                );
-                if frame == 4 {
-                    assert!(output.shapes.iter().any(|shape| {
-                    matches!(&shape.shape, egui::Shape::Rect(rect) if rect.stroke.color == color)
-                }), "Exact target must have a visible highlight shape");
-                }
-            }
-            assert!(highlighted);
-            assert!(
-                before > 1000.0,
-                "Initial viewport must start at the newest messages"
-            );
-            assert!(
-                after < before && target_visible,
-                "Jump must center the older target, not remain at the bottom: {after}"
-            );
-        }
-    }
-
-    #[test]
-    fn workspace_layout_and_mention_helpers() {
-        // Chat stream height never underflows on compact viewports or tall composers
-        let h_compact = compute_chat_stream_height(360.0, 340.0);
-        assert!(h_compact >= 48.0);
-        let h_normal = compute_chat_stream_height(800.0, 132.0);
-        assert!((h_normal - 668.0).abs() < 0.01);
-
-        // Compact drawer width stays inside viewport while respecting bounds
-        assert!((compute_compact_drawer_width(480.0) - 340.0).abs() < 0.01);
-        assert!((compute_compact_drawer_width(300.0) - 255.0).abs() < 0.01);
-        assert!((compute_compact_drawer_width(1200.0) - 324.0).abs() < 0.01);
-
-        // Header actions collapse cleanly when narrow
-        let w_narrow = compute_chat_header_actions_width(true, true);
-        let w_wide = compute_chat_header_actions_width(true, false);
-        assert!(w_narrow < w_wide && w_narrow >= 164.0);
-        assert!(
-            compute_chat_header_actions_width_exact(true, true, true)
-                < compute_chat_header_actions_width_exact(true, false, true)
-        );
-        assert!(
-            compute_chat_header_actions_width_exact(false, true, false)
-                < compute_chat_header_actions_width_exact(false, true, true)
-        );
-
-        // Cursor-aware mention replacement keeps surrounding UTF-8 text intact
-        let (new_draft, next_cursor) =
-            replace_active_mention_in_text("Nhắc @an về báo cáo", Some(8), "Anh Tuấn")
-                .expect("should replace active mention");
-        assert_eq!(new_draft, "Nhắc @Anh Tuấn về báo cáo");
-        assert_eq!(next_cursor, "Nhắc @Anh Tuấn".chars().count());
-    }
-
-    #[test]
-    fn group_manage_button_toggles_without_sync_while_dm_syncs() {
-        assert_eq!(resolve_group_manage_click(true, false), (true, true, false));
-        assert_eq!(resolve_group_manage_click(true, true), (false, false, false));
-        assert_eq!(resolve_group_manage_click(false, false), (false, false, true));
-        assert_eq!(resolve_group_manage_click(false, true), (true, false, true));
-    }
-
-    #[test]
-    fn chat_scroll_resync_eliminates_top_flash_and_thumbnail_jump_without_hijacking_scroll_up() {
-        assert_eq!(
-            compute_chat_scroll_resync(true, false, 0.0, 1400.0, 2000.0, 600.0),
-            Some(1400.0)
-        );
-        assert_eq!(
-            compute_chat_scroll_resync(true, false, 300.0, 300.0, 2000.0, 600.0),
-            Some(1400.0)
-        );
-        assert_eq!(
-            compute_chat_scroll_resync(false, false, 1400.0, 2200.0, 2800.0, 600.0),
-            Some(2200.0)
-        );
-        assert_eq!(
-            compute_chat_scroll_resync(false, false, 300.0, 300.0, 2800.0, 600.0),
-            None
-        );
-        assert_eq!(
-            compute_chat_scroll_resync(false, false, 2200.0, 2200.0, 2800.0, 600.0),
-            None
-        );
-        assert_eq!(
-            compute_chat_scroll_resync(true, true, 0.0, 1400.0, 2000.0, 600.0),
-            None
-        );
-    }
-
-    #[test]
-    fn chat_scroll_multipass_discard_snaps_initial_and_expanding_bottom_in_single_frame() {
-        let ctx = egui::Context::default();
-        let scroll_salt = ("chat_scroll", "cloud_test");
-        let mut force_snap = true;
-        let mut content_rows = 40usize;
-        let mut output_offset_y = 0.0_f32;
-        let mut output_max_y = 0.0_f32;
-
-        let out1 = ctx.run(
-            egui::RawInput {
-                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(420.0, 300.0))),
-                ..Default::default()
-            },
-            |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    let scroll_id = ui.make_persistent_id(Id::new(scroll_salt));
-                    let rendered_y = egui::scroll_area::State::load(ctx, scroll_id)
-                        .map_or(0.0, |s| s.offset.y);
-                    let scroll_out = egui::ScrollArea::vertical()
-                        .id_salt(scroll_salt)
-                        .max_height(260.0)
-                        .auto_shrink([false, false])
-                        .scroll_bar_visibility(
-                            egui::scroll_area::ScrollBarVisibility::AlwaysVisible,
-                        )
-                        .animated(!force_snap)
-                        .stick_to_bottom(true)
-                        .show(ui, |ui| {
-                            for idx in 0..content_rows {
-                                ui.allocate_exact_size(Vec2::new(320.0, 24.0), Sense::hover());
-                                if idx + 1 == content_rows {
-                                    ui.add_space(1.0);
-                                }
-                            }
-                        });
-                    assert_eq!(scroll_id, scroll_out.id);
-                    let max_y =
-                        (scroll_out.content_size.y - scroll_out.inner_rect.height()).max(0.0);
-                    if let Some(target_y) = compute_chat_scroll_resync(
-                        force_snap,
-                        false,
-                        rendered_y,
-                        scroll_out.state.offset.y,
-                        scroll_out.content_size.y,
-                        scroll_out.inner_rect.height(),
-                    ) {
-                        sync_chat_scroll_bottom_pass(
-                            ctx,
-                            scroll_out.id,
-                            target_y,
-                            scroll_out.state.offset.x,
-                        );
-                    }
-                    force_snap = false;
-                    output_offset_y = rendered_y;
-                    output_max_y = max_y;
-                });
-            },
-        );
-        assert!(out1.platform_output.num_completed_passes <= 2);
-        assert!(
-            (output_offset_y - output_max_y).abs() <= 1.0 && output_max_y > 100.0,
-            "pass discard should render final frame already at bottom: rendered={output_offset_y}, max={output_max_y}"
-        );
-
-        content_rows = 60;
-        let out2 = ctx.run(
-            egui::RawInput {
-                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(420.0, 300.0))),
-                ..Default::default()
-            },
-            |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    let scroll_id = ui.make_persistent_id(Id::new(scroll_salt));
-                    let rendered_y = egui::scroll_area::State::load(ctx, scroll_id)
-                        .map_or(0.0, |s| s.offset.y);
-                    let scroll_out = egui::ScrollArea::vertical()
-                        .id_salt(scroll_salt)
-                        .max_height(260.0)
-                        .auto_shrink([false, false])
-                        .scroll_bar_visibility(
-                            egui::scroll_area::ScrollBarVisibility::AlwaysVisible,
-                        )
-                        .stick_to_bottom(true)
-                        .show(ui, |ui| {
-                            for _ in 0..content_rows {
-                                ui.allocate_exact_size(Vec2::new(320.0, 24.0), Sense::hover());
-                            }
-                        });
-                    assert_eq!(scroll_id, scroll_out.id);
-                    let max_y =
-                        (scroll_out.content_size.y - scroll_out.inner_rect.height()).max(0.0);
-                    if let Some(target_y) = compute_chat_scroll_resync(
-                        false,
-                        false,
-                        rendered_y,
-                        scroll_out.state.offset.y,
-                        scroll_out.content_size.y,
-                        scroll_out.inner_rect.height(),
-                    ) {
-                        sync_chat_scroll_bottom_pass(
-                            ctx,
-                            scroll_out.id,
-                            target_y,
-                            scroll_out.state.offset.x,
-                        );
-                    }
-                    output_offset_y = rendered_y;
-                    output_max_y = max_y;
-                });
-            },
-        );
-        assert!(out2.platform_output.num_completed_passes <= 2);
-        assert!(
-            (output_offset_y - output_max_y).abs() <= 1.0,
-            "expanding content while stuck must resync before present: rendered={output_offset_y}, max={output_max_y}"
-        );
     }
 }

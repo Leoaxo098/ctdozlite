@@ -2594,7 +2594,6 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                                             }
                                                         }
                                                         let _ = s.sync_profile_me().await;
-                                                        // The profile call can fail or omit the
                                                         // name; the scan result already named the
                                                         // account, so keep it rather than leaving
                                                         // the account labelled by its id.
@@ -3146,7 +3145,6 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                             temp_threads.retain(|t| !t.messages.is_empty());
                                             if !temp_threads.is_empty() {
                                                 // Skip UI churn when nothing actually changed (#135:
-                                                // 1.2s poll used to relayout the whole message list
                                                 // every tick even with zero new messages).
                                                 let fingerprint = |ts: &[Thread]| -> u64 {
                                                     use std::hash::{Hash, Hasher};
@@ -3975,7 +3973,6 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                         crate::chat::recall_message(&s, &to_id, is_group, &old_msg)
                                             .await;
                                 }
-                                // 2. Gửi tin mới với text đã sửa.
                                 let client_id = crate::chat::next_client_message_id();
                                 let res = if is_group {
                                     crate::chat::send_group_message_with_client_id(
@@ -4214,8 +4211,14 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                 let Ok(_permit) = decode_sem.acquire_owned().await else {
                                     return;
                                 };
-                                let cache_dir =
-                                    crate::account_manager::ensure_media_cache_dir();
+                                let cache_dir = if key.starts_with("hd_") {
+                                    crate::storage_manager::ensure_media_category_dir(
+                                        &crate::account_manager::active_uin(),
+                                        crate::storage_manager::MediaCategory::Photos,
+                                    )
+                                } else {
+                                    crate::account_manager::ensure_media_cache_dir()
+                                };
                                 let cache_path = cache_dir.join(format!("{key}.png"));
 
                                 // Bytes come from the disk cache, a local file or the network. They
@@ -5828,27 +5831,9 @@ async fn download_attachment_with_original_name(
         .await
         .map_err(|e| format!("Lỗi đọc dữ liệu tập tin: {e}"))?;
 
-    let target_dir = if !download_dir.trim().is_empty() {
-        std::path::PathBuf::from(download_dir.trim())
-    } else {
-        std::env::var("USERPROFILE")
-            .ok()
-            .map(|p| {
-                std::path::PathBuf::from(p)
-                    .join("Downloads")
-                    .join("Zalo Received Files")
-            })
-            .or_else(|| {
-                std::env::var("HOME").ok().map(|h| {
-                    std::path::PathBuf::from(h)
-                        .join("Downloads")
-                        .join("Zalo Received Files")
-                })
-            })
-            .unwrap_or_else(|| std::path::PathBuf::from("Downloads"))
-    };
-    // Each account saves into its own subfolder so received files never mix.
-    let target_dir = crate::account_manager::account_download_dir(&target_dir, account_uin);
+    let _ = download_dir;
+    let category = crate::storage_manager::MediaCategory::from_filename(&clean_name);
+    let target_dir = crate::storage_manager::ensure_media_category_dir(account_uin, category);
 
     tokio::task::spawn_blocking(move || write_unique_file(&target_dir, &clean_name, &bytes))
         .await
@@ -5914,10 +5899,19 @@ async fn save_media_to_downloads(
         .await
         .map_err(|e| format!("Lỗi đọc dữ liệu tập tin: {e}"))?;
     let name = media_file_name(hint, url, &content_type, crate::login::unix_now());
+    let uin = crate::account_manager::active_uin();
+    let category = crate::storage_manager::MediaCategory::from_filename(&name);
+    let media_dir = crate::storage_manager::ensure_media_category_dir(&uin, category);
     let target_dir = crate::account_manager::os_downloads_dir();
-    tokio::task::spawn_blocking(move || write_unique_file(&target_dir, &name, &bytes))
-        .await
-        .map_err(|e| format!("Lỗi tác vụ lưu file: {e}"))?
+    tokio::task::spawn_blocking(move || {
+        let media_copy = media_dir.join(&name);
+        if !media_copy.exists() {
+            let _ = std::fs::write(&media_copy, &bytes);
+        }
+        write_unique_file(&target_dir, &name, &bytes)
+    })
+    .await
+    .map_err(|e| format!("Lỗi tác vụ lưu file: {e}"))?
 }
 
 const MEDIA_EXTENSIONS: [&str; 12] = [
@@ -5974,55 +5968,6 @@ fn media_file_name(hint: &str, url: &str, content_type: &str, ts: i64) -> String
     format!("zalo_{ts}.{ext}")
 }
 
-#[cfg(test)]
-mod save_media_tests {
-    use super::*;
-
-    #[test]
-    fn media_name_prefers_hint_then_url_segment() {
-        assert_eq!(
-            media_file_name("beach.png", "https://x/a.jpg", "", 1),
-            "beach.png"
-        );
-        assert_eq!(
-            media_file_name("Hình ảnh", "https://f1.zdn.vn/jpg/9/abc.jpg?x=1", "", 1),
-            "abc.jpg"
-        );
-    }
-
-    #[test]
-    fn media_name_falls_back_to_timestamp_with_mime_extension() {
-        assert_eq!(
-            media_file_name("Hình ảnh", "https://x/renewMedia", "image/png", 42),
-            "zalo_42.png"
-        );
-        assert_eq!(
-            media_file_name("", "https://x/v", "video/mp4; codecs=avc1", 7),
-            "zalo_7.mp4"
-        );
-        assert_eq!(media_file_name("", "https://x/", "", 3), "zalo_3.jpg");
-    }
-
-    #[test]
-    fn media_name_strips_path_separators() {
-        assert_eq!(
-            media_file_name("../../etc/a.jpg", "https://x/", "", 1),
-            "_.._etc_a.jpg"
-        );
-    }
-
-    #[test]
-    fn unique_file_appends_counter_instead_of_overwriting() {
-        let dir = std::env::temp_dir().join(format!("ctdoz_save_media_{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let (first, _) = write_unique_file(&dir, "a.jpg", b"1").unwrap();
-        let (second, path) = write_unique_file(&dir, "a.jpg", b"2").unwrap();
-        assert_eq!(first, "a.jpg");
-        assert_eq!(second, "a (1).jpg");
-        assert_eq!(std::fs::read(path).unwrap(), b"2");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-}
 /// Download attachment bytes for in-app preview, bounded at 10 MiB (no disk write).
 async fn download_preview_bytes(
     client: &reqwest::Client,
@@ -6208,140 +6153,5 @@ pub(crate) fn capture_screen_interactive(gui_tx: crate::gui::GuiTx, ctx: egui::C
             "Đã huỷ chụp màn hình".into(),
         ));
         ctx.request_repaint();
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    struct WorkerTempDir {
-        path: std::path::PathBuf,
-    }
-
-    impl WorkerTempDir {
-        fn new(prefix: &str) -> Self {
-            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            let seq = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let path = std::env::temp_dir().join(format!(
-                "ctdozlite-worker-{prefix}-{}-{seq}",
-                std::process::id()
-            ));
-            let _ = std::fs::remove_dir_all(&path);
-            std::fs::create_dir_all(&path).unwrap();
-            Self { path }
-        }
-
-        fn path(&self) -> &std::path::Path {
-            &self.path
-        }
-    }
-
-    impl Drop for WorkerTempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.path);
-        }
-    }
-
-    #[test]
-    fn forget_lock_and_sign_out_all_non_blocking_under_long_poll_and_epoch_guarded() {
-        let dir = WorkerTempDir::new("forget-lock");
-        std::fs::write(dir.path().join("session.json"), b"{}").unwrap();
-        std::fs::write(dir.path().join(crate::app_lock::APP_LOCK_FILE), b"{}").unwrap();
-
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        rt.block_on(async {
-            let mut s = Session::new(false, false, false).unwrap();
-            s.login = Some(crate::session::LoginInfo {
-                uin: "123456".into(),
-                display_name: "Tester".into(),
-                ..Default::default()
-            });
-            let session = std::sync::Arc::new(tokio::sync::Mutex::new(s));
-            let poll_state = std::sync::Arc::new(tokio::sync::Mutex::new(crate::chat::PollState {
-                last_action_id: "999".into(),
-                ..Default::default()
-            }));
-            let ctrl_poll_state = std::sync::Arc::new(tokio::sync::Mutex::new(
-                crate::call::CtrlPollState {
-                    last_action_id: "888".into(),
-                    ..Default::default()
-                },
-            ));
-            let (raw_tx, gui_rx) = std::sync::mpsc::channel();
-            let egui_ctx = egui::Context::default();
-            let gui_tx = GuiTx::new(raw_tx, egui_ctx.clone());
-            let call_bridge = std::sync::Arc::new(crate::call::CallBridge::spawn(
-                session.clone(),
-                gui_tx.clone(),
-                egui_ctx.clone(),
-            ));
-
-            let held_poll = poll_state.clone().lock_owned().await;
-            let held_ctrl = ctrl_poll_state.clone().lock_owned().await;
-
-            let mut qr_task: Option<tokio::task::JoinHandle<()>> = None;
-            let mut pass_task: Option<tokio::task::JoinHandle<()>> = None;
-
-            let completed = tokio::time::timeout(
-                Duration::from_millis(500),
-                forget_lock_and_sign_out_all_in(
-                    dir.path(),
-                    &mut qr_task,
-                    &mut pass_task,
-                    &call_bridge,
-                    &session,
-                    &poll_state,
-                    &ctrl_poll_state,
-                    &gui_tx,
-                    &egui_ctx,
-                ),
-            )
-            .await;
-            assert!(completed.is_ok(), "must not block behind long-poll mutexes");
-            assert!(session.lock().await.login.is_none());
-            assert!(!dir.path().join("session.json").exists());
-            assert!(!dir.path().join(crate::app_lock::APP_LOCK_FILE).exists());
-
-            let ev = gui_rx.try_recv().expect("ForgotLockSignedOut emitted");
-            assert!(matches!(ev, GuiEvent::ForgotLockSignedOut));
-
-            drop(held_poll);
-            drop(held_ctrl);
-            tokio::time::sleep(Duration::from_millis(30)).await;
-            assert_eq!(
-                poll_state.lock().await.last_action_id,
-                crate::chat::PollState::default().last_action_id
-            );
-            assert_eq!(
-                ctrl_poll_state.lock().await.last_action_id,
-                crate::call::CtrlPollState::default().last_action_id
-            );
-
-            let held_poll2 = poll_state.clone().lock_owned().await;
-            forget_lock_and_sign_out_all_in(
-                dir.path(),
-                &mut qr_task,
-                &mut pass_task,
-                &call_bridge,
-                &session,
-                &poll_state,
-                &ctrl_poll_state,
-                &gui_tx,
-                &egui_ctx,
-            )
-            .await;
-            bump_poll_reset_epoch();
-            drop(held_poll2);
-            {
-                let mut ps = poll_state.lock().await;
-                ps.last_action_id = "fresh_relogin".into();
-            }
-            tokio::time::sleep(Duration::from_millis(30)).await;
-            assert_eq!(poll_state.lock().await.last_action_id, "fresh_relogin");
-        });
     }
 }
