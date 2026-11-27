@@ -142,6 +142,10 @@ pub struct ChatMessage {
     /// Photo album membership (`group_layout_id`); consecutive photos sharing it render as one grid.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub media_group: Option<MediaGroupLayout>,
+    /// Pixel size the sender declared for a photo (`params.width`/`height`). Lets the chat
+    /// reserve the final size before the thumbnail loads, so the list does not jump.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_size: Option<[u32; 2]>,
     /// Bản dịch hiển thị dưới tin gốc (session-only, không persist).
     #[serde(skip)]
     pub translation: Option<String>,
@@ -195,10 +199,15 @@ impl ChatMessage {
         if gained_oa_card {
             self.oa_card = incoming.oa_card.clone();
         }
+        let gained_media_size = self.media_size.is_none() && incoming.media_size.is_some();
+        if gained_media_size {
+            self.media_size = incoming.media_size;
+        }
         self.delivery = self.delivery.merge(incoming.delivery);
         gained_media_group
             || notice_text_changed
             || gained_oa_card
+            || gained_media_size
             || previous_mentions != self.resolved_mention_uids
             || before
                 != (
@@ -736,6 +745,9 @@ pub fn apply_vanish_expiry(msg: &mut ChatMessage) -> bool {
     msg.sticker_id = None;
     msg.sticker_cate_id = None;
     msg.sticker_type = None;
+    msg.oa_card = None;
+    msg.media_group = None;
+    msg.media_size = None;
     true
 }
 
@@ -2484,6 +2496,44 @@ pub struct MediaGroupLayout {
     pub total: u32,
 }
 
+/// Parse `params` from a message `content`; both may arrive as an object or a JSON string.
+fn content_params(content: &Value) -> Option<Value> {
+    let parse_json = |v: &Value| -> Option<Value> {
+        match v {
+            Value::String(s) if s.trim_start().starts_with('{') => serde_json::from_str(s).ok(),
+            Value::Object(_) => Some(v.clone()),
+            _ => None,
+        }
+    };
+    let content = parse_json(content)?;
+    content.get("params").and_then(parse_json)
+}
+
+/// Read a photo's declared pixel size from `content.params` (`width`, `height`), as numbers
+/// or numeric strings. Returns `None` unless both are positive.
+pub fn photo_size_from_content(content: &Value) -> Option<[u32; 2]> {
+    params_size(content, "width", "height")
+}
+
+/// Read a video's declared pixel size from `content.params` (`video_width`, `video_height`,
+/// the fields Zalo's web client reads for `MSG_VIDEO`).
+pub fn video_size_from_content(content: &Value) -> Option<[u32; 2]> {
+    params_size(content, "video_width", "video_height")
+}
+
+fn params_size(content: &Value, width_key: &str, height_key: &str) -> Option<[u32; 2]> {
+    let params = content_params(content)?;
+    let dim = |key: &str| -> Option<u32> {
+        let v = params.get(key)?;
+        let n = v
+            .as_u64()
+            .or_else(|| v.as_f64().map(|f| f.round() as u64))
+            .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))?;
+        u32::try_from(n).ok().filter(|&n| n > 0)
+    };
+    Some([dim(width_key)?, dim(height_key)?])
+}
+
 impl MediaGroupLayout {
     /// Build the layout for photo `index` of `total`, all sharing `id`.
     pub fn new(id: impl Into<String>, index: u32, total: u32) -> Self {
@@ -2498,15 +2548,7 @@ impl MediaGroupLayout {
     /// `params` carries `group_layout_id`, `is_group_layout` and `id_in_group`. Returns `None`
     /// for photos sent on their own.
     pub fn from_content(content: &Value) -> Option<Self> {
-        let parse_json = |v: &Value| -> Option<Value> {
-            match v {
-                Value::String(s) if s.trim_start().starts_with('{') => serde_json::from_str(s).ok(),
-                Value::Object(_) => Some(v.clone()),
-                _ => None,
-            }
-        };
-        let content = parse_json(content)?;
-        let params = content.get("params").and_then(parse_json)?;
+        let params = content_params(content)?;
         let as_u64 = |key_snake: &str, key_camel: &str| -> Option<u64> {
             let v = params.get(key_snake).or_else(|| params.get(key_camel))?;
             v.as_u64()
@@ -3117,6 +3159,7 @@ pub async fn send_attachment_in_layout(
             link_thumb: Some(final_thumb),
             link_src: Some("Hình ảnh Zalo".into()),
             media_group: layout.filter(|_| joined_album).cloned(),
+            media_size: Some([width, height]).filter(|&[w, h]| w > 0 && h > 0),
             ..Default::default()
         };
         return Ok((send_resp, cm));
@@ -3274,6 +3317,7 @@ pub async fn send_attachment_in_layout(
                             link_desc: (!caption.trim().is_empty())
                                 .then(|| caption.trim().to_string()),
                             link_src: Some("Video Zalo".into()),
+                            media_size: Some([vid_w, vid_h]).filter(|&[w, h]| w > 0 && h > 0),
                             ..Default::default()
                         };
                         return Ok((fwd_resp, cm));
@@ -9019,6 +9063,13 @@ fn parse_chat_message(it: &Value) -> Option<ChatMessage> {
         oa_card,
         media_group: if is_photo_msg {
             raw_content_val.and_then(MediaGroupLayout::from_content)
+        } else {
+            None
+        },
+        media_size: if is_photo_msg {
+            raw_content_val.and_then(photo_size_from_content)
+        } else if is_video_msg {
+            raw_content_val.and_then(video_size_from_content)
         } else {
             None
         },

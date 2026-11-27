@@ -1402,6 +1402,14 @@ impl MessageStore {
     /// original row — otherwise the sweep re-persists expiry every 2s tick and a
     /// restart restores the original content from the stale row (gui.rs:1908).
     pub fn upsert_message(&mut self, msg: &StoredMessage) -> Result<bool> {
+        let trimmed = msg.text.trim();
+        let is_tombstone =
+            msg.raw_json.is_empty() && trimmed == crate::chat::VANISH_EXPIRED_TEXT;
+        let insert_raw_json = if is_tombstone {
+            VANISH_TOMBSTONE_JSON
+        } else {
+            msg.raw_json.as_str()
+        };
         let rows = self.conn.execute(
             "INSERT OR IGNORE INTO messages (msg_id, thread_id, sender_id, sender_name, text, msg_type, ts, is_outgoing, raw_json)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
@@ -1414,12 +1422,9 @@ impl MessageStore {
                 msg.msg_type,
                 msg.ts,
                 if msg.is_outgoing { 1 } else { 0 },
-                msg.raw_json,
+                insert_raw_json,
             ],
         )?;
-        let trimmed = msg.text.trim();
-        let is_tombstone =
-            msg.raw_json.is_empty() && trimmed == crate::chat::VANISH_EXPIRED_TEXT;
         let is_incoming_undo = !is_tombstone
             && (trimmed == "[Tin nhắn đã thu hồi]"
                 || msg.msg_type == "chat.undo"
@@ -2056,6 +2061,7 @@ impl MessageStore {
                 let mut link_src = None;
                 let mut oa_card: Option<crate::chat::OaRichCard> = None;
                 let mut media_group: Option<crate::chat::MediaGroupLayout> = None;
+                let mut media_size: Option<[u32; 2]> = None;
                 if !sm.raw_json.is_empty() {
                     // Expiry tombstone (`{"vanished":true}`): authoritative —
                     // keep the tombstone text, restore NO metadata, and never
@@ -2100,6 +2106,8 @@ impl MessageStore {
                             existing.link_thumb = None;
                             existing.link_src = None;
                             existing.oa_card = None;
+                            existing.media_group = None;
+                            existing.media_size = None;
                             existing.sticker_id = None;
                             existing.sticker_cate_id = None;
                             existing.sticker_type = None;
@@ -2193,6 +2201,9 @@ impl MessageStore {
                         media_group = val
                             .get("media_group")
                             .and_then(|v| serde_json::from_value(v.clone()).ok());
+                        media_size = val
+                            .get("media_size")
+                            .and_then(|v| serde_json::from_value(v.clone()).ok());
                     }
                 }
                 let is_video_url = link_url.as_deref().is_some_and(|u| {
@@ -2274,6 +2285,7 @@ impl MessageStore {
                     link_src,
                     oa_card,
                     media_group,
+                    media_size,
 
                     ..Default::default()
                 };
@@ -2361,6 +2373,9 @@ impl MessageStore {
                     existing.is_pinned = existing.is_pinned || cm.is_pinned;
                     existing.is_starred = existing.is_starred || cm.is_starred;
                     existing.edited = existing.edited || cm.edited;
+                    if existing.media_size.is_none() {
+                        existing.media_size = cm.media_size;
+                    }
                 } else {
                     t.messages.push(cm);
                     loaded_count += 1;
@@ -2448,7 +2463,10 @@ impl From<&ChatMessage> for StoredMessage {
         if let Some(group) = &m.media_group {
             meta.insert("media_group".into(), serde_json::json!(group));
         }
-        let raw_json = if meta.is_empty() {
+        if let Some(size) = &m.media_size {
+            meta.insert("media_size".into(), serde_json::json!(size));
+        }
+        let raw_json = if meta.is_empty() || crate::chat::is_vanished_message(m) {
             String::new()
         } else {
             serde_json::Value::Object(meta).to_string()
