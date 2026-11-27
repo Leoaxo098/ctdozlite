@@ -1034,9 +1034,209 @@ async fn forget_lock_and_sign_out_all(
     .await;
 }
 
+#[cfg(windows)]
+enum SettingsRequest {
+    Save(String),
+    Flush,
+}
+
+#[cfg(windows)]
+static SETTINGS_TX: std::sync::OnceLock<std::sync::mpsc::Sender<SettingsRequest>> =
+    std::sync::OnceLock::new();
+
+#[cfg(windows)]
+fn save_app_settings_with(
+    slot: &std::sync::OnceLock<std::sync::mpsc::Sender<SettingsRequest>>,
+    json: String,
+    fallback_path: &std::path::Path,
+) {
+    let mut unsent_json = Some(json);
+    if let Some(tx) = slot.get() {
+        if let Some(payload) = unsent_json.take() {
+            match tx.send(SettingsRequest::Save(payload)) {
+                Ok(()) => return,
+                Err(std::sync::mpsc::SendError(SettingsRequest::Save(returned))) => {
+                    unsent_json = Some(returned);
+                }
+                Err(_) => {}
+            }
+        }
+    }
+    if let Some(payload) = unsent_json {
+        if let Err(err) = crate::data_dir::write_private_atomic(fallback_path, payload.as_bytes()) {
+            crate::logger::log_error("gui::save_app_settings", &err.to_string());
+        }
+    }
+}
+
+/// Queue a complete settings snapshot for ordered persistence on Windows.
+#[cfg(windows)]
+pub(super) fn save_app_settings(json: String) {
+    save_app_settings_with(&SETTINGS_TX, json, std::path::Path::new("app_settings.json"));
+}
+
+#[cfg(windows)]
+fn flush_app_settings_with(
+    slot: &std::sync::OnceLock<std::sync::mpsc::Sender<SettingsRequest>>,
+) -> bool {
+    slot.get()
+        .is_some_and(|tx| tx.send(SettingsRequest::Flush).is_ok())
+}
+
+/// Request an acknowledgment after the settings writer drains its queued saves.
+#[cfg(windows)]
+pub(super) fn flush_app_settings() -> bool {
+    flush_app_settings_with(&SETTINGS_TX)
+}
+
+#[cfg(windows)]
+fn write_app_settings(
+    requests: std::sync::mpsc::Receiver<SettingsRequest>,
+    gui_tx: GuiTx,
+    path: &std::path::Path,
+) {
+    for request in requests {
+        match request {
+            SettingsRequest::Save(json) => {
+                if crate::data_dir::write_private_atomic(path, json.as_bytes()).is_err() {
+                    crate::logger::log_error("gui::save_app_settings", "Could not persist settings");
+                    let _ = gui_tx.send(GuiEvent::SettingsSaveFailed);
+                }
+            }
+            SettingsRequest::Flush => {
+                let _ = gui_tx.send(GuiEvent::SettingsFlushed);
+                break;
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn start_settings_writer_with(
+    slot: &std::sync::OnceLock<std::sync::mpsc::Sender<SettingsRequest>>,
+    gui_tx: &GuiTx,
+    path: std::path::PathBuf,
+) {
+    if slot.get().is_some() {
+        return;
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    let writer_tx = gui_tx.clone();
+    match std::thread::Builder::new()
+        .name("zalo-settings".into())
+        .spawn(move || write_app_settings(rx, writer_tx, &path))
+    {
+        Ok(_) => {
+            let _ = slot.set(tx);
+        }
+        Err(err) => {
+            crate::logger::log_error("gui::start_settings_writer", &err.to_string());
+            let _ = gui_tx.send(GuiEvent::SettingsSaveFailed);
+        }
+    }
+}
+
+/// Start the Windows settings writer once at GUI startup; subsequent calls are no-ops.
+#[cfg(windows)]
+pub(super) fn start_settings_writer(gui_tx: &GuiTx) {
+    start_settings_writer_with(
+        &SETTINGS_TX,
+        gui_tx,
+        std::path::PathBuf::from("app_settings.json"),
+    );
+}
+
+#[cfg(all(test, windows))]
+mod windows_settings_tests {
+    use super::*;
+
+    #[test]
+    fn settings_flush_persists_latest_snapshot_without_session_runtime() {
+        let path = std::env::temp_dir().join(format!(
+            "ctdozlite-settings-writer-{}.json",
+            std::process::id(),
+        ));
+        let (requests_tx, requests_rx) = std::sync::mpsc::channel();
+        let (events_tx, events_rx) = std::sync::mpsc::channel();
+        assert!(requests_tx.send(SettingsRequest::Save("{}".into())).is_ok());
+        let final_snapshot = r#"{"close_to_tray":true}"#;
+        assert!(requests_tx.send(SettingsRequest::Save(final_snapshot.into())).is_ok());
+        assert!(requests_tx.send(SettingsRequest::Flush).is_ok());
+        write_app_settings(
+            requests_rx,
+            GuiTx {
+                tx: events_tx,
+                ctx: egui::Context::default(),
+            },
+            &path,
+        );
+        let saved = std::fs::read_to_string(&path);
+        assert!(std::fs::remove_file(path).is_ok());
+        assert_eq!(saved.as_deref().ok(), Some(final_snapshot));
+        assert!(matches!(events_rx.try_recv(), Ok(GuiEvent::SettingsFlushed)));
+        assert!(requests_tx.send(SettingsRequest::Save("{}".into())).is_err());
+    }
+
+    #[test]
+    fn save_app_settings_persists_before_writer_start_and_is_idempotent_across_restarts() {
+        let path = std::env::temp_dir().join(format!(
+            "ctdozlite-settings-prelogin-{}.json",
+            std::process::id(),
+        ));
+        let _ = std::fs::remove_file(&path);
+        let slot: std::sync::OnceLock<std::sync::mpsc::Sender<SettingsRequest>> =
+            std::sync::OnceLock::new();
+
+        let pre_login_snapshot = r#"{"close_to_tray":true,"stage":"pre_login"}"#;
+        save_app_settings_with(&slot, pre_login_snapshot.into(), &path);
+        assert_eq!(
+            std::fs::read_to_string(&path).as_deref().ok(),
+            Some(pre_login_snapshot)
+        );
+
+        let (events_tx, events_rx) = std::sync::mpsc::channel();
+        let gui_tx = GuiTx {
+            tx: events_tx,
+            ctx: egui::Context::default(),
+        };
+        start_settings_writer_with(&slot, &gui_tx, path.clone());
+        let Some(first_sender) = slot.get().cloned() else {
+            panic!("writer sender initialized");
+        };
+        start_settings_writer_with(&slot, &gui_tx, path.clone());
+        let Some(second_sender) = slot.get().cloned() else {
+            panic!("writer sender kept");
+        };
+        assert!(first_sender.send(SettingsRequest::Save(r#"{"stage":"active"}"#.into())).is_ok());
+
+        let queued_snapshot = r#"{"close_to_tray":false,"stage":"relogin"}"#;
+        save_app_settings_with(&slot, queued_snapshot.into(), &path);
+        assert!(flush_app_settings_with(&slot));
+        assert!(matches!(
+            events_rx.recv_timeout(std::time::Duration::from_secs(2)),
+            Ok(GuiEvent::SettingsFlushed)
+        ));
+        assert_eq!(
+            std::fs::read_to_string(&path).as_deref().ok(),
+            Some(queued_snapshot)
+        );
+        assert!(second_sender.send(SettingsRequest::Flush).is_err());
+
+        let post_flush_snapshot = r#"{"close_to_tray":true,"stage":"post_flush"}"#;
+        save_app_settings_with(&slot, post_flush_snapshot.into(), &path);
+        assert_eq!(
+            std::fs::read_to_string(&path).as_deref().ok(),
+            Some(post_flush_snapshot)
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
 pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: egui::Context) {
     let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<WorkerCmd>();
     let _ = WORKER_TX.set(cmd_tx);
+    #[cfg(windows)]
+    start_settings_writer(&gui_tx);
 
     let session = std::sync::Arc::new(tokio::sync::Mutex::new(session));
     let poll_state =
@@ -1611,7 +1811,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                                 if !ws_threads.is_empty() && session_matches_active(&s_snap) {
                                                     // Deliver incoming messages to UI immediately (0ms network wait)
                                                     let _ = gui_tx_ws.send(
-                                                        GuiEvent::ThreadsUpdated(ws_threads.clone()),
+                                                        GuiEvent::LiveThreadsUpdated(ws_threads.clone()),
                                                     );
                                                     ctx_ws.request_repaint();
                                                     let needs_resolve = ws_threads.iter().any(|t| {
@@ -2983,7 +3183,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
                                                 if is_fresh && session_matches_active(&s) {
                                                     // Deliver polled messages to UI immediately without blocking on profile HTTP
                                                     let _ = gui_tx_clone
-                                                        .send(GuiEvent::ThreadsUpdated(temp_threads.clone()));
+                                                        .send(GuiEvent::LiveThreadsUpdated(temp_threads.clone()));
                                                     ctx_clone.request_repaint();
                                                 }
                                                 let needs_resolve = temp_threads.iter().any(|t| {

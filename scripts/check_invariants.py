@@ -23,6 +23,7 @@ GUI_FILES = [
     ROOT / "src/gui/messages.rs",
     ROOT / "src/gui/modals.rs",
     ROOT / "src/gui/theme.rs",
+    ROOT / "src/gui/windows_tray.rs",
     ROOT / "src/gui/worker.rs",
     ROOT / "src/gui/workspace.rs",
 ]
@@ -34,6 +35,7 @@ UI_THREAD_FILES = [
     ROOT / "src/gui/messages.rs",
     ROOT / "src/gui/modals.rs",
     ROOT / "src/gui/theme.rs",
+    ROOT / "src/gui/windows_tray.rs",
     ROOT / "src/gui/workspace.rs",
 ]
 

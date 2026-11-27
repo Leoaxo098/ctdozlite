@@ -590,9 +590,14 @@ impl ZaloGuiApp {
                             .on_hover_cursor(CursorIcon::PointingHand)
                             .clicked()
                         {
-                            self.allow_quit = true;
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                            std::process::exit(0);
+                            #[cfg(windows)]
+                            self.begin_windows_quit(ctx);
+                            #[cfg(not(windows))]
+                            {
+                                self.allow_quit = true;
+                                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                                std::process::exit(0);
+                            }
                         }
                     });
             });
@@ -1891,6 +1896,20 @@ impl ZaloGuiApp {
                                                             render_toggle_switch(ui, &mut self.settings.autostart_on_boot, pal);
                                                         });
                                                     });
+                                                    #[cfg(windows)]
+                                                    {
+                                                        ui.add_space(8.0);
+                                                        let previous = self.settings.close_to_tray;
+                                                        ui.horizontal(|ui| {
+                                                            ui.label(RichText::new("Thu nhỏ xuống khay hệ thống khi đóng cửa sổ").color(pal.text_primary).size(13.2));
+                                                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                                                render_toggle_switch(ui, &mut self.settings.close_to_tray, pal);
+                                                            });
+                                                        });
+                                                        if self.settings.close_to_tray != previous {
+                                                            self.settings.save();
+                                                        }
+                                                    }
                                                     ui.add_space(8.0);
                                                     ui.horizontal(|ui| {
                                                         ui.label(RichText::new("Ghi nhớ tài khoản đăng nhập lần trước").color(pal.text_primary).size(13.2));
