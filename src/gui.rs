@@ -3630,12 +3630,22 @@ impl ZaloGuiApp {
     }
 
     fn check_events(&mut self, ctx: &egui::Context) {
+        #[cfg(windows)]
+        if self.windows_quit_ready {
+            return;
+        }
         release_cooled_failed_stickers_with_elapsed(
             &mut self.loading_stickers,
             &self.failed_stickers,
             |last_fail| last_fail.elapsed(),
         );
         while let Ok(event) = self.event_rx.try_recv() {
+            #[cfg(windows)]
+            if self.windows_quit_deadline.is_some()
+                && !matches!(&event, GuiEvent::SettingsSaveFailed | GuiEvent::SettingsFlushed)
+            {
+                continue;
+            }
             let live_delivery = matches!(&event, GuiEvent::LiveThreadsUpdated(_));
             match event {
                 GuiEvent::NotificationAuthorization { request_id, result } => {
@@ -3720,20 +3730,13 @@ impl ZaloGuiApp {
                 #[cfg(windows)]
                 GuiEvent::SettingsSaveFailed => self.show_toast("Không thể lưu cài đặt."),
                 #[cfg(windows)]
-                GuiEvent::SettingsFlushed => self.finish_windows_quit(ctx),
+                GuiEvent::SettingsFlushed => {
+                    self.finish_windows_quit(ctx);
+                    break;
+                }
                 GuiEvent::ThreadsUpdated(updates) | GuiEvent::LiveThreadsUpdated(updates) => {
                     let parked = self.is_parked_in_windows_tray();
-                    #[cfg(windows)]
-                    let tray_since = self
-                        .windows_tray
-                        .as_ref()
-                        .filter(|_| live_delivery)
-                        .map(windows_tray::Tray::parked_since_ms);
-                    #[cfg(not(windows))]
-                    let tray_since = {
-                        let _ = live_delivery;
-                        None
-                    };
+                    let parked_live = parked && live_delivery;
                     if !parked {
                         ensure_cjk_font(ctx, thread_texts(&updates));
                     }
@@ -3761,6 +3764,7 @@ impl ZaloGuiApp {
                         let is_focused = !parked && self.effective_window_focused(ctx);
                         let mask_notifications = self.should_mask_notifications();
                         let mut new_incoming_alert = false;
+                        let mut unread_changed = false;
                         let mut chat_banners: Vec<(String, String)> = Vec::new();
                         let mut watch_toasts: Vec<String> = Vec::new();
                         let mut script_msg_pending: Vec<(String, Vec<ChatMessage>)> = Vec::new();
@@ -3803,6 +3807,31 @@ impl ZaloGuiApp {
                                     .filter(|m| !m.id.is_empty())
                                     .map(|m| m.id.clone())
                                     .collect();
+                                let seen = existing.unread.last_seen_id.as_deref().unwrap_or("");
+                                #[cfg(windows)]
+                                if parked_live
+                                    && !is_thread_muted
+                                    && self.settings.enable_notifications
+                                {
+                                    if let Some(tray) = &mut self.windows_tray {
+                                        new_incoming_alert |= tray.record_message_alerts(
+                                            &self.user_uin,
+                                            &nt.id,
+                                            &nt.messages,
+                                            seen,
+                                        );
+                                    }
+                                }
+                                let live_unread = parked_live.then(|| {
+                                    nt.messages
+                                        .iter()
+                                        .filter(|m| {
+                                            tray_unread_message(m, seen)
+                                                && (seen.is_empty() || !old_ids.contains(&m.id))
+                                        })
+                                        .map(|m| (m.id.clone(), m.sender.clone(), m.text.clone()))
+                                        .collect::<Vec<_>>()
+                                });
                                 crate::chat::merge_thread_into(existing, nt, true);
                                 if let Some(until) = settings_muted_until {
                                     existing.presentation.muted = true;
@@ -3817,29 +3846,24 @@ impl ZaloGuiApp {
                                 }
                                 if was_empty
                                     && existing.unread.last_seen_id.is_none()
-                                    && tray_since.is_none()
+                                    && !parked_live
                                 {
-                                    // Empty thread receiving its initial history snapshot must not fire alerts.
-                                    let _ = advance_thread_read_point(existing);
+                                    if !parked {
+                                        let _ = advance_thread_read_point(existing);
+                                    }
                                 } else {
                                     let seen = existing.unread.last_seen_id.as_deref().unwrap_or("");
-                                    let fresh_unread_ids: Vec<(String, String, String)> =
-                                        if let Some(since) = tray_since {
-                                            existing.messages.iter().filter(|m| {
-                                                !old_ids.contains(&m.id)
-                                                    && incoming_tray_message(m, since)
-                                                    && (seen.is_empty()
-                                                        || crate::unread::compare_ids(&m.id, seen)
-                                                            == Some(std::cmp::Ordering::Greater))
-                                            }).collect()
-                                        } else {
-                                            collect_fresh_incoming_unread(
-                                                &existing.messages, seen, &old_ids, old_max_ts,
-                                            )
-                                        }
+                                    let fresh_unread_ids = live_unread.unwrap_or_else(|| {
+                                        collect_fresh_incoming_unread(
+                                            &existing.messages,
+                                            seen,
+                                            &old_ids,
+                                            old_max_ts,
+                                        )
                                         .into_iter()
                                         .map(|m| (m.id.clone(), m.sender.clone(), m.text.clone()))
-                                        .collect();
+                                        .collect()
+                                    });
                                     if !fresh_unread_ids.is_empty() {
                                         if self.notified_msg_ids.len() > 8192 {
                                             self.notified_msg_ids.clear();
@@ -3871,14 +3895,15 @@ impl ZaloGuiApp {
                                                     .collect();
                                             let inc_cnt = notify_items.len();
                                             if inc_cnt > 0 {
+                                                unread_changed = true;
                                                 *self
                                                     .unread_counts
                                                     .entry(existing.id.clone())
                                                     .or_insert(0) += inc_cnt;
-                                                if !is_thread_muted {
-                                                    new_incoming_alert |= !parked || tray_since.is_some();
+                                                if !is_thread_muted && !parked {
+                                                    new_incoming_alert = true;
                                                     if let Some((_, sender_raw, text_raw)) =
-                                                        notify_items.last().filter(|_| !parked)
+                                                        notify_items.last()
                                                     {
                                                         let unread_for_thread = self
                                                             .unread_counts
@@ -3993,8 +4018,24 @@ impl ZaloGuiApp {
                                     now_ts,
                                 );
                                 let seen = nt.unread.last_seen_id.as_deref().unwrap_or("");
-                                if seen.is_empty() && tray_since.is_none() {
-                                    let _ = advance_thread_read_point(&mut nt);
+                                #[cfg(windows)]
+                                if parked_live
+                                    && !is_thread_muted
+                                    && self.settings.enable_notifications
+                                {
+                                    if let Some(tray) = &mut self.windows_tray {
+                                        new_incoming_alert |= tray.record_message_alerts(
+                                            &self.user_uin,
+                                            &nt.id,
+                                            &nt.messages,
+                                            seen,
+                                        );
+                                    }
+                                }
+                                if seen.is_empty() && !parked_live {
+                                    if !parked {
+                                        let _ = advance_thread_read_point(&mut nt);
+                                    }
                                     self.threads.push(nt);
                                     continue;
                                 }
@@ -4008,7 +4049,7 @@ impl ZaloGuiApp {
                                             && (seen.is_empty()
                                                 || crate::unread::compare_ids(&m.id, seen)
                                                     == Some(std::cmp::Ordering::Greater))
-                                            && tray_since.is_none_or(|since| incoming_tray_message(m, since))
+                                            && (!parked_live || !m.id.is_empty())
                                             && (m.id.is_empty()
                                                 || self.notified_msg_ids.insert(m.id.clone()))
                                     })
@@ -4016,16 +4057,18 @@ impl ZaloGuiApp {
                                     .collect();
                                 let inc_cnt = unseen_items.len();
                                 if inc_cnt > 0 && (nt.id != active_tid || !is_focused) {
+                                    unread_changed = true;
                                     *self.unread_counts.entry(nt.id.clone()).or_insert(0) +=
                                         inc_cnt;
                                 }
-                                if !is_thread_muted
+                                if !parked
+                                    && !is_thread_muted
                                     && inc_cnt > 0
                                     && (nt.id != active_tid || !is_focused)
                                 {
-                                    new_incoming_alert |= !parked || tray_since.is_some();
+                                    new_incoming_alert = true;
                                     if let Some((_, sender_raw, text_raw)) =
-                                        unseen_items.last().filter(|_| !parked)
+                                        unseen_items.last()
                                     {
                                         push_thread_chat_notification(
                                             &nt,
@@ -4056,7 +4099,8 @@ impl ZaloGuiApp {
                                 self.show_toast(toast);
                             }
                         }
-                        if new_incoming_alert && self.settings.enable_notifications {
+                        let notify = new_incoming_alert && self.settings.enable_notifications;
+                        if notify {
                             if self.settings.play_notification_sound {
                                 crate::media::play_notification_chime();
                             }
@@ -4065,6 +4109,13 @@ impl ZaloGuiApp {
                             #[cfg(target_os = "windows")]
                             self.notify_windows_tray();
                             ctx.request_repaint();
+                            if !is_focused && !parked {
+                                ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
+                                    egui::UserAttentionType::Informational,
+                                ));
+                            }
+                        }
+                        if notify || (parked && unread_changed) {
                             let total_unread: usize = self.unread_counts.values().sum();
                             let title = if total_unread > 0 {
                                 format!("({total_unread}) ctdozlite")
@@ -4072,11 +4123,6 @@ impl ZaloGuiApp {
                                 "ctdozlite".to_string()
                             };
                             ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
-                            if !is_focused && !self.is_parked_in_windows_tray() {
-                                ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
-                                    egui::UserAttentionType::Informational,
-                                ));
-                            }
                         }
                         crate::chat::deduplicate_threads(&mut self.threads, Some(&live_ids));
                         // Restore selected thread by exact `id` first so contacts sharing the
@@ -4535,7 +4581,8 @@ impl ZaloGuiApp {
                         .get(self.selected_thread_index)
                         .map(|t| t.id.clone())
                         .unwrap_or_default();
-                    let is_focused_now = self.effective_window_focused(ctx);
+                    let is_focused_now =
+                        !self.is_parked_in_windows_tray() && self.effective_window_focused(ctx);
                     let my_uid_count = self.user_uin.clone();
                     for ev in &accepted {
                         if ev.r_type < 0 || ev.historical || banner_state.is_done(ev) {
@@ -7676,12 +7723,45 @@ fn collect_fresh_incoming_unread<'a>(
         .collect()
 }
 
-fn incoming_tray_message(message: &ChatMessage, since_ms: i64) -> bool {
-    crate::clock::normalize_ts_ms(message.ts) >= since_ms
-        && !message.id.is_empty()
+fn tray_unread_message(message: &ChatMessage, seen: &str) -> bool {
+    !message.id.is_empty()
         && !message.is_outgoing
         && message.kind != crate::message_model::MessageKind::System
         && message.unread_policy.counts_unread()
+        && (seen.is_empty()
+            || crate::unread::compare_ids(&message.id, seen) == Some(std::cmp::Ordering::Greater))
+}
+
+/// Message alerts already requested during the current stay in the tray.
+#[cfg(any(windows, test))]
+#[derive(Default)]
+struct TrayMessageAlerts {
+    delivered: HashSet<(String, String, String)>,
+}
+
+#[cfg(any(windows, test))]
+impl TrayMessageAlerts {
+    fn record(
+        &mut self,
+        account: &str,
+        thread: &str,
+        messages: &[ChatMessage],
+        seen: &str,
+        since_ms: i64,
+    ) -> bool {
+        let mut should_alert = false;
+        for message in messages.iter().filter(|message| {
+            tray_unread_message(message, seen)
+                && crate::clock::normalize_ts_ms(message.ts) >= since_ms
+        }) {
+            should_alert |= self.delivered.insert((
+                account.to_owned(),
+                thread.to_owned(),
+                message.id.clone(),
+            ));
+        }
+        should_alert
+    }
 }
 
 /// Count incoming messages newer than each thread's read-point.
@@ -8975,7 +9055,7 @@ fn windows_close_action(quit: bool, close_to_tray: bool, active_call: bool) -> W
 
 #[cfg(test)]
 mod windows_close_tests {
-    use super::{incoming_tray_message, windows_close_action, AppSettings, WindowsCloseAction::*};
+    use super::{windows_close_action, AppSettings, TrayMessageAlerts, WindowsCloseAction::*};
 
     #[test]
     fn close_to_tray_defaults_off_and_round_trips() {
@@ -9004,10 +9084,27 @@ mod windows_close_tests {
             ..Default::default()
         };
         let cutoff = 1_799_000_000_000;
-        assert!(incoming_tray_message(&message, cutoff));
-        assert!(!incoming_tray_message(&message, cutoff + 1));
+        let mut alerts = TrayMessageAlerts::default();
+        assert!(alerts.record("account", "thread", std::slice::from_ref(&message), "", cutoff));
+        assert!(!alerts.record("account", "thread-2", std::slice::from_ref(&message), "", cutoff + 1));
         message.is_outgoing = true;
-        assert!(!incoming_tray_message(&message, cutoff));
+        assert!(!alerts.record("account", "thread-3", &[message], "", cutoff));
+    }
+
+    #[test]
+    fn tray_alert_delivery_is_independent_of_an_earlier_unread_count() {
+        let message = crate::chat::ChatMessage {
+            id: "101".into(),
+            ts: 1_799_000_000,
+            ..Default::default()
+        };
+        let mut alerts = super::TrayMessageAlerts::default();
+        let cutoff = 1_799_000_000_000;
+        assert!(super::tray_unread_message(&message, "100"));
+        assert!(alerts.record("account", "thread", std::slice::from_ref(&message), "100", cutoff));
+        assert!(!alerts.record("account", "thread", std::slice::from_ref(&message), "100", cutoff));
+        assert!(!alerts.record("account", "thread-2", std::slice::from_ref(&message), "100", cutoff + 1));
+        assert!(super::tray_unread_message(&message, "100"));
     }
 
     #[test]

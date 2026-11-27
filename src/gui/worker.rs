@@ -1041,7 +1041,7 @@ enum SettingsRequest {
 }
 
 #[cfg(windows)]
-static SETTINGS_TX: std::sync::OnceLock<tokio::sync::mpsc::UnboundedSender<SettingsRequest>> =
+static SETTINGS_TX: std::sync::OnceLock<std::sync::mpsc::Sender<SettingsRequest>> =
     std::sync::OnceLock::new();
 
 /// Queue a complete settings snapshot for ordered persistence on Windows.
@@ -1059,29 +1059,74 @@ pub(super) fn flush_app_settings() -> bool {
 }
 
 #[cfg(windows)]
-async fn write_app_settings(
-    mut requests: tokio::sync::mpsc::UnboundedReceiver<SettingsRequest>,
+fn write_app_settings(
+    requests: std::sync::mpsc::Receiver<SettingsRequest>,
     gui_tx: GuiTx,
+    path: &std::path::Path,
 ) {
-    while let Some(request) = requests.recv().await {
+    for request in requests {
         match request {
             SettingsRequest::Save(json) => {
-                let saved = tokio::task::spawn_blocking(move || {
-                    crate::data_dir::write_private_atomic(
-                        std::path::Path::new("app_settings.json"),
-                        json.as_bytes(),
-                    )
-                })
-                .await;
-                if !matches!(saved, Ok(Ok(()))) {
+                if crate::data_dir::write_private_atomic(path, json.as_bytes()).is_err() {
                     crate::logger::log_error("gui::save_app_settings", "Could not persist settings");
                     let _ = gui_tx.send(GuiEvent::SettingsSaveFailed);
                 }
             }
             SettingsRequest::Flush => {
                 let _ = gui_tx.send(GuiEvent::SettingsFlushed);
+                break;
             }
         }
+    }
+}
+
+#[cfg(windows)]
+fn start_settings_writer(gui_tx: &GuiTx) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let writer_tx = gui_tx.clone();
+    match std::thread::Builder::new()
+        .name("zalo-settings".into())
+        .spawn(move || write_app_settings(rx, writer_tx, std::path::Path::new("app_settings.json")))
+    {
+        Ok(_) => {
+            let _ = SETTINGS_TX.set(tx);
+        }
+        Err(err) => {
+            crate::logger::log_error("gui::start_settings_writer", &err.to_string());
+            let _ = gui_tx.send(GuiEvent::SettingsSaveFailed);
+        }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_settings_tests {
+    use super::*;
+
+    #[test]
+    fn settings_flush_persists_latest_snapshot_without_session_runtime() {
+        let path = std::env::temp_dir().join(format!(
+            "ctdozlite-settings-writer-{}.json",
+            std::process::id(),
+        ));
+        let (requests_tx, requests_rx) = std::sync::mpsc::channel();
+        let (events_tx, events_rx) = std::sync::mpsc::channel();
+        assert!(requests_tx.send(SettingsRequest::Save("{}".into())).is_ok());
+        let final_snapshot = r#"{"close_to_tray":true}"#;
+        assert!(requests_tx.send(SettingsRequest::Save(final_snapshot.into())).is_ok());
+        assert!(requests_tx.send(SettingsRequest::Flush).is_ok());
+        write_app_settings(
+            requests_rx,
+            GuiTx {
+                tx: events_tx,
+                ctx: egui::Context::default(),
+            },
+            &path,
+        );
+        let saved = std::fs::read_to_string(&path);
+        assert!(std::fs::remove_file(path).is_ok());
+        assert_eq!(saved.as_deref().ok(), Some(final_snapshot));
+        assert!(matches!(events_rx.try_recv(), Ok(GuiEvent::SettingsFlushed)));
+        assert!(requests_tx.send(SettingsRequest::Save("{}".into())).is_err());
     }
 }
 
@@ -1089,11 +1134,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
     let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<WorkerCmd>();
     let _ = WORKER_TX.set(cmd_tx);
     #[cfg(windows)]
-    let settings_rx = {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let _ = SETTINGS_TX.set(tx);
-        rx
-    };
+    start_settings_writer(&gui_tx);
 
     let session = std::sync::Arc::new(tokio::sync::Mutex::new(session));
     let poll_state =
@@ -1121,8 +1162,6 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: GuiTx, egui_ctx: eg
             };
 
             rt.block_on(async move {
-                #[cfg(windows)]
-                tokio::spawn(write_app_settings(settings_rx, gui_tx.clone()));
                 {
                     let s = session.lock().await.clone();
                     if let Some(li) = s.login.as_ref() {

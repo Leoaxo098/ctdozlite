@@ -39,6 +39,7 @@ pub(super) struct Tray {
     callbacks: Rc<Callbacks>,
     parked_window: ParkedWindow,
     parked_since_ms: i64,
+    message_alerts: super::TrayMessageAlerts,
 }
 
 /// The main window retains its normal placement while parked as a tool window.
@@ -162,6 +163,7 @@ impl Tray {
                 callbacks,
                 parked_window,
                 parked_since_ms: crate::clock::normalize_ts_ms(crate::login::unix_now() as i64),
+                message_alerts: Default::default(),
             };
             if tray.register() {
                 tray.parked_window.park()?;
@@ -177,9 +179,16 @@ impl Tray {
         self.parked_window.restore();
     }
 
-    /// Earliest message timestamp eligible for a tray alert during this stay.
-    pub(super) fn parked_since_ms(&self) -> i64 {
-        self.parked_since_ms
+    /// Record eligible live delivery separately from the unread and message stores.
+    pub(super) fn record_message_alerts(
+        &mut self,
+        account: &str,
+        thread: &str,
+        messages: &[super::ChatMessage],
+        seen: &str,
+    ) -> bool {
+        self.message_alerts
+            .record(account, thread, messages, seen, self.parked_since_ms)
     }
 
     /// Reinstall the icon after Explorer has discarded its notification area.
