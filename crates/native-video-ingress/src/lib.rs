@@ -2,3 +2,4 @@
 
 pub mod decode_queue;
 pub mod ingress;
+pub mod fanout;
