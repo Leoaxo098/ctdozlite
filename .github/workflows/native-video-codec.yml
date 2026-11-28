@@ -5,12 +5,14 @@ on:
     paths:
       - 'crates/native-video-codec/**'
       - 'crates/native-video-ingress/**'
+      - 'crates/native-video-capture/**'
       - '.github/workflows/native-video-codec.yml'
   push:
     branches: [main]
     paths:
       - 'crates/native-video-codec/**'
       - 'crates/native-video-ingress/**'
+      - 'crates/native-video-capture/**'
       - '.github/workflows/native-video-codec.yml'
 
 jobs:
@@ -27,8 +29,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Install assembler (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y nasm
+        run: sudo apt-get update && sudo apt-get install -y nasm pkg-config clang libclang-dev
       - name: Test codec
         run: cargo test --locked --manifest-path crates/native-video-codec/Cargo.toml
       - name: Test ingress
         run: cargo test --locked --manifest-path crates/native-video-ingress/Cargo.toml
+      - name: Test capture
+        run: cargo test --locked --manifest-path crates/native-video-capture/Cargo.toml
