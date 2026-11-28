@@ -1,0 +1,30 @@
+name: Native video codec
+
+on:
+  pull_request:
+    paths:
+      - 'crates/native-video-codec/**'
+      - '.github/workflows/native-video-codec.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'crates/native-video-codec/**'
+      - '.github/workflows/native-video-codec.yml'
+
+jobs:
+  codec-tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, macos-14, windows-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      CMAKE_POLICY_VERSION_MINIMUM: '3.5'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install assembler (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y nasm
+      - name: Test codec
+        run: cargo test --locked --manifest-path crates/native-video-codec/Cargo.toml
