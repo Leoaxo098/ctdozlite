@@ -1,0 +1,9 @@
+[package]
+name = "ctdozlite-native-video-codec"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+anyhow = "1"
+openh264 = { version = "=0.9.9", default-features = false, features = ["source"] }
